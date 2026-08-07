@@ -1,0 +1,1574 @@
+{
+  "name": "fox-ai",
+  "displayName": "%foxai.n1%",
+  "description": "%foxai.n2%",
+  "version": "0.8.65",
+  "publisher": "foxai",
+  "license": "GPL-3.0",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "llama.cpp",
+    "ollama",
+    "deepseek",
+    "chatglm",
+    "qwen",
+    "agent",
+    "ai",
+    "copilot"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "scripts": {
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "foxAi",
+          "title": "%foxai.n3%",
+          "icon": "media/fox.png"
+        }
+      ]
+    },
+    "views": {
+      "foxAi": [
+        {
+          "type": "tree",
+          "id": "foxAi.sessions",
+          "name": "%foxai.n4%",
+          "icon": "media/fox.png"
+        },
+        {
+          "type": "tree",
+          "id": "foxAi.files",
+          "name": "%foxai.n5%",
+          "icon": "media/fox.png"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "foxAi.openChat",
+        "title": "%foxai.n6%",
+        "category": "%foxai.n7%",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "foxAi.openChatInPanel",
+        "title": "%foxai.n8%",
+        "category": "%foxai.n9%",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "foxAi.newChat",
+        "title": "%foxai.n10%",
+        "category": "%foxai.n11%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "foxAi.switchSession",
+        "title": "%foxai.n12%",
+        "category": "%foxai.n13%"
+      },
+      {
+        "command": "foxAi.renameSession",
+        "title": "%foxai.n14%",
+        "category": "%foxai.n15%",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "foxAi.deleteSession",
+        "title": "%foxai.n16%",
+        "category": "%foxai.n17%",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "foxAi.setSessionStorage",
+        "title": "%foxai.n18%",
+        "category": "%foxai.n19%",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "foxAi.rebuildKnowledgeBase",
+        "title": "%foxai.n20%",
+        "category": "%foxai.n21%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "foxAi.organizeKnowledge",
+        "title": "%foxai.n22%",
+        "category": "%foxai.n23%",
+        "icon": "$(library)"
+      },
+      {
+        "command": "foxAi.pause",
+        "title": "%foxai.n24%",
+        "category": "%foxai.n25%",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "foxAi.resume",
+        "title": "%foxai.n26%",
+        "category": "%foxai.n27%",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "foxAi.stop",
+        "title": "%foxai.n28%",
+        "category": "%foxai.n29%",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "foxAi.undoLastEdit",
+        "title": "%foxai.n30%",
+        "category": "%foxai.n31%",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "foxAi.redoLastEdit",
+        "title": "%foxai.n32%",
+        "category": "%foxai.n33%",
+        "icon": "$(redo)"
+      },
+      {
+        "command": "foxAi.toggleAgent",
+        "title": "%foxai.n34%",
+        "category": "%foxai.n35%"
+      },
+      {
+        "command": "foxAi.selectProvider",
+        "title": "%foxai.n36%",
+        "category": "%foxai.n37%"
+      },
+      {
+        "command": "foxAi.selectModel",
+        "title": "%foxai.n38%",
+        "category": "%foxai.n39%"
+      },
+      {
+        "command": "foxAi.setApiKey",
+        "title": "%foxai.n40%",
+        "category": "%foxai.n41%"
+      },
+      {
+        "command": "foxAi.clearApiKey",
+        "title": "%foxai.n42%",
+        "category": "%foxai.n43%"
+      },
+      {
+        "command": "foxAi.testConnection",
+        "title": "%foxai.n44%",
+        "category": "%foxai.n45%"
+      },
+      {
+        "command": "foxAi.explainCode",
+        "title": "%foxai.n46%",
+        "category": "%foxai.n47%"
+      },
+      {
+        "command": "foxAi.refactorCode",
+        "title": "%foxai.n48%",
+        "category": "%foxai.n49%"
+      },
+      {
+        "command": "foxAi.addComments",
+        "title": "%foxai.n50%",
+        "category": "%foxai.n51%"
+      },
+      {
+        "command": "foxAi.generateTests",
+        "title": "%foxai.n52%",
+        "category": "%foxai.n53%"
+      },
+      {
+        "command": "foxAi.fixCode",
+        "title": "%foxai.n54%",
+        "category": "%foxai.n55%"
+      },
+      {
+        "command": "foxAi.askAboutSelection",
+        "title": "%foxai.n56%",
+        "category": "%foxai.n57%"
+      },
+      {
+        "command": "foxAi.fixProblems",
+        "title": "%foxai.n58%",
+        "category": "%foxai.n59%"
+      },
+      {
+        "command": "foxAi.explainTerminalError",
+        "title": "%foxai.n60%",
+        "category": "%foxai.n61%"
+      },
+      {
+        "command": "foxAi.runAndFix",
+        "title": "%foxai.n62%",
+        "category": "%foxai.n63%"
+      },
+      {
+        "command": "foxAi.fixDiagnostic",
+        "title": "%foxai.n64%",
+        "category": "%foxai.n65%"
+      },
+      {
+        "command": "foxAi.toggleInlineCompletion",
+        "title": "%foxai.n66%",
+        "category": "%foxai.n67%"
+      },
+      {
+        "command": "foxAi.remember",
+        "title": "%foxai.n68%",
+        "category": "%foxai.n69%",
+        "icon": "$(book)"
+      },
+      {
+        "command": "foxAi.openMemory",
+        "title": "%foxai.n70%",
+        "category": "%foxai.n71%",
+        "icon": "$(book)"
+      },
+      {
+        "command": "foxAi.openUserSkills",
+        "title": "%foxai.n72%",
+        "category": "%foxai.n73%",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "foxAi.openPlanTasks",
+        "title": "%foxai.n74%",
+        "category": "%foxai.n75%",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "foxAi.openEnvManager",
+        "title": "%foxai.n76%",
+        "category": "%foxai.n77%",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "foxAi.callExtensionCommand",
+        "title": "%foxai.n78%",
+        "category": "%foxai.n79%"
+      },
+      {
+        "command": "foxAi.openTaskManager",
+        "title": "%foxai.n80%",
+        "category": "%foxai.n81%",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "foxAi.listMcpConnectors",
+        "title": "%foxai.n82%",
+        "category": "%foxai.n83%"
+      },
+      {
+        "command": "foxAi.setupMcpDeps",
+        "title": "%foxai.n84%",
+        "category": "%foxai.n85%",
+        "icon": "$(package)"
+      },
+      {
+        "command": "foxAi.importVSCodeMcp",
+        "title": "%foxai.n86%",
+        "category": "%foxai.n87%",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "foxAi.installCatalogServer",
+        "title": "%foxai.n88%",
+        "category": "%foxai.n89%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "foxAi.openSessionStorage",
+        "title": "%foxai.n90%",
+        "category": "%foxai.n91%",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "foxAi.openMemoryStorage",
+        "title": "%foxai.n92%",
+        "category": "%foxai.n93%",
+        "icon": "$(database)"
+      },
+      {
+        "command": "foxAi.setMemoryStorage",
+        "title": "%foxai.n94%",
+        "category": "%foxai.n95%",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "foxAi.openUserSkillStorage",
+        "title": "%foxai.n96%",
+        "category": "%foxai.n97%",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "foxAi.setUserSkillStorage",
+        "title": "%foxai.n98%",
+        "category": "%foxai.n99%",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "foxAi.openPlanTaskStorage",
+        "title": "%foxai.n100%",
+        "category": "%foxai.n101%",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "foxAi.setPlanTaskStorage",
+        "title": "%foxai.n102%",
+        "category": "%foxai.n103%",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "foxAi.manageStorage",
+        "title": "%foxai.n104%",
+        "category": "%foxai.n105%",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "foxAi.optimizeMemory",
+        "title": "%foxai.n106%",
+        "category": "%foxai.n107%",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "foxAi.cleanupFoxAi",
+        "title": "%foxai.n108%",
+        "category": "%foxai.n109%",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "foxAi.openFileAt",
+        "title": "%foxai.n110%",
+        "category": "%foxai.n111%"
+      },
+      {
+        "command": "foxAi.openAnyFile",
+        "title": "%foxai.n112%",
+        "category": "%foxai.n113%",
+        "icon": "$(file-search)"
+      },
+      {
+        "command": "foxAi.projectOutline",
+        "title": "%foxai.n114%",
+        "category": "%foxai.n115%",
+        "icon": "$(graph)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "foxAi.editorSubmenu",
+        "label": "🦊 狐狸 AI"
+      },
+      {
+        "id": "foxAi.storageSubmenu",
+        "label": "存储"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "foxAi.fixDiagnostic",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "foxAi.openChat",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@0"
+        },
+        {
+          "command": "foxAi.stop",
+          "when": "view == foxAi.sessions && foxAi.running",
+          "group": "navigation@1"
+        },
+        {
+          "command": "foxAi.newChat",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "foxAi.openEnvManager",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "foxAi.setSessionStorage",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@4"
+        },
+        {
+          "submenu": "foxAi.storageSubmenu",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@5"
+        },
+        {
+          "command": "foxAi.openAnyFile",
+          "when": "view == foxAi.files",
+          "group": "navigation@0"
+        },
+        {
+          "command": "foxAi.projectOutline",
+          "when": "view == foxAi.files",
+          "group": "navigation@1"
+        }
+      ],
+      "foxAi.storageSubmenu": [
+        {
+          "command": "foxAi.openSessionStorage",
+          "group": "open@1"
+        },
+        {
+          "command": "foxAi.openMemoryStorage",
+          "group": "open@2"
+        },
+        {
+          "command": "foxAi.openUserSkillStorage",
+          "group": "open@3"
+        },
+        {
+          "command": "foxAi.openPlanTaskStorage",
+          "group": "open@4"
+        },
+        {
+          "command": "foxAi.setSessionStorage",
+          "group": "change@1"
+        },
+        {
+          "command": "foxAi.setMemoryStorage",
+          "group": "change@2"
+        },
+        {
+          "command": "foxAi.setUserSkillStorage",
+          "group": "change@3"
+        },
+        {
+          "command": "foxAi.setPlanTaskStorage",
+          "group": "change@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "foxAi.renameSession",
+          "when": "view == foxAi.sessions && viewItem == foxAi.session",
+          "group": "inline@0"
+        },
+        {
+          "command": "foxAi.deleteSession",
+          "when": "view == foxAi.sessions && viewItem == foxAi.session",
+          "group": "inline@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "foxAi.editorSubmenu",
+          "group": "0_foxai",
+          "when": "editorTextFocus"
+        }
+      ],
+      "foxAi.editorSubmenu": [
+        {
+          "command": "foxAi.explainCode",
+          "group": "1_ask@1"
+        },
+        {
+          "command": "foxAi.refactorCode",
+          "group": "1_ask@2"
+        },
+        {
+          "command": "foxAi.addComments",
+          "group": "1_ask@3"
+        },
+        {
+          "command": "foxAi.generateTests",
+          "group": "1_ask@4"
+        },
+        {
+          "command": "foxAi.fixCode",
+          "group": "1_ask@5"
+        },
+        {
+          "command": "foxAi.askAboutSelection",
+          "group": "2_free@1"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "foxAi.explainTerminalError",
+          "group": "0_foxai"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "foxAi.askAboutSelection",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "foxAi.openChat",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l"
+      },
+      {
+        "command": "foxAi.stop",
+        "key": "ctrl+alt+q",
+        "mac": "cmd+alt+q"
+      }
+    ],
+    "configuration": [
+      {
+        "title": "%foxai.n116%",
+        "properties": {
+          "foxAi.provider": {
+            "type": "string",
+            "default": "llamacpp",
+            "order": 1,
+            "enum": [
+              "llamacpp",
+              "ollama",
+              "lmstudio",
+              "deepseek",
+              "zhipu",
+              "dashscope",
+              "moonshot",
+              "siliconflow",
+              "openrouter",
+              "custom"
+            ],
+            "enumDescriptions": [
+              "本地 llama.cpp server（默认 http://127.0.0.1:8080/v1）",
+              "本地 Ollama（默认 http://127.0.0.1:11434/v1）",
+              "本地 LM Studio（默认 http://127.0.0.1:1234/v1）",
+              "DeepSeek 深度求索",
+              "智谱 GLM（BigModel 开放平台）",
+              "阿里云百炼 / 通义千问（兼容模式）",
+              "月之暗面 Kimi",
+              "硅基流动 SiliconFlow",
+              "OpenRouter",
+              "自定义 OpenAI 兼容服务"
+            ],
+            "description": "%foxai.n117%"
+          },
+          "foxAi.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 2,
+            "description": "%foxai.n118%"
+          },
+          "foxAi.model": {
+            "type": "string",
+            "default": "",
+            "order": 3,
+            "description": "%foxai.n119%"
+          },
+          "foxAi.apiKey": {
+            "type": "string",
+            "default": "",
+            "order": 4,
+            "markdownDescription": "%foxai.n120%"
+          },
+          "foxAi.systemPrompt": {
+            "type": "string",
+            "default": "你是一位资深工程师，回答简洁准确，默认使用中文。",
+            "editPresentation": "multilineText",
+            "order": 5,
+            "description": "%foxai.n121%"
+          },
+          "foxAi.temperature": {
+            "type": "number",
+            "default": 0.3,
+            "minimum": 0,
+            "maximum": 2,
+            "description": "%foxai.n122%"
+          },
+          "foxAi.maxTokens": {
+            "type": "number",
+            "default": 4096,
+            "description": "%foxai.n123%"
+          },
+          "foxAi.timeout": {
+            "type": "number",
+            "default": 60000,
+            "markdownDescription": "%foxai.n124%"
+          },
+          "foxAi.maxHistory": {
+            "type": "number",
+            "default": 20,
+            "description": "%foxai.n125%"
+          },
+          "foxAi.includeFileContext": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n126%"
+          },
+          "foxAi.forceNonStream": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "%foxai.n127%",
+            "order": 9
+          },
+          "foxAi.streamFormat": {
+            "type": "string",
+            "default": "auto",
+            "enum": [
+              "auto",
+              "sse",
+              "jsonl"
+            ],
+            "enumDescriptions": [
+              "根据响应 Content-Type 自动识别（SSE / JSON Lines / 普通 JSON）",
+              "强制按 SSE（text/event-stream）解析",
+              "强制按 JSON Lines（application/x-ndjson 或 application/json 逐行）解析，兼容 MCP Streamable HTTP"
+            ],
+            "markdownDescription": "%foxai.n128%",
+            "order": 10
+          },
+          "foxAi.insecureHttpParser": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "%foxai.n129%",
+            "order": 10
+          },
+          "foxAi.visionMode": {
+            "type": "string",
+            "default": "auto",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "enumDescriptions": [
+              "自动按模型名判断是否支持读图",
+              "强制把图片发给模型（模型不支持会报 400）",
+              "从不发送图片，只发文件名"
+            ],
+            "markdownDescription": "%foxai.n130%",
+            "order": 11
+          },
+          "foxAi.visionModels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "markdownDescription": "%foxai.n131%",
+            "order": 12
+          },
+          "foxAi.textOnlyModels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "markdownDescription": "%foxai.n132%",
+            "order": 13
+          },
+          "foxAi.keepImageTurns": {
+            "type": "number",
+            "default": 1,
+            "description": "%foxai.n133%",
+            "order": 12
+          },
+          "foxAi.attachment.maxSizeMB": {
+            "type": "number",
+            "default": 6,
+            "description": "%foxai.n134%",
+            "order": 13
+          },
+          "foxAi.webSearch.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n135%"
+          },
+          "foxAi.webSearch.provider": {
+            "type": "string",
+            "default": "builtin",
+            "enum": [
+              "builtin",
+              "duckduckgo",
+              "tavily",
+              "serper"
+            ],
+            "enumDescriptions": [
+              "自动选择可用搜索源（默认 DuckDuckGo，无需 Key）",
+              "DuckDuckGo HTML（无需 Key，稳定性一般）",
+              "Tavily API（需 Key，更稳定）",
+              "Serper/Google API（需 Key）"
+            ]
+          },
+          "foxAi.webSearch.apiKey": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n136%"
+          },
+          "foxAi.apiMode": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "responses"
+            ],
+            "default": "chat",
+            "markdownDescription": "API protocol. chat = OpenAI-compatible /chat/completions (default, works with all providers). responses = OpenAI Responses API (/v1/responses, native function calling and reasoning deltas), supported by OpenAI official and DeepSeek (deepseek-v4-flash; see api-docs.deepseek.com). Selecting the openai provider defaults to responses. Other third-party services (Zhipu, Ollama, LM Studio, etc.) may not implement /responses; forcing it on an unsupported endpoint will error."
+          }
+        }
+      },
+      {
+        "title": "%foxai.n137%",
+        "properties": {
+          "foxAi.vision.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "%foxai.n138%"
+          },
+          "foxAi.vision.provider": {
+            "type": "string",
+            "default": "custom",
+            "description": "%foxai.n139%"
+          },
+          "foxAi.vision.baseUrl": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n140%"
+          },
+          "foxAi.vision.apiKey": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n141%"
+          },
+          "foxAi.vision.model": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n142%"
+          },
+          "foxAi.vision.apiMode": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "responses"
+            ],
+            "default": "chat",
+            "description": "%foxai.n143%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n144%",
+        "properties": {
+          "foxAi.imageGen.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "%foxai.n145%"
+          },
+          "foxAi.imageGen.provider": {
+            "type": "string",
+            "default": "custom",
+            "description": "%foxai.n146%"
+          },
+          "foxAi.imageGen.baseUrl": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n147%"
+          },
+          "foxAi.imageGen.apiKey": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n148%"
+          },
+          "foxAi.imageGen.model": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n149%"
+          },
+          "foxAi.imageGen.apiMode": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "responses"
+            ],
+            "default": "chat",
+            "description": "%foxai.n150%"
+          },
+          "foxAi.imageGen.maxTokens": {
+            "type": "number",
+            "default": 1024,
+            "description": "%foxai.n151%"
+          },
+          "foxAi.imageGen.timeout": {
+            "type": "number",
+            "default": 60000,
+            "description": "%foxai.n152%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n153%",
+        "properties": {
+          "foxAi.securityAudit.allowNetwork": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "%foxai.n154%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n155%",
+        "properties": {
+          "foxAi.mcp.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n156%"
+          },
+          "foxAi.mcp.modulesPath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n157%"
+          },
+          "foxAi.mcp.priority": {
+            "type": "string",
+            "default": "local-first",
+            "enum": [
+              "local-first",
+              "remote-first"
+            ],
+            "enumDescriptions": [
+              "本地 CLI 工具优先；只有当本地无同名工具时，才使用 MCP 暴露的同名（扁平）工具",
+              "MCP 工具优先；若 MCP 以扁平模式暴露了与本地同名的工具，远程版本会覆盖本地"
+            ],
+            "description": "%foxai.n158%"
+          },
+          "foxAi.mcp.autoInject": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n159%"
+          },
+          "foxAi.mcp.autoImportVSCode": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n160%"
+          },
+          "foxAi.mcp.playwright.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n161%"
+          },
+          "foxAi.mcp.servers": {
+            "type": "array",
+            "default": [],
+            "description": "%foxai.n162%"
+          },
+          "foxAi.mcp.allowedCommands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "%foxai.n163%"
+          },
+          "foxAi.mcp.allowPrivateUrls": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n164%"
+          },
+          "foxAi.mcp.allowedEnv": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "%foxai.n165%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n166%",
+        "properties": {
+          "foxAi.sessions.storagePath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n167%"
+          },
+          "foxAi.memory.storagePath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n168%"
+          },
+          "foxAi.skills.storagePath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n169%"
+          },
+          "foxAi.planTasks.storagePath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n170%"
+          },
+          "foxAi.knowledgeBase.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n171%"
+          },
+          "foxAi.knowledgeBase.paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "%foxai.n172%"
+          },
+          "foxAi.knowledgeBase.maxChars": {
+            "type": "number",
+            "default": 8000,
+            "description": "%foxai.n173%"
+          },
+          "foxAi.knowledgeBase.chunkSize": {
+            "type": "number",
+            "default": 800,
+            "description": "%foxai.n174%"
+          },
+          "foxAi.knowledgeBase.organize.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 10,
+            "description": "%foxai.n175%"
+          },
+          "foxAi.knowledgeBase.organize.sourcePaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 11,
+            "description": "%foxai.n176%"
+          },
+          "foxAi.knowledgeBase.organize.outputDir": {
+            "type": "string",
+            "default": "",
+            "order": 12,
+            "description": "%foxai.n177%"
+          },
+          "foxAi.knowledgeBase.organize.provider": {
+            "type": "string",
+            "default": "llamacpp",
+            "enum": [
+              "llamacpp",
+              "ollama",
+              "lmstudio",
+              "deepseek",
+              "zhipu",
+              "dashscope",
+              "moonshot",
+              "siliconflow",
+              "openrouter",
+              "custom"
+            ],
+            "order": 13,
+            "description": "%foxai.n178%"
+          },
+          "foxAi.knowledgeBase.organize.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 14,
+            "description": "%foxai.n179%"
+          },
+          "foxAi.knowledgeBase.organize.model": {
+            "type": "string",
+            "default": "",
+            "order": 15,
+            "description": "%foxai.n180%"
+          },
+          "foxAi.knowledgeBase.organize.prompt": {
+            "type": "string",
+            "default": "",
+            "order": 16,
+            "description": "%foxai.n181%"
+          },
+          "foxAi.knowledgeBase.autoSummarize.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n182%"
+          },
+          "foxAi.knowledgeBase.autoSummarize.threshold": {
+            "type": "number",
+            "default": 0.9,
+            "minimum": 0.1,
+            "maximum": 1,
+            "description": "%foxai.n183%"
+          },
+          "foxAi.knowledgeBase.autoSummarize.keepRecent": {
+            "type": "number",
+            "default": 6,
+            "minimum": 2,
+            "maximum": 40,
+            "description": "%foxai.n184%"
+          },
+          "foxAi.knowledgeBase.autoSummarize.dir": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n185%"
+          },
+          "foxAi.knowledgeBase.bm25Enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n186%"
+          },
+          "foxAi.knowledgeBase.topK": {
+            "type": "number",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 30,
+            "description": "%foxai.n187%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n188%",
+        "properties": {
+          "foxAi.projectScan.cacheEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n189%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n190%",
+        "properties": {
+          "foxAi.planTask.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 1,
+            "description": "%foxai.n191%"
+          },
+          "foxAi.planTask.provider": {
+            "type": "string",
+            "default": "",
+            "order": 2,
+            "enum": [
+              "",
+              "llamacpp",
+              "ollama",
+              "lmstudio",
+              "deepseek",
+              "zhipu",
+              "dashscope",
+              "moonshot",
+              "siliconflow",
+              "openrouter",
+              "custom"
+            ],
+            "enumDescriptions": [
+              "使用当前对话模型",
+              "本地 llama.cpp",
+              "本地 Ollama",
+              "本地 LM Studio",
+              "DeepSeek",
+              "智谱 GLM",
+              "阿里云百炼/通义",
+              "Kimi",
+              "硅基流动",
+              "OpenRouter",
+              "自定义 OpenAI 兼容服务"
+            ],
+            "description": "%foxai.n192%"
+          },
+          "foxAi.planTask.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 3,
+            "description": "%foxai.n193%"
+          },
+          "foxAi.planTask.model": {
+            "type": "string",
+            "default": "",
+            "order": 4,
+            "description": "%foxai.n194%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n195%",
+        "properties": {
+          "foxAi.nodePath": {
+            "type": "string",
+            "default": "",
+            "order": 1,
+            "description": "%foxai.n196%"
+          },
+          "foxAi.verify.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 2,
+            "description": "%foxai.n197%"
+          },
+          "foxAi.verify.provider": {
+            "type": "string",
+            "default": "",
+            "order": 3,
+            "description": "%foxai.n198%"
+          },
+          "foxAi.verify.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 4,
+            "description": "%foxai.n199%"
+          },
+          "foxAi.verify.model": {
+            "type": "string",
+            "default": "",
+            "order": 5,
+            "description": "%foxai.n200%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n201%",
+        "properties": {
+          "foxAi.showContextUsage": {
+            "type": "boolean",
+            "default": true,
+            "order": 1,
+            "description": "%foxai.n202%"
+          },
+          "foxAi.contextWindow": {
+            "type": "number",
+            "default": 0,
+            "order": 2,
+            "description": "%foxai.n203%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n204%",
+        "properties": {
+          "foxAi.policy.mode": {
+            "type": "string",
+            "default": "",
+            "order": 1,
+            "enum": [
+              "",
+              "off",
+              "read",
+              "edit",
+              "network",
+              "exec",
+              "install",
+              "all"
+            ],
+            "description": "%foxai.n205%"
+          },
+          "foxAi.policy.blockedPaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 2,
+            "description": "%foxai.n206%"
+          },
+          "foxAi.policy.blockedCommands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 3,
+            "description": "%foxai.n207%"
+          },
+          "foxAi.policy.allowedCommands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 4,
+            "description": "%foxai.n208%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n209%",
+        "properties": {
+          "foxAi.workspace.allowOutsideReads": {
+            "type": "boolean",
+            "default": true,
+            "order": 1,
+            "description": "%foxai.n210%"
+          },
+          "foxAi.workspace.outsideEditConfirm": {
+            "type": "string",
+            "default": "triple",
+            "order": 2,
+            "enum": [
+              "triple",
+              "double",
+              "single",
+              "off"
+            ],
+            "enumDescriptions": [
+              "三次确认：模态警告 + 输入完整路径 + 最终确认（推荐）",
+              "两次确认：模态警告 + 最终确认",
+              "一次确认：仅模态警告",
+              "不额外确认，按普通编辑走 autoApprove（危险）"
+            ],
+            "description": "%foxai.n211%"
+          },
+          "foxAi.workspace.globalSearchRoot": {
+            "type": "string",
+            "default": "",
+            "order": 3,
+            "description": "%foxai.n212%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n213%",
+        "properties": {
+          "foxAi.agent.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 1,
+            "description": "%foxai.n214%"
+          },
+          "foxAi.planAndExecute.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 1.5,
+            "description": "%foxai.n215%"
+          },
+          "foxAi.review.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 1.6,
+            "description": "%foxai.n216%"
+          },
+          "foxAi.agent.autoApprove": {
+            "type": "string",
+            "default": "read",
+            "order": 2,
+            "enum": [
+              "off",
+              "read",
+              "edit",
+              "all"
+            ],
+            "enumDescriptions": [
+              "所有操作都要我点确认",
+              "只读操作自动放行，改文件和跑命令要确认（推荐）",
+              "读和改文件自动放行，跑命令要确认",
+              "全部自动放行（放飞模式，谨慎使用）"
+            ],
+            "description": "%foxai.n217%"
+          },
+          "foxAi.agent.maxSteps": {
+            "type": "number",
+            "default": 12,
+            "order": 3,
+            "description": "%foxai.n218%"
+          },
+          "foxAi.agent.maxContinues": {
+            "type": "number",
+            "default": 3,
+            "order": 4,
+            "description": "%foxai.n219%"
+          },
+          "foxAi.routing.gateEnabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 20,
+            "description": "%foxai.n220%"
+          },
+          "foxAi.routing.maxQueryLen": {
+            "type": "number",
+            "default": 120,
+            "order": 21,
+            "description": "%foxai.n221%"
+          },
+          "foxAi.tools.dynamicSubset.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 30,
+            "description": "%foxai.n222%"
+          },
+          "foxAi.tools.dynamicSubset.topK": {
+            "type": "number",
+            "default": 12,
+            "order": 31,
+            "description": "%foxai.n223%"
+          },
+          "foxAi.tools.dynamicSubset.alwaysInclude": {
+            "type": "string",
+            "default": "",
+            "order": 32,
+            "description": "%foxai.n224%"
+          },
+          "foxAi.guardrails.forceCitation": {
+            "type": "boolean",
+            "default": false,
+            "order": 33,
+            "description": "%foxai.n225%"
+          },
+          "foxAi.planner.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 40,
+            "description": "%foxai.n226%"
+          },
+          "foxAi.planner.provider": {
+            "type": "string",
+            "default": "",
+            "order": 41,
+            "description": "%foxai.n227%"
+          },
+          "foxAi.planner.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 42,
+            "description": "%foxai.n228%"
+          },
+          "foxAi.planner.model": {
+            "type": "string",
+            "default": "",
+            "order": 43,
+            "description": "%foxai.n229%"
+          },
+          "foxAi.planner.maxTokens": {
+            "type": "number",
+            "default": 700,
+            "order": 44,
+            "description": "%foxai.n230%"
+          },
+          "foxAi.planner.mode": {
+            "type": "string",
+            "default": "auto",
+            "enum": [
+              "auto",
+              "always",
+              "off"
+            ],
+            "order": 45,
+            "description": "%foxai.n231%"
+          },
+          "foxAi.planner.timeoutMs": {
+            "type": "number",
+            "default": 30000,
+            "order": 46,
+            "description": "%foxai.n232%"
+          },
+          "foxAi.selfConsistency.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 50,
+            "description": "%foxai.n233%"
+          },
+          "foxAi.selfConsistency.tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 51,
+            "description": "%foxai.n234%"
+          },
+          "foxAi.selfConsistency.sampleTemp": {
+            "type": "number",
+            "default": 0.8,
+            "order": 52,
+            "description": "%foxai.n235%"
+          },
+          "foxAi.tools.globalTimeout.enabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 60,
+            "description": "%foxai.n236%"
+          },
+          "foxAi.tools.globalTimeout.timeoutMs": {
+            "type": "number",
+            "default": 30000,
+            "order": 61,
+            "description": "%foxai.n237%"
+          },
+          "foxAi.tools.globalTimeout.maxFailures": {
+            "type": "number",
+            "default": 3,
+            "order": 62,
+            "description": "%foxai.n238%"
+          },
+          "foxAi.agent.toolProtocol": {
+            "type": "string",
+            "default": "auto",
+            "order": 4,
+            "enum": [
+              "auto",
+              "text"
+            ],
+            "enumDescriptions": [
+              "优先用原生 function calling，失败自动降级为文本协议",
+              "始终使用文本协议（适合不支持 tools 的本地小模型）"
+            ],
+            "description": "%foxai.n239%"
+          },
+          "foxAi.agent.terminalMode": {
+            "type": "string",
+            "default": "integrated",
+            "enum": [
+              "integrated",
+              "background"
+            ],
+            "enumDescriptions": [
+              "在可见的集成终端里执行（推荐，过程透明）",
+              "后台子进程执行，只把输出回传给 AI"
+            ],
+            "description": "%foxai.n240%"
+          },
+          "foxAi.agent.shell": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n241%"
+          },
+          "foxAi.agent.commandTimeout": {
+            "type": "number",
+            "default": 120000,
+            "description": "%foxai.n242%"
+          },
+          "foxAi.agent.blockedCommands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "%foxai.n243%"
+          },
+          "foxAi.agent.maxToolOutput": {
+            "type": "number",
+            "default": 8000,
+            "description": "%foxai.n244%"
+          },
+          "foxAi.agent.maxMessageBytes": {
+            "type": "number",
+            "default": 1048576,
+            "description": "%foxai.n245%"
+          },
+          "foxAi.agent.structuredOutput": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n246%"
+          },
+          "foxAi.agent.projectSkeleton": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n247%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n248%",
+        "properties": {
+          "foxAi.inlineCompletion.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n249%"
+          },
+          "foxAi.inlineCompletion.debounce": {
+            "type": "number",
+            "default": 350,
+            "description": "%foxai.n250%"
+          },
+          "foxAi.inlineCompletion.maxTokens": {
+            "type": "number",
+            "default": 128,
+            "description": "%foxai.n251%"
+          },
+          "foxAi.inlineCompletion.contextLines": {
+            "type": "number",
+            "default": 60,
+            "description": "%foxai.n252%"
+          },
+          "foxAi.inlineCompletion.useProjectContext": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n253%"
+          },
+          "foxAi.inlineCompletion.projectContextChars": {
+            "type": "number",
+            "default": 1000,
+            "description": "%foxai.n254%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n255%",
+        "properties": {
+          "foxAi.runtimes.installRoot": {
+            "type": "string",
+            "default": "C:\\Users\\asis\\.fox-ai\\runtimes",
+            "order": 1,
+            "markdownDescription": "%foxai.n256%"
+          },
+          "foxAi.runtimes.mirror": {
+            "type": "string",
+            "default": "auto",
+            "order": 2,
+            "enum": [
+              "auto",
+              "official",
+              "tsinghua"
+            ],
+            "enumDescriptions": [
+              "官方源优先，失败自动回退镜像（清华）",
+              "仅使用官方源，不回退",
+              "优先使用清华镜像（国内更快）"
+            ],
+            "description": "%foxai.n257%"
+          },
+          "foxAi.runtimes.elevation": {
+            "type": "string",
+            "default": "always",
+            "order": 3,
+            "enum": [
+              "always",
+              "session"
+            ],
+            "enumDescriptions": [
+              "每次需要管理员权限都弹 UAC 确认（最安全）",
+              "本次会话内一旦批准，后续不再弹扩展内确认（仍由系统弹一次 UAC）"
+            ],
+            "markdownDescription": "%foxai.n258%"
+          },
+          "foxAi.bridge.allowedCommands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "order": 4,
+            "markdownDescription": "%foxai.n259%"
+          },
+          "foxAi.bridge.silentAllowed": {
+            "type": "boolean",
+            "default": false,
+            "order": 5,
+            "description": "%foxai.n260%"
+          }
+        }
+      }
+    ]
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.93.0"
+  }
+}

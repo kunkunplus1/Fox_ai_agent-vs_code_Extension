@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; img-src ${cspSource} https: data:; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link href="${styleUri}" rel="stylesheet" />
+  <title>狐狸 AI</title>
+</head>
+<body>
+  <header class="topbar">
+    <button id="providerChip" class="chip" title="点击切换服务商" data-i18n-title="点击切换服务商">
+      <span class="dot"></span><span id="providerName" data-i18n="未连接">未连接</span>
+    </button>
+    <button id="modelChip" class="chip subtle" title="点击选择模型" data-i18n-title="点击选择模型"><span id="modelName">-</span></button>
+    <button id="apiModeChip" class="chip subtle" title="API 协议：chat / responses。点此切换" data-i18n-title="API 协议：chat / responses。点此切换" data-i18n="协议: Chat">协议: Chat</button>
+    <button id="btnPlanTasks" class="chip subtle" title="项目任务清单" data-i18n-title="项目任务清单" data-i18n="📋 任务">📋 任务</button>
+    <button id="btnContextUsage" class="chip subtle" title="上下文用量" data-i18n-title="上下文用量" data-i18n="📊 上下文">📊 上下文</button>
+    <button id="btnStorage" class="chip subtle" title="管理存储位置" data-i18n-title="管理存储位置" data-i18n="⚙️ 存储">⚙️ 存储</button>
+    <span class="spacer"></span>
+    <button id="agentChip" class="chip mode" title="智能体模式：可读写文件、执行命令" data-i18n-title="智能体模式：可读写文件、执行命令" data-i18n="智能体">智能体</button>
+    <button id="approveChip" class="chip subtle" title="自动批准级别" data-i18n-title="自动批准级别" data-i18n="确认">确认</button>
+    <button id="btnSettings" class="icon-btn" title="打开设置" data-i18n-title="打开设置">⚙</button>
+  </header>
+
+  <div id="planPanel" class="plan-panel hidden">
+    <div class="plan-head">
+      <span data-i18n="📋 项目任务清单">📋 项目任务清单</span>
+      <div class="plan-actions">
+        <button id="btnPlanOpenFile" class="mini ghost" title="在编辑器中打开任务清单文件" data-i18n-title="在编辑器中打开任务清单文件" data-i18n="打开文件">打开文件</button>
+        <button id="btnPlanClose" class="mini ghost">×</button>
+      </div>
+    </div>
+    <div id="planList" class="plan-list"></div>
+  </div>
+
+  <div id="contextPanel" class="context-panel hidden">
+    <div class="context-head">
+      <span data-i18n="📊 上下文用量">📊 上下文用量</span>
+      <div class="context-actions">
+        <label class="ctx-limit-input" title="上下文窗口大小（token 数），例如 128000。填了才会显示占比与触发自动压缩" data-i18n-title="上下文窗口大小（token 数），例如 128000。填了才会显示占比与触发自动压缩">
+          上限
+          <input id="contextWindowInput" type="number" min="0" step="1000" placeholder="如 128000" data-i18n-placeholder="如 128000" />
+        </label>
+        <button id="btnContextOpenSettings" class="mini ghost" title="打开 foxAi.contextWindow 设置" data-i18n-title="打开 foxAi.contextWindow 设置" data-i18n="设置页">设置页</button>
+        <button id="btnContextClose" class="mini ghost">×</button>
+      </div>
+    </div>
+    <div id="contextBody" class="context-body">
+      <div class="context-empty" data-i18n="发送消息后，这里会显示当前 prompt 的估算 token 分布。">发送消息后，这里会显示当前 prompt 的估算 token 分布。</div>
+    </div>
+  </div>
+
+  <main id="messages" class="messages">
+    <div class="welcome" id="welcome">
+      <div class="fox">🦊</div>
+      <h3 data-i18n="狐狸 AI 智能体">狐狸 AI 智能体</h3>
+      <p data-i18n-html="能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。">能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。</p>
+      <div class="quick">
+        <button class="quick-btn" data-q="看一下这个项目的结构，告诉我它是干什么的">🔍 摸清这个项目</button>
+        <button class="quick-btn" data-q="检查工作区里现在有哪些报错，并逐个修复">🛠 修掉所有报错</button>
+        <button class="quick-btn" data-q="读一下终端里最近的输出，看看有没有报错，有的话分析原因">📟 分析终端报错</button>
+        <button class="quick-btn" data-q="用一句话介绍你自己，并说明你现在跑在哪个模型上">✅ 测试模型连通</button>
+      </div>
+    </div>
+  </main>
+
+  <div id="errorBar" class="error-bar hidden"><span id="errorText"></span><button id="errorClose">×</button></div>
+
+  <div id="runBar" class="run-bar hidden">
+    <span class="run-dot"></span>
+    <span id="runText" data-i18n="思考中…">思考中…</span>
+    <span class="spacer"></span>
+    <button id="btnPause" class="mini" data-i18n="⏸ 暂停">⏸ 暂停</button>
+    <button id="btnResume" class="mini hidden" data-i18n="▶ 继续">▶ 继续</button>
+    <button id="btnStop" class="mini danger" data-i18n="■ 停止">■ 停止</button>
+  </div>
+
+  <div id="ragHint" class="rag-hint hidden"></div>
+
+  <footer class="composer">
+    <div id="attachments" class="attachments hidden"></div>
+    <div id="slashPopup" class="slash-popup hidden"></div>
+    <textarea id="input" rows="3" placeholder="让狐狸 AI 做点什么…（Enter 发送，Shift+Enter 换行；/mcp 查看可用 MCP 工具；需要调用插件或 MCP 时请明说）" data-i18n-placeholder="让狐狸 AI 做点什么…（Enter 发送，Shift+Enter 换行；/mcp 查看可用 MCP 工具；需要调用插件或 MCP 时请明说）"></textarea>
+    <div class="composer-actions">
+      <button id="btnAttach" class="mini ghost" title="上传图片或文件" data-i18n-title="上传图片或文件" data-i18n="📎 附件">📎 附件</button>
+      <button id="btnUndo" class="mini ghost" title="撤销 AI 的上一次文件改动" data-i18n-title="撤销 AI 的上一次文件改动" data-i18n="↩ 撤销改动">↩ 撤销改动</button>
+      <button id="btnRedo" class="mini ghost hidden" title="重做刚刚撤销的 AI 改动" data-i18n-title="重做刚刚撤销的 AI 改动" data-i18n="↪ 重做">↪ 重做</button>
+      <button id="btnReadTerminal" class="mini ghost" title="把 VS Code 终端的最新输出发给狐狸 AI" data-i18n-title="把 VS Code 终端的最新输出发给狐狸 AI" data-i18n="📟 读取终端">📟 读取终端</button>
+      <span class="spacer"></span>
+      <button id="btnSend" class="btn primary" data-i18n="发送">发送</button>
+    </div>
+  </footer>
+
+  <script nonce="${nonce}" src="${i18nUri}"></script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
+</body>
+</html>

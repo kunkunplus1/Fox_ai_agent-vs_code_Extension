@@ -1,0 +1,177 @@
+'use strict';
+
+/*
+ * src/messageSanitize.js — 对话历史清洗与硬截断
+ *
+ * 防止发给 OpenAI / DeepSeek 兼容格式的 messages 触发 400：
+ *   «Messages with role 'tool' must be a response to a preceding message
+ *    with 'tool_calls'»
+ *
+ * 同时提供按 token/字节上限的硬截断，避免 messages 无限膨胀导致内存与 token 双爆炸。
+ */
+
+const { estimateTokens, messageText } = require('./contextUsage');
+
+const DEFAULT_MAX_BYTES_PER_MSG = 12000;
+const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024; // 1MB
+
+function clampText(text, maxBytes) {
+  if (!text) return text;
+  const s = String(text);
+  if (s.length <= maxBytes) return s;
+  return s.slice(0, maxBytes) + `\n…（内容已截断，原 ${s.length} 字）`;
+}
+
+function clampMessage(m, maxBytes) {
+  if (!m) return m;
+  if (typeof m.content === 'string') {
+    if (m.content.length <= maxBytes) return m;
+    return Object.assign({}, m, { content: clampText(m.content, maxBytes) });
+  }
+  if (Array.isArray(m.content)) {
+    return Object.assign({}, m, {
+      content: m.content.map((c) => {
+        if (c && c.type === 'text' && c.text && c.text.length > maxBytes) {
+          return Object.assign({}, c, { text: clampText(c.text, maxBytes) });
+        }
+        return c;
+      })
+    });
+  }
+  return m;
+}
+
+/**
+ * @param {Array} messages  原始消息数组（含 system 也不要紧，这里会过滤）
+ * @param {string} protocol 'native' | 'text'
+ * @param {number} maxHistory 保留基数，实际保留 maxHistory*2 条
+ * @param {object} [opts]
+ * @param {number} [opts.maxBytesPerMessage=12000] 单条消息最大字符数
+ * @param {number} [opts.maxTotalBytes=1048576] 历史总字符数硬上限
+ * @returns {Array} 清洗后的消息数组
+ */
+function trimHistory(messages, protocol, maxHistory, opts) {
+  opts = opts || {};
+  const maxBytesPerMsg = opts.maxBytesPerMessage || DEFAULT_MAX_BYTES_PER_MSG;
+  const maxTotalBytes = opts.maxTotalBytes || DEFAULT_MAX_TOTAL_BYTES;
+  const limit = Math.max(6, (maxHistory || 20) * 2);
+  let list = (messages || []).filter((m) => m && m.role !== 'system');
+
+  // 1) 单条消息截断：防止 read_file / search_text / terminal 输出把单条消息撑爆
+  list = list.map((m) => clampMessage(m, maxBytesPerMsg));
+
+  // 1.5) 旧工具结果摘要化：超出「最近窗口」的旧 role:'tool' 长结果，剥离原始数据，
+  //      仅保留「调过什么 / 成败」的元摘要，既省 token 又保留执行轨迹（优于直接丢弃）。
+  const RECENT_TOOL_KEEP = 20; // 最近 20 条不摘要（约最近 10 轮，防止模型因摘要化丢失信息而反复重读）
+  const toolCutoff = Math.max(0, list.length - RECENT_TOOL_KEEP);
+  for (let i = 0; i < toolCutoff; i++) {
+    const m = list[i];
+    if (m && m.role === 'tool' && typeof m.content === 'string' && m.content.length > 500) {
+      const c = m.content;
+      const failed = /\[MCP 工具报错\]|status=error|执行失败/i.test(c.slice(0, 400));
+      // read_file 结果：保留前 300 字符的开场白，让模型记得「读过什么文件、内容第一行是什么」
+      const isReadFile = m.name === 'read_file';
+      const preview = isReadFile ? c.replace(/[\n\r]+/g, ' ').slice(0, 300) : '';
+      const previewPart = preview ? `，内容开头：「${preview}…」` : '';
+      list[i] = Object.assign({}, m, {
+        content: '[历史工具结果摘要] ' + (m.name || '工具') + ' 调用' + (failed ? '失败' : '成功') + '，原始结果约 ' + c.length + ' 字符' + previewPart + '（如需完整内容可重新调用该工具）。'
+      });
+    }
+  }
+
+  // 2) 超长截断：从尾部保留最近 limit 条，但不能把「assistant(tool_calls) + 其 tool 结果」
+  //    整块切断，否则会留下孤立 tool 消息导致 400。
+  if (list.length > limit) {
+    let start = list.length - limit;
+    while (start > 0 && list[start - 1] && list[start - 1].role === 'tool') start--;
+    if (start > 0 && list[start - 1] && list[start - 1].role === 'assistant' && list[start - 1].tool_calls) {
+      start--;
+    }
+    list = list.slice(start);
+  }
+  // 去掉开头可能残留的孤立 tool 消息
+  while (list.length && list[0].role === 'tool') list.shift();
+
+  // 3) 总字节硬上限：从最早的消息开始丢，丢到总字符低于阈值；同样保证不切断 tool 对
+  let total = list.reduce((s, m) => s + messageText(m).length, 0);
+  if (total > maxTotalBytes) {
+    let start = 0;
+    while (total > maxTotalBytes && start < list.length - 4) {
+      const removed = list[start];
+      let removeCount = 1;
+      // 如果起点是 assistant(tool_calls)，把后续对应的 tool 结果一起丢掉
+      if (removed.role === 'assistant' && removed.tool_calls) {
+        const ids = new Set(removed.tool_calls.map((t) => t.id));
+        let i = start + 1;
+        while (i < list.length && list[i].role === 'tool' && ids.has(list[i].tool_call_id)) {
+          i++;
+          removeCount++;
+        }
+      }
+      for (let i = 0; i < removeCount && start < list.length; i++) {
+        total -= messageText(list[start]).length;
+        list.splice(start, 1);
+      }
+    }
+    // 再次清理开头孤立 tool
+    while (list.length && list[0].role === 'tool') list.shift();
+  }
+
+  // 收集每条 tool 结果的 tool_call_id
+  const ids = new Set();
+  for (const m of list) if (m.role === 'tool' && m.tool_call_id) ids.add(m.tool_call_id);
+
+  if (protocol === 'native') {
+    // 4) 丢弃「孤立 tool 消息」
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      if (m.role === 'tool') {
+        let ok = false;
+        for (let j = i - 1; j >= 0; j--) {
+          const p = list[j];
+          if (p.role === 'assistant') {
+            ok = !!(p.tool_calls && p.tool_calls.some((t) => t.id === m.tool_call_id));
+            break;
+          }
+          if (p.role === 'user') break;
+        }
+        if (!ok) continue;
+      }
+      out.push(m);
+    }
+    list = out;
+    // 5) 清理 assistant 里没有对应 tool 结果的 tool_calls
+    return list.map((m) => {
+      if (m.role === 'assistant' && m.tool_calls) {
+        const kept = m.tool_calls.filter((t) => ids.has(t.id));
+        if (kept.length === m.tool_calls.length) return m;
+        const copy = Object.assign({}, m);
+        if (kept.length) copy.tool_calls = kept;
+        else delete copy.tool_calls;
+        if (!copy.content && !copy.tool_calls) copy.content = '(略)';
+        return copy;
+      }
+      return m;
+    });
+  }
+
+  // 文本协议（或降级后）：不允许 role:'tool'，把残留 tool 结果转成 user 文本
+  return list.map((m) => {
+    if (m.role === 'tool') {
+      return {
+        role: 'user',
+        content: `[工具 ${m.name || 'unknown'} 的结果]\n${m.content || ''}\n\n请根据结果继续，或给出最终回答。`
+      };
+    }
+    if (m.role === 'assistant' && m.tool_calls) {
+      const c = Object.assign({}, m);
+      delete c.tool_calls;
+      if (!c.content) c.content = '(已调用工具并获取结果)';
+      return c;
+    }
+    return m;
+  });
+}
+
+module.exports = { trimHistory, clampText, clampMessage };
