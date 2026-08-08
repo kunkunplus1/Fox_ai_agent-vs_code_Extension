@@ -301,6 +301,61 @@ body {
   background: var(--vscode-editorWidget-background, rgba(128,128,128,.07));
 }
 
+/* 执行步骤时间线 */
+.step-item {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  margin: 0 0 6px;
+  padding-left: 22px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.step-item .step-rail {
+  position: absolute;
+  left: 9px;
+  top: 4px;
+  bottom: -6px;
+  width: 2px;
+  background: var(--vscode-panel-border, rgba(128,128,128,.3));
+}
+.step-item:last-child .step-rail { bottom: 50%; }
+.step-item .step-icon {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  background: var(--vscode-editor-background, #1e1e1e);
+  border-radius: 50%;
+}
+.step-item .step-main { flex: 1; min-width: 0; }
+.step-row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.step-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-foreground, #ddd); }
+.step-state { font-size: 11px; flex: 0 0 auto; }
+.step-item.status-ok .step-state { color: var(--vscode-charts-green, #3fb950); }
+.step-item.status-error .step-state { color: var(--vscode-errorForeground, #f14c4c); }
+.step-item.status-running .step-state { animation: stepPulse 1.2s ease-in-out infinite; }
+@keyframes stepPulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+.step-detail {
+  display: none;
+  margin: 2px 4px 2px 0;
+  padding: 4px 6px;
+  border-left: 2px solid var(--vscode-panel-border, rgba(128,128,128,.3));
+  background: var(--vscode-editorWidget-background, rgba(128,128,128,.06));
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--vscode-descriptionForeground, #999);
+}
+.step-item.open .step-detail { display: block; }
+
 /* ---------- 审批 ---------- */
 .approval {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
@@ -330,6 +385,17 @@ body {
 .review-card .review-body h4 { font-size: 12.5px; margin: 6px 0 2px; }
 .review-card .review-body .li { display: block; }
 .review-card .review-body br + .li { margin-top: 2px; }
+.review-card .review-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; }
+.review-card .review-actions button:disabled {
+  opacity: .65;
+  cursor: not-allowed;
+  filter: grayscale(.3);
+}
+.review-card .review-status {
+  font-size: 11.5px;
+  opacity: .75;
+  font-style: italic;
+}
 
 .plan-pending {
   border: 1px solid var(--vscode-focusBorder, #007acc);

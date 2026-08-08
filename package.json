@@ -1,8 +1,8 @@
 {
   "name": "fox-ai",
-  "displayName": "%foxai.n1%",
-  "description": "%foxai.n2%",
-  "version": "0.8.71",
+  "displayName": "狐狸 AI 智能体",
+  "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
+  "version": "0.8.80",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "engines": {
@@ -1255,6 +1255,14 @@
             "default": true,
             "order": 1.6,
             "description": "%foxai.n216%"
+          },
+          "foxAi.review.injectTimeout": {
+            "type": "number",
+            "default": 8000,
+            "minimum": 0,
+            "maximum": 60000,
+            "order": 1.61,
+            "description": "%foxai.n216a%"
           },
           "foxAi.agent.autoApprove": {
             "type": "string",

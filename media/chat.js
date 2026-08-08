@@ -5,6 +5,7 @@
   const $ = (id) => document.getElementById(id);
 
   const messagesEl = $('messages');
+  const stepItems = {};
   const inputEl = $('input');
   const btnSend = $('btnSend');
   const btnAttach = $('btnAttach');
@@ -377,6 +378,7 @@
 
   const KIND_ICON = { read: '📖', edit: '✏️', exec: '⚡' };
   const STATUS_ICON = { running: '⏳', ok: '✅', error: '❌', rejected: '🚫' };
+  const STEP_ICON = { llm: '🧠', read: '🔍', write: '✏️', edit: '✏️', delete: '🗑️', exec: '🖥️', command: '🖥️', info: '•', review: '🔎', approval: '⏳', done: '✅', error: '❌' };
 
   function addToolCard(msg) {
     hideWelcome();
@@ -451,6 +453,37 @@
       card.classList.add('open');
     }
     scrollDown();
+  }
+
+  function addStep(msg) {
+    hideWelcome();
+    let el = stepItems[msg.id];
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'step-item';
+      el.dataset.id = msg.id;
+      el.innerHTML =
+        '<div class="step-rail"></div>' +
+        '<div class="step-icon"></div>' +
+        '<div class="step-main">' +
+          '<div class="step-row">' +
+            '<span class="step-title"></span>' +
+            '<span class="step-state"></span>' +
+          '</div>' +
+          '<div class="step-detail"></div>' +
+        '</div>';
+      el.querySelector('.step-title').addEventListener('click', () => el.classList.toggle('open'));
+      messagesEl.appendChild(el);
+      stepItems[msg.id] = el;
+    }
+    el.className = 'step-item kind-' + (msg.kind || 'info') + ' status-' + (msg.status || 'running') + (msg.detail ? ' has-detail' : '');
+    el.querySelector('.step-icon').textContent = STEP_ICON[msg.kind] || '•';
+    el.querySelector('.step-title').textContent = msg.title || '';
+    const st = msg.status || 'running';
+    el.querySelector('.step-state').textContent = st === 'ok' ? '✓' : st === 'error' ? '✗' : '⏳';
+    if (msg.detail) el.querySelector('.step-detail').textContent = msg.detail;
+    scrollDown();
+    return el;
   }
 
   function appendToolStream(msg) {
@@ -548,17 +581,47 @@
     hideWelcome();
     const files = msg.files || [];
     const text = msg.text || '';
+    const id = msg.id || '';
     const filesHtml = files.length
       ? '<div class="review-files">' + t('审查文件：') + files.map((f) => '<code>' + escapeHtml(f) + '</code>').join('、') + '</div>'
       : '';
     const box = document.createElement('div');
     box.className = 'review-card';
+    if (id) box.dataset.reviewId = id;
     box.innerHTML =
       '<div class="review-head">' + t('🔍 代码审查意见（自动）') + '</div>' +
       filesHtml +
-      '<div class="review-body">' + miniMarkdown(text) + '</div>';
+      '<div class="review-body">' + miniMarkdown(text) + '</div>' +
+      '<div class="review-actions">' +
+        '<button class="mini primary" data-act="apply-review">' + t('✅ 按审查意见修正') + '</button>' +
+        '<span class="review-status"></span>' +
+      '</div>';
+    const applyBtn = box.querySelector('[data-act="apply-review"]');
+    const statusEl = box.querySelector('.review-status');
+    if (applyBtn) {
+      applyBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'applyReview', text, id });
+        applyBtn.disabled = true;
+        applyBtn.textContent = t('修正中…');
+        if (statusEl) statusEl.textContent = '';
+      });
+    }
     messagesEl.appendChild(box);
     scrollDown(true);
+  }
+
+  function updateReviewButton(msg) {
+    const box = msg.id ? messagesEl.querySelector('.review-card[data-review-id="' + msg.id + '"]') : messagesEl.querySelector('.review-card:last-child');
+    if (!box) return;
+    const btn = box.querySelector('[data-act="apply-review"]');
+    const statusEl = box.querySelector('.review-status');
+    if (msg.state === 'queued') {
+      if (btn) { btn.disabled = true; btn.textContent = t('排队中'); }
+      if (statusEl) statusEl.textContent = msg.text || t('主任务结束后自动应用');
+    } else if (msg.state === 'applied') {
+      if (btn) { btn.disabled = true; btn.textContent = t('已应用'); }
+      if (statusEl) statusEl.textContent = '';
+    }
   }
 
   function addNotice(text) {
@@ -1041,6 +1104,9 @@
         case 'tool':
           addToolCard(msg);
           break;
+        case 'step':
+          addStep(msg);
+          break;
         case 'toolStream':
           appendToolStream(msg);
           break;
@@ -1064,6 +1130,7 @@
           hideRagHint();
           for (const k of Object.keys(live)) delete live[k];
           for (const k of Object.keys(toolCards)) delete toolCards[k];
+          for (const k of Object.keys(stepItems)) delete stepItems[k];
           attachments = [];
           renderAttachments();
           break;
@@ -1088,6 +1155,9 @@
           break;
         case 'review':
           addReview(msg);
+          break;
+        case 'reviewApplied':
+          updateReviewButton(msg);
           break;
         case 'contextUsage':
           renderContextUsage(msg);

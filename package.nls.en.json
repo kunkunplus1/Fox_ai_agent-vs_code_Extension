@@ -1,6 +1,4 @@
 {
-  "foxai.n1": "Fox AI Agent",
-  "foxai.n2": "A coding agent inside VS Code: connects to local llama.cpp / Ollama or domestic APIs such as DeepSeek, Zhipu, Qwen, Kimi, SiliconFlow, etc. It can read/write workspace files, run terminal commands, read errors and auto-fix them, with pause / resume / cancel throughout.",
   "foxai.n3": "Fox AI",
   "foxai.n4": "Sessions",
   "foxai.n5": "Files",
@@ -215,6 +213,7 @@
   "foxai.n214": "Enable agent mode: allow the AI to read/write workspace files, run terminal commands, and read diagnostics. When off, degrades to pure Q&A.",
   "foxai.n215": "Plan-and-Execute confirmation mode: for multi-step tasks the AI first lists a complete plan and submits it; it executes only after you confirm. To adjust the plan during execution it must call revise_plan with a reason and be confirmed again before continuing.",
   "foxai.n216": "Automatic code review (Code Review sub-agent): after writing code (edit_file/write_file/delete_file succeeds), automatically run a read-only review sub-agent on the change, show its comments in chat and feed them back as observations to help reduce low-level errors.",
+  "foxai.n216a": "Review injection timeout (ms): before the main agent outputs its final answer, wait up to this many milliseconds for the review sub-agent. If the review finishes in time, its feedback is injected into the system prompt for the main agent; otherwise the agent answers first and the review card appears later with a one-click apply button. 0 means don't wait.",
   "foxai.n217": "Auto-approve level",
   "foxai.n218": "Max consecutive tool-call steps per task (hard cap to prevent infinite loops burning tokens). Exceeding it pauses and (if auto-compression is on) compresses context.",
   "foxai.n219": "Max times to auto-send \"continue\" and re-call when a single reply is truncated by length limit (finish_reason=length/incomplete). 0 disables auto-continue.",

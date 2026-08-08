@@ -102,6 +102,12 @@ class ChatViewProvider {
     this.attachments = []; // 当前输入框待发送的附件
     /** 上一轮“真实”用户输入（非切换指令），用于「换agent」时复述原问题重交智能体 */
     this._lastUserTurn = null;
+    /** 主任务尚未 idle 时收到的审查卡片，暂存到 session 结束后再弹出 */
+    this._pendingReviewCard = null;
+    /** 用户点击「按审查意见修正」时若 session 正忙，把 prompt 暂存到 idle 后自动执行 */
+    this._pendingApplyReview = null;
+    /** 规划待确认时保留的 session 引用（此时主任务未真正结束） */
+    this._planPendingSession = null;
     this.sessionManager = new SessionManager(context);
     this._sessionChangeListener = null;
     /** 项目任务清单 */
@@ -280,6 +286,19 @@ class ChatViewProvider {
         if (msg.src) await this._saveGeneratedImage(msg.src, msg.name);
         break;
       }
+      case 'applyReview': {
+        if (!msg.text) break;
+        const prompt = '【代码审查意见】\n' + msg.text + '\n\n请检查本次改动是否需要修正；若需要，请直接执行修正并给出最终回答。';
+        // 若主任务还在跑（含 plan-pending 暂停），先把审查修正请求排队；等 session 真正 idle 后自动执行。
+        if (this.session || this._planPendingSession) {
+          this._pendingApplyReview = { text: prompt, showText: i18n.tw('按审查意见修正'), id: msg.id };
+          this.post({ type: 'reviewApplied', id: msg.id, state: 'queued', text: i18n.tw('主任务尚未结束，已排队，结束后将自动应用审查意见。') });
+          break;
+        }
+        await this.ask(prompt, { showText: i18n.tw('按审查意见修正') });
+        this.post({ type: 'reviewApplied', id: msg.id, state: 'applied' });
+        break;
+      }
       case 'newFile': {
         const doc = await vscode.workspace.openTextDocument({ content: msg.code || '' });
         await vscode.window.showTextDocument(doc, { preview: false });
@@ -453,7 +472,7 @@ class ChatViewProvider {
         if (p && typeof p.then === 'function') p.then(() => {}, () => {});
       } catch (_) {}
     }
-    if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'notice', 'error'].includes(msg.type)) {
+    if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'step', 'notice', 'error'].includes(msg.type)) {
       this.transcript.push(msg);
       // 限制气泡历史数量，避免长会话内存线性增长
       const TRANSCRIPT_LIMIT = 200;
@@ -485,6 +504,11 @@ class ChatViewProvider {
       redoCount: undo.redoSize(),
       sessionTitle: (this.sessionManager.current() || {}).title || '新会话'
     });
+    const finalState = state || (this.session ? 'running' : 'idle');
+    if (finalState === 'idle' && this._lastThinkingId) {
+      this.post({ type: 'step', id: this._lastThinkingId, status: 'ok' });
+      this._lastThinkingId = null;
+    }
   }
 
   async show() {
@@ -1260,10 +1284,15 @@ class ChatViewProvider {
       }
     } catch (err) {
       this.endBubble();
-      const msg = (err && err.message) || String(err);
-      log('session.run error:', msg, '\nstack:', err && err.stack);
-      this.post({ type: 'error', text: msg });
-      vscode.window.showErrorMessage(i18n.tw('狐狸 AI 请求失败：{0}', msg));
+      if (err && err.isQuota) {
+        // 额度/余额耗尽：agent 已 emit 友好提示并中止了审查子代理；记忆由 finally 的 _saveCurrentSession 兜底保留
+        vscode.window.showWarningMessage(i18n.tw('模型额度/余额不足，已自动停止并保留本次对话。请充值后重试。'));
+      } else {
+        const msg = (err && err.message) || String(err);
+        log('session.run error:', msg, '\nstack:', err && err.stack);
+        this.post({ type: 'error', text: msg });
+        vscode.window.showErrorMessage(i18n.tw('狐狸 AI 请求失败：{0}', msg));
+      }
     } finally {
       if (this.session === session) {
         this.session = null;
@@ -1279,6 +1308,17 @@ class ChatViewProvider {
         }
         this._saveCurrentSession();
         this.pushStatus('idle');
+        // session 真正 idle 后：补发被抑制的审查卡片，并自动执行排队的审查修正
+        if (this._pendingReviewCard) {
+          const card = this._pendingReviewCard;
+          this._pendingReviewCard = null;
+          this.post({ type: 'review', files: card.files, text: card.text, id: card.id });
+        }
+        if (this._pendingApplyReview) {
+          const pending = this._pendingApplyReview;
+          this._pendingApplyReview = null;
+          this.ask(pending.text, { showText: pending.showText }).catch(() => {});
+        }
       }
     }
   }
@@ -1360,6 +1400,12 @@ class ChatViewProvider {
       },
       toolStart: ({ id, name, kind, title, args, preview }) => {
         this.endBubble();
+        // 步骤时间线：工具调用前先收尾仍在运行的「思考」步骤，再开本条工具步骤
+        if (self._lastThinkingId) {
+          self.post({ type: 'step', id: self._lastThinkingId, status: 'ok' });
+          self._lastThinkingId = null;
+        }
+        self.post({ type: 'step', id, kind: kind || 'info', title, status: 'running' });
         if (preview && preview.before !== undefined) {
           this.previews.set(id, { path: preview.path, before: preview.before, after: preview.after });
         }
@@ -1388,13 +1434,33 @@ class ChatViewProvider {
           status: rejected ? 'rejected' : ok ? 'ok' : 'error',
           output: String(output || '').slice(0, 4000)
         });
+        self.post({ type: 'step', id, status: rejected ? 'error' : ok ? 'ok' : 'error', detail: String(output || '').slice(0, 240) });
         self.pushStatus();
       },
       requestApproval: (req, cb) => {
         this.approvalResolvers.set(req.id, cb);
         this.post({ type: 'approval', id: req.id, name: req.name, kind: req.kind, title: req.title });
+        this.post({ type: 'step', id: 'ap-' + req.id, kind: 'approval', title: i18n.tw('等待审批：{0}', req.title || req.name), status: 'running' });
       },
-      state: ({ state }) => this.pushStatus(state),
+      step: ({ id, kind, title, detail, status }) => {
+        self._stepSeq = self._stepSeq || 0;
+        // 完成/出错到达时，先收尾仍在运行的「思考」步骤，避免时间线末尾残留 ⏳
+        if ((kind === 'done' || kind === 'error') && self._lastThinkingId) {
+          self.post({ type: 'step', id: self._lastThinkingId, status: 'ok' });
+          self._lastThinkingId = null;
+        }
+        self.post({ type: 'step', id: id || ('s' + (++self._stepSeq)), kind: kind || 'info', title: title || '', detail: detail || '', status: status || 'running' });
+      },
+      state: ({ state }) => {
+        this.pushStatus(state);
+        if (state === 'thinking') {
+          this._stepSeq = this._stepSeq || 0;
+          if (this._lastThinkingId) this.post({ type: 'step', id: this._lastThinkingId, status: 'ok' });
+          const sid = 'st' + (++this._stepSeq);
+          this._lastThinkingId = sid;
+          this.post({ type: 'step', id: sid, kind: 'llm', title: i18n.tw('调用模型'), status: 'running' });
+        }
+      },
       notice: ({ text }) => this.post({ type: 'notice', text }),
       contextUsage: (data) => {
         this.lastContextUsage = data;
@@ -1408,8 +1474,14 @@ class ChatViewProvider {
       plan: ({ steps }) => {
         self.post({ type: 'plan', steps: steps || [] });
       },
-      review: ({ files, text }) => {
-        self.post({ type: 'review', files: files || [], text: text || '' });
+      review: ({ files, text, id }) => {
+        // 若主任务还在跑（或处于 plan-pending 暂停），先把卡片暂存，等 session 真正 idle 再弹出。
+        // 避免用户在主任务未结束时看到卡片、点了「应用」却提示「还在忙」。
+        if (self.session || self._planPendingSession) {
+          self._pendingReviewCard = { files: files || [], text: text || '', id: id || null };
+          return;
+        }
+        self.post({ type: 'review', files: files || [], text: text || '', id: id || null });
       }
     };
   }

@@ -285,10 +285,12 @@ async function writeFile(args, ctx) {
   return `${had ? '已覆盖' : '已创建'} ${relative(uri)}（+${delta.added} -${delta.removed} 行）`;
 }
 
-async function editFile(args, ctx) {
-  const uri = resolveWriteUri(args, ctx);
-  if (!(await exists(uri))) throw new Error('文件不存在：' + args.path);
-  const rawBefore = await readText(uri);
+/**
+ * 纯函数：根据 edit_file 参数计算编辑后的内容。
+ * 返回 { before: 原始文本, after: 编辑后文本, editKind, replacedCount }。
+ * 与 editFile 实际写入逻辑保持一致，避免审批预览与实际执行不一致。
+ */
+function previewEditFile(args, rawBefore) {
   const le = detectLineEnding(rawBefore);
   const before = toLf(rawBefore);
   const oldText = toLf(String(args.old_text == null ? '' : args.old_text));
@@ -335,7 +337,7 @@ async function editFile(args, ctx) {
     const count = countOccurrences(searchSpace, oldText);
     if (count === 0) {
       const hint = nearestHint(searchSpace, oldText);
-      throw new Error(`在 ${relative(uri)} 的指定范围里找不到 old_text。${hint}`);
+      throw new Error(`找不到 old_text。${hint}`);
     }
     if (count > 1 && !args.replace_all) {
       throw new Error(
@@ -343,9 +345,11 @@ async function editFile(args, ctx) {
       );
     }
 
+    // 注意：用函数式替换，避免 new_text 中的 $$ / $& / $` / $' / $n 被当作特殊替换模式解释。
+    // 否则模型想写入「$$eval」会被静默变成「$eval」，正是历史死循环的根因。
     const midAfter = args.replace_all
       ? searchSpace.split(oldText).join(newText)
-      : searchSpace.replace(oldText, newText);
+      : searchSpace.replace(oldText, () => newText);
     after = prefix + midAfter + suffix;
     replacedCount = args.replace_all ? count : 1;
   }
@@ -362,7 +366,23 @@ async function editFile(args, ctx) {
     throw new Error('old_text 不能为空，创建新文件请用 write_file');
   }
 
-  const finalAfter = fromLf(after, le);
+  return { before: rawBefore, after: fromLf(after, le), editKind, replacedCount };
+}
+
+async function editFile(args, ctx) {
+  const uri = resolveWriteUri(args, ctx);
+  if (!(await exists(uri))) throw new Error('文件不存在：' + args.path);
+  const rawBefore = await readText(uri);
+
+  let result;
+  try {
+    result = previewEditFile(args, rawBefore);
+  } catch (e) {
+    // 把纯函数里的错误消息补回文件路径，保持原有提示体验
+    throw new Error(`${relative(uri)}：${e.message}`);
+  }
+  const finalAfter = result.after;
+
   const doc = await vscode.workspace.openTextDocument(uri);
   const edit = new vscode.WorkspaceEdit();
   const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
@@ -373,7 +393,7 @@ async function editFile(args, ctx) {
 
   if (ctx && ctx.recordUndo) ctx.recordUndo({ uri, before: rawBefore, after: finalAfter, existed: true });
   const delta = diffStat(rawBefore, finalAfter);
-  return `已修改 ${relative(uri)}（${editKind} ${replacedCount} 处，+${delta.added} -${delta.removed} 行）`;
+  return `已修改 ${relative(uri)}（${result.editKind} ${result.replacedCount} 处，+${delta.added} -${delta.removed} 行）`;
 }
 
 function charIndexAt(lines, line, char) {
@@ -753,6 +773,7 @@ module.exports = {
   readFile,
   writeFile,
   editFile,
+  previewEditFile,
   listDir,
   findFiles,
   searchText,

@@ -82,6 +82,23 @@ class Cancelled extends Error {
   }
 }
 
+/** 模型额度/余额耗尽（含 402/403/429 限流）：需自动终止并保留记忆 */
+class QuotaError extends Error {
+  constructor(message) {
+    super(message || '额度或余额不足');
+    this.name = 'QuotaError';
+    this.isQuota = true;
+  }
+}
+
+/** 判断错误是否为额度/余额耗尽（含 402/403/429 限流）。供 run() 自动终止与测试复用 */
+function isQuotaError(err) {
+  const msg = String((err && err.message) || err || '');
+  const status = (err && (err.status || err.httpStatus)) || 0;
+  return /insufficient|balance|quota|exhaust|额度|余额|credit|too many requests|rate.?limit|\b402\b|\b403\b|\b429\b/i.test(msg)
+    || [402, 403, 429].includes(Number(status));
+}
+
 /** 简单的取消令牌，传给耗时工具 */
 function makeToken() {
   const listeners = [];
@@ -266,6 +283,7 @@ class AgentSession {
     this.state = 'idle';
     this.stream = null;
     this.token = makeToken();
+    this._abortCtrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     this._resumeWaiters = [];
     this._pendingApproval = null;
     this.protocol = 'native';
@@ -291,6 +309,12 @@ class AgentSession {
     // 自动代码审查：本轮代码写操作收集到这里，工具循环结束后触发一次 review
     this._pendingReview = [];
     this._reviewing = false;
+    this._reviewPromise = null; // 当前正在跑的审查 Promise
+    this._reviewResult = null; // 已完成的审查结果（供 _awaitReview 取走）
+    this._reviewInjected = false; // 本轮审查是否已被注入 system 供主控参考
+    this._reviewConsumed = false; // 本轮审查卡片是否已被 emit（避免 _doReview 与 _awaitReview 重复推送）
+    this._reviewQuotaError = null; // 审查子代理遇到的配额错误，需冒泡给 run() 统一处理
+    this._reviewId = null; // 当前这轮审查卡片的唯一 id，供前端 applyReview 对应
     // 续跑：关联会话 id 与要复用的任务 id
     this.sessionId = opts.sessionId || null;
     this.resumeTaskId = opts.resumeTaskId || null;
@@ -323,6 +347,7 @@ class AgentSession {
     this.cancelled = true;
     this.paused = false;
     this.token.cancel();
+    try { if (this._abortCtrl) this._abortCtrl.abort(); } catch (_) {}
     if (this.stream) {
       try {
         this.stream.abort();
@@ -488,6 +513,11 @@ class AgentSession {
     if (!this._scVerified) this._scVerified = new Set();
     // 每次用户提问都重置自动继续计数
     this._continuesUsed = 0;
+    // 每轮用户提问重置审查注入状态（本轮新的审查结果才应被主控参考）
+    this._reviewInjected = false;
+    this._reviewConsumed = false;
+    this._reviewResult = null;
+    this._reviewQuotaError = null;
 
     // ---- Harness：任务状态机 ----
     if (this.taskManager) {
@@ -608,6 +638,18 @@ class AgentSession {
         this.state = 'thinking';
         this.emit('state', { state: 'thinking', step: this.stepCount });
 
+        // 等待本轮可能触发的代码审查结果（限时，默认 8s）。
+        // 若审查在限时内完成，把摘要注入 system 供主控参考，主控的最终回答会自然吸纳这些意见；
+        // 若超时，主控先回答，审查完成后异步弹出 review 卡片，用户可一键应用。
+        const reviewTimeout = (cfg.review && typeof cfg.review.injectTimeout === 'number')
+          ? cfg.review.injectTimeout
+          : 8000;
+        const reviewSnapshot = await this._awaitReview(reviewTimeout);
+        const reviewInjectText = (reviewSnapshot && reviewSnapshot.text)
+          ? '\n\n【本轮代码审查意见】\n' + reviewSnapshot.text +
+            '\n请把这些意见纳入当前思考；若认同，在最终回答中说明你将如何修正。'
+          : '';
+
         const preparedHistory = await this.prepareHistory();
         this._emitContextUsage({
           baseSystem,
@@ -620,7 +662,7 @@ class AgentSession {
           maxTokens: cfg.maxTokens,
           contextWindow: cfg.contextWindow
         });
-        const payload = [{ role: 'system', content: system }].concat(preparedHistory);
+        const payload = [{ role: 'system', content: system + reviewInjectText }].concat(preparedHistory);
         const useNative = this.protocol === 'native';
 
         let result;
@@ -760,6 +802,7 @@ class AgentSession {
           }
           // 任务结束前尝试一次上下文压缩（防止戛然而止导致压缩永远不触发）
           try { await this._maybeAutoCompress(queryText, envBrief); } catch (_) {}
+          this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
           return { finished: true, text: visibleText };
         }
 
@@ -770,9 +813,9 @@ class AgentSession {
           if (this.cancelled) throw new Cancelled();
         }
 
-        // 自动代码审查：本轮有代码写操作则触发一次只读审查子代理
+        // 自动代码审查：本轮有代码写操作则在后台异步触发（不阻塞主代理最终回复，与主回复并行执行）
         if (this._pendingReview.length) {
-          await this._runCodeReview();
+          this._runCodeReview();
         }
 
         // 规划确认模式：模型刚提交/修订了计划 → 暂停，等用户在面板确认后再继续
@@ -813,7 +856,25 @@ class AgentSession {
         if (this.task) {
           try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.CANCELLED); } catch (_) {}
         }
+        this.emit('step', { kind: 'error', title: '已取消', status: 'error' });
         return { finished: false, reason: 'cancelled' };
+      }
+      // 额度/余额耗尽（含 402/403/429 限流）：自动终止并保留记忆，避免主模型报错后审查子代理再用同一 Key 空转
+      // 也包括审查子代理在后台遇到的配额错误（_reviewQuotaError）。
+      if (isQuotaError(err) || this._reviewQuotaError) {
+        this.state = 'error';
+        this._quotaExhausted = true;
+        this.cancelled = true; // 让仍在后台的审查子代理（_silentCall / _runCodeReview）立即退出
+        try { if (this._abortCtrl) this._abortCtrl.abort(); } catch (_) {}
+        const qmsg = String((this._reviewQuotaError && this._reviewQuotaError.message) || (err && err.message) || err || '');
+        this.emit('notice', {
+          text: '⚠️ 模型额度/余额不足，已自动停止并保留本次对话：' + qmsg.split('\n')[0].slice(0, 160)
+        });
+        if (this.task) {
+          try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.FAILED); } catch (_) {}
+        }
+        this.emit('step', { kind: 'error', title: '额度/余额不足', status: 'error' });
+        throw new QuotaError(qmsg);
       }
       this.state = 'error';
       if (this.task) {
@@ -822,6 +883,7 @@ class AgentSession {
           await this.taskManager.updateState(this.task.id, harness.TASK_STATES.FAILED);
         } catch (_) {}
       }
+      this.emit('step', { kind: 'error', title: '执行出错', status: 'error' });
       throw err;
     } finally {
       this.stream = null;
@@ -845,69 +907,152 @@ class AgentSession {
   }
 
   /** 生成本次改动的摘要，供审查子代理阅读（截断过长的片段） */
-  _reviewSummary(name, args) {
+  _reviewSummary(name, args, before, after) {
     const cut = (s, n) => (s == null ? '' : String(s).length > n ? String(s).slice(0, n) + `…（已截断，共 ${String(s).length} 字）` : String(s));
+    const path = args.path || '';
     if (name === 'delete_file') {
       const scope = args.start_line ? ` 删除行 ${args.start_line}-${args.end_line || args.start_line}` : '';
-      return `删除文件/范围：${args.path}${scope}`;
+      return `删除文件/范围：${path}${scope}`;
+    }
+    // 优先展示“文件真实改动”（before/after 取自磁盘），避免模型给错 old/new 参数时审查被误导
+    if (before != null && after != null) {
+      const stat = ws.diffStat(before, after);
+      const scope = args.start_line ? `（限定行 ${args.start_line}-${args.end_line || args.start_line}）` : '';
+      if (stat.added === 0 && stat.removed === 0) {
+        return `修改 ${path}${scope}：实际未产生内容差异（无变化）。`;
+      }
+      return `修改 ${path}${scope}（+${stat.added} -${stat.removed}）：\n${cut(ws.unifiedPreview(before, after), 1600)}`;
     }
     if (name === 'write_file') {
-      return `整体写入 ${args.path}（共 ${String(args.content || '').length} 字）：${cut(args.content, 800)}`;
+      return `整体写入 ${path}（共 ${String(args.content || '').length} 字）：${cut(args.content, 800)}`;
     }
-    // edit_file
+    // 兜底：拿不到真实快照时，才回退到模型声明的参数
     const oldT = args.old_text ? cut(args.old_text, 400) : '';
     const newT = cut(args.new_text, 400);
     const scope = args.start_line ? `（限定行 ${args.start_line}-${args.end_line || args.start_line}）` : '';
-    return `修改 ${args.path}${scope}：\n- 旧：${oldT}\n- 新：${newT}`;
+    return `修改 ${path}${scope}：\n- 旧：${oldT}\n- 新：${newT}`;
   }
 
   /** 不向 UI 推送的静默模型调用（用于审查子代理等内部请求） */
-  async _silentCall(messages) {
+  async _silentCall(messages, opts) {
+    opts = opts || {};
+    if (this.cancelled) throw new Cancelled();
     const cfg = this.cfg;
     const b = selectBackend(cfg);
+    const isReview = !!opts.review;
     return b.nonStream({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
       model: cfg.model,
       messages,
       temperature: cfg.temperature,
-      maxTokens: cfg.maxTokens,
-      timeout: cfg.timeout,
+      // 审查子代理：缩短输出与等待上限，显著提升响应速度（不拖慢主代理）
+      maxTokens: isReview ? Math.min(cfg.maxTokens || 1024, 1024) : cfg.maxTokens,
+      timeout: isReview ? Math.min(cfg.timeout || 60000, 60000) : cfg.timeout,
       insecureHttpParser: cfg.insecureHttpParser,
-      streamFormat: cfg.streamFormat
+      streamFormat: cfg.streamFormat,
+      signal: this._abortCtrl ? this._abortCtrl.signal : undefined
     });
   }
 
-  /** 自动代码审查：本轮有代码写操作后触发一次只读审查子代理 */
-  async _runCodeReview() {
-    if (this._reviewing) return;
+  /** 自动代码审查：本轮有代码写操作后触发一次只读审查子代理（后台异步，不阻塞主代理回复） */
+  _runCodeReview() {
+    if (this.cancelled) { this._reviewing = false; return; }
+    if (this._reviewing) return; // 正在跑：新改动累积在 _pendingReview，本轮结束会自动再触发一次（合并审查）
     const changed = this._pendingReview;
     if (!changed.length) return;
     this._pendingReview = [];
     if (!this.cfg.review || !this.cfg.review.enabled) return;
+
+    this._reviewConsumed = false; // 新的一次审查，结果尚未被消费/emit
+    this._reviewId = 'review-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const promise = this._doReview(changed);
+    this._reviewPromise = promise;
+    promise.then(
+      () => { if (this._reviewPromise === promise) this._reviewPromise = null; },
+      () => { if (this._reviewPromise === promise) this._reviewPromise = null; }
+    );
+    return promise;
+  }
+
+  async _doReview(changed) {
     this._reviewing = true;
+    let result = null;
     try {
-      this.emit('notice', { text: '🔍 正在用审查子代理检查本次代码改动…' });
+      if (this.cancelled) return null;
+      this.emit('notice', { text: '🔍 审查子代理正在检查本次改动…' });
       const { ok, text } = await reviewer.runReview({
-        silentCall: (m) => this._silentCall(m),
+        silentCall: (m) => this._silentCall(m, { review: true }),
         cfg: this.cfg,
         changed
       });
+      if (this.cancelled) return null;
       const reviewText = (text && String(text).trim()) || '';
       if (ok && reviewText) {
-        this.emit('review', { files: changed.map((c) => c.path).filter(Boolean), text: reviewText });
-        this.messages.push({
-          role: 'user',
-          content: '[代码审查意见]\n' + reviewText + '\n\n请据此检查本次改动是否需要修正；若没有问题，直接继续或给出最终回答。'
-        });
+        result = { files: changed.map((c) => c.path).filter(Boolean), text: reviewText };
+        this._reviewResult = result;
       } else {
         this.emit('notice', { text: '（审查子代理未返回额外意见）' });
       }
     } catch (e) {
+      // 用户取消 / 请求被中止：直接退出，不再把“失败”当成需回应的审查意见
+      if (this.cancelled || e instanceof Cancelled || /请求已取消|abort/i.test(String((e && e.message) || ''))) {
+        return null;
+      }
+      // 配额耗尽：记录到 _reviewQuotaError 并取消主任务，由 run() catch 统一处理自动终止 + 保留记忆
+      if (e && e.isQuota) {
+        this._reviewQuotaError = e;
+        this.cancel();
+        this.emit('notice', { text: '⚠️ 模型额度/余额不足，已自动停止审查子代理。' });
+        return null;
+      }
       this.emit('notice', { text: '自动代码审查失败：' + String((e && e.message) || e).split('\n')[0] });
     } finally {
+      // 先保存结果并 emit（如果还没被 _awaitReview 消费），再触发下一次审查，
+      // 避免 finally 内启动的新审查抢占 _reviewConsumed 导致本次卡片漏发。
+      if (result) {
+        result.id = this._reviewId;
+        this._reviewResult = result;
+        if (!this._reviewConsumed) {
+          this._reviewConsumed = true;
+          this.emit('review', result);
+        }
+      }
       this._reviewing = false;
+      // 审查期间可能又有新改动累积，自动再触发一次（合并多次改动只审一遍批次，避免并发重入）
+      if (!this.cancelled && this._pendingReview.length) {
+        this._runCodeReview().catch(() => {});
+      }
     }
+    return result;
+  }
+
+  /** 限时等待当前审查子代理结果；若等到了非空结果，标记为已注入并 emit review 卡片 */
+  async _awaitReview(ms) {
+    // 审查已经完成且结果还在：直接注入，不重复阻塞。
+    if (this._reviewResult && this._reviewResult.text && !this._reviewInjected) {
+      this._reviewInjected = true;
+      if (!this._reviewConsumed) {
+        this._reviewConsumed = true;
+        this._reviewResult.id = this._reviewId;
+        this.emit('review', this._reviewResult);
+      }
+      return this._reviewResult;
+    }
+    if (!this._reviewPromise) return null;
+    const p = this._reviewPromise;
+    const timer = new Promise((resolve) => setTimeout(resolve, ms));
+    const winner = await Promise.race([p.catch(() => null), timer]);
+    if (winner && winner.text && !this._reviewInjected) {
+      this._reviewInjected = true;
+      if (!this._reviewConsumed) {
+        this._reviewConsumed = true;
+        winner.id = this._reviewId;
+        this.emit('review', winner);
+      }
+      return winner;
+    }
+    return null;
   }
 
   /** 发送前清洗历史：图片按模型能力降级 / 老图片丢弃 */
@@ -1463,6 +1608,14 @@ class AgentSession {
     };
 
     try {
+      // 编辑类工具执行前，先把文件真实内容读出来作为审查用的“before”快照。
+      // 关键：审查必须基于“文件实际状态”，而非模型传给工具的 old_text/new_text 参数——
+      // 否则模型给出错误/虚假编辑（如 +0 -0 自我替换、又把 $$eval 改回 $eval）时，审查子代理会被骗，
+      // 基于“模型声称的改动”而非“文件真实内容”给意见，造成误导循环。
+      let _reviewBefore = null;
+      if (name === 'edit_file' || name === 'write_file' || name === 'delete_file') {
+        try { _reviewBefore = await ws.readText(ws.resolveUri(args.path, { allowOutside: true })); } catch (_) { _reviewBefore = null; }
+      }
       const output = await tools.execute(name, args, execCtx);
       this.emit('toolEnd', { id: uiId, ok: true, output });
       // ---- Harness：自动验证层 ----
@@ -1475,13 +1628,29 @@ class AgentSession {
         if (cm) okMeta.okNote = `命令退出码 ${cm[1]}`;
       }
       // ---- 记录改动，供自动代码审查使用 ----
+      // 记录“文件真实内容”的 before/after，而非模型声明参数；同文件多轮编辑合并为一条。
       if (name === 'edit_file' || name === 'write_file' || name === 'delete_file') {
-        this._pendingReview.push({
-          name,
-          path: args.path,
-          op: name === 'write_file' ? '新增/覆盖' : name === 'delete_file' ? '删除' : '修改',
-          summary: this._reviewSummary(name, args)
-        });
+        let after = null;
+        if (name !== 'delete_file') {
+          try { after = await ws.readText(ws.resolveUri(args.path, { allowOutside: true })); } catch (_) { after = null; }
+        }
+        const summary = this._reviewSummary(name, args, _reviewBefore, after);
+        const existing = this._pendingReview.find((c) => c.path === args.path);
+        if (existing) {
+          // 合并同文件：before 保留首轮、after 取最新，避免重复条目让审查模型困惑
+          existing.after = after;
+          existing.summary = summary;
+          existing.op = name === 'write_file' ? '新增/覆盖' : name === 'delete_file' ? '删除' : '修改';
+        } else {
+          this._pendingReview.push({
+            name,
+            path: args.path,
+            op: name === 'write_file' ? '新增/覆盖' : name === 'delete_file' ? '删除' : '修改',
+            before: _reviewBefore,
+            after,
+            summary
+          });
+        }
       }
       // 记录 read_file 调用（用于去重）—— 成功执行后存档
       if (name === 'read_file' && args && args.path) {
@@ -1601,17 +1770,15 @@ class AgentSession {
     }
     if (name === 'edit_file') {
       const uri = ws.resolveUri(args.path, { allowOutside: true });
-      const before = await ws.readText(uri);
-      const oldText = String(args.old_text || '');
-      const newText = String(args.new_text == null ? '' : args.new_text);
-      const after = args.replace_all ? before.split(oldText).join(newText) : before.replace(oldText, newText);
+      const rawBefore = await ws.readText(uri);
+      const result = ws.previewEditFile(args, rawBefore);
       return {
         path: ws.relative(uri),
         existed: true,
-        stat: ws.diffStat(before, after),
-        text: ws.unifiedPreview(before, after),
-        before,
-        after
+        stat: ws.diffStat(result.before, result.after),
+        text: ws.unifiedPreview(result.before, result.after),
+        before: result.before,
+        after: result.after
       };
     }
     if (name === 'delete_file') {
@@ -1939,4 +2106,4 @@ function _isMultiStepTask(query) {
   return false;
 }
 
-module.exports = { AgentSession, Cancelled, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask };
+module.exports = { AgentSession, Cancelled, QuotaError, isQuotaError, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask };

@@ -11,6 +11,14 @@ const https = require('https');
 const { URL } = require('url');
 const zlib = require('zlib');
 
+// 全局 keep-alive 连接池：主代理请求与审查/裁判等子代理请求复用 TCP/TLS 连接，
+// 省去重复握手（对本地模型尤其明显），直接降低端到端延迟。
+const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16 });
+const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16 });
+function agentFor(url) {
+  return url.protocol === 'https:' ? httpsAgent : httpAgent;
+}
+
 const UA = 'fox-ai-vscode/0.2.0';
 
 // 诊断：把 Responses API 实际发出的 tools / tool_choice 可靠落盘（VS Code Output 落盘会吞掉 console.log）
@@ -118,33 +126,45 @@ function explainHttpError(status, text) {
 }
 
 /** 普通 JSON 请求（支持 gzip/deflate/br 与重定向） */
-function requestJson(urlString, { method = 'GET', apiKey, body, timeout = 15000, insecureHTTPParser = false, _redirects = 0 } = {}) {
+function requestJson(urlString, { method = 'GET', apiKey, body, timeout = 15000, insecureHTTPParser = false, _redirects = 0, signal } = {}) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let onAbort = null;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      if (onAbort && signal) { try { signal.removeEventListener('abort', onAbort); } catch (_) {} }
+      fn(val);
+    };
+    if (signal && signal.aborted) { reject(new Error('请求已取消')); return; }
     if (_redirects > MAX_REDIRECTS) {
-      reject(new Error('重定向次数过多：' + urlString));
+      finish(reject, new Error('重定向次数过多：' + urlString));
       return;
     }
     let url;
     try {
       url = new URL(urlString);
     } catch (e) {
-      reject(new Error('接口地址不合法：' + urlString));
+      finish(reject, new Error('接口地址不合法：' + urlString));
       return;
     }
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : null;
     const headers = buildHeaders(apiKey, { 'Accept-Encoding': 'gzip, deflate, br' });
     if (payload) headers['Content-Length'] = payload.length;
 
-    const req = pickAgent(url).request(url, { method, headers, timeout, insecureHTTPParser }, (res) => {
+    const req = pickAgent(url).request(url, { method, headers, timeout, insecureHTTPParser, agent: agentFor(url) }, (res) => {
       if (shouldRedirect(res.statusCode) && res.headers.location) {
         let next;
         try {
           next = new URL(res.headers.location, urlString).href;
         } catch (e) {
-          reject(new Error('重定向地址不合法：' + res.headers.location));
+          finish(reject, new Error('重定向地址不合法：' + res.headers.location));
           return;
         }
-        requestJson(next, { method, apiKey, body, timeout, insecureHTTPParser, _redirects: _redirects + 1 }).then(resolve, reject);
+        requestJson(next, { method, apiKey, body, timeout, insecureHTTPParser, _redirects: _redirects + 1, signal }).then(
+          (v) => finish(resolve, v),
+          (e) => finish(reject, e)
+        );
         return;
       }
 
@@ -154,21 +174,27 @@ function requestJson(urlString, { method = 'GET', apiKey, body, timeout = 15000,
       bodyStream.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode >= 400) {
-          reject(new Error(explainHttpError(res.statusCode, text)));
+          const err = new Error(explainHttpError(res.statusCode, text));
+          err.status = res.statusCode;
+          finish(reject, err);
           return;
         }
         try {
-          resolve(text ? JSON.parse(text) : {});
+          finish(resolve, text ? JSON.parse(text) : {});
         } catch (e) {
-          reject(new Error('返回内容不是 JSON：' + text.slice(0, 300)));
+          finish(reject, new Error('返回内容不是 JSON：' + text.slice(0, 300)));
         }
       });
-      bodyStream.on('error', (e) => reject(normalizeError(e, urlString)));
+      bodyStream.on('error', (e) => finish(reject, normalizeError(e, urlString)));
     });
     req.on('timeout', () => req.destroy(new Error('请求超时')));
-    req.on('error', (e) => reject(normalizeError(e, urlString)));
+    req.on('error', (e) => finish(reject, normalizeError(e, urlString)));
     if (payload) req.write(payload);
     req.end();
+    if (signal) {
+      onAbort = () => { try { req.destroy(new Error('请求已取消')); } catch (_) {} };
+      signal.addEventListener('abort', onAbort);
+    }
   });
 }
 
@@ -383,7 +409,7 @@ function streamChat(options) {
       return;
     }
 
-    const req = pickAgent(targetUrl).request(targetUrl, { method: 'POST', headers, timeout, insecureHTTPParser }, (res) => {
+    const req = pickAgent(targetUrl).request(targetUrl, { method: 'POST', headers, timeout, insecureHTTPParser, agent: agentFor(targetUrl) }, (res) => {
       const contentType = String(res.headers['content-type'] || '').toLowerCase();
       const detectedSse = contentType.includes('text/event-stream');
       const detectedNdjson = contentType.includes('application/x-ndjson') || contentType.includes('application/jsonlines');
@@ -644,6 +670,7 @@ async function chatNonStream(options) {
     stop,
     extraBody,
     insecureHTTPParser = false,
+    signal,
     includeRaw = false
   } = options;
 
@@ -660,8 +687,9 @@ async function chatNonStream(options) {
   const data = await requestJson(String(baseUrl).replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
     apiKey,
-    timeout: Math.max(timeout || 0, 90000),
+    timeout: Math.max(timeout || 0, 30000),
     insecureHTTPParser,
+    signal,
     body
   });
 
@@ -906,7 +934,7 @@ function streamResponses(options) {
       finish(new Error('流式请求重定向次数过多'));
       return;
     }
-    const req = pickAgent(targetUrl).request(targetUrl, { method: 'POST', headers, timeout, insecureHTTPParser }, (res) => {
+    const req = pickAgent(targetUrl).request(targetUrl, { method: 'POST', headers, timeout, insecureHTTPParser, agent: agentFor(targetUrl) }, (res) => {
       const contentType = String(res.headers['content-type'] || '').toLowerCase();
       const detectedSse = contentType.includes('text/event-stream');
       const detectedNdjson = contentType.includes('application/x-ndjson') || contentType.includes('application/jsonlines');
@@ -1112,7 +1140,8 @@ async function chatNonStreamResponses(options) {
   const {
     baseUrl, apiKey, model, messages, tools, toolChoice,
     temperature = 0.3, maxTokens = 0, timeout = 120000,
-    extraBody, insecureHTTPParser = false
+    extraBody, insecureHTTPParser = false,
+    signal
   } = options;
 
   const sysMsgs = (messages || []).filter((m) => m && m.role === 'system');
@@ -1132,8 +1161,9 @@ async function chatNonStreamResponses(options) {
   const data = await requestJson(String(baseUrl).replace(/\/+$/, '') + '/responses', {
     method: 'POST',
     apiKey,
-    timeout: Math.max(timeout || 0, 90000),
+    timeout: Math.max(timeout || 0, 30000),
     insecureHTTPParser,
+    signal,
     body
   });
   if (data.error) {
