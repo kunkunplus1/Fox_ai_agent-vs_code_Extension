@@ -1,5 +1,5 @@
 # 狐狸ai智能体（IDE原生跨界型agent）
-【详见master】
+【详见master】-注：目前并未上架任何插件平台，只有GitHub仓库这一个获取方式
 # 狐狸 AI 智能体 · 使用说明书
 
 > **制作人**：Cyunkun(kunkunplus1)
