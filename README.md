@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：0.8.63
+> **版本**：0.8.80
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -31,10 +31,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-0.8.63.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
+1. 获取扩展包 `fox-ai-0.8.80.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-0.8.63.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-0.8.80.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏与扩展详情页使用狐狸图标（`media/fox.png`）。
