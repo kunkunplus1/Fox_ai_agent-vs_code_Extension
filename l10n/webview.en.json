@@ -203,5 +203,11 @@
   "图片下载失败，无法保存。": "Image download failed; cannot save.",
   "不支持的图片来源，无法保存。": "Unsupported image source; cannot save.",
   "图片内容为空，保存失败。": "Image content is empty; save failed.",
-  "保存图片失败：{0}": "Failed to save image: {0}"
+  "保存图片失败：{0}": "Failed to save image: {0}",
+  "思考": "Think",
+  "关": "off",
+  "🧠 思考: 关": "🧠 Think: off",
+  "深度思考：左键开关，右键选强度（low / medium / high）": "Deep thinking: left-click to toggle, right-click to pick effort (low / medium / high)",
+  "深度思考已开启（强度 {0}）：模型先推理再作答。左键关闭，右键改强度": "Deep thinking is ON (effort {0}): the model reasons before answering. Left-click to turn off, right-click to change effort.",
+  "深度思考已关闭：模型直接作答。左键开启，右键选强度": "Deep thinking is OFF: the model answers directly. Left-click to turn on, right-click to pick effort."
 }

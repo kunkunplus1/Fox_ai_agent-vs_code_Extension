@@ -22,6 +22,7 @@ const { PlanTaskStore } = require('./planTasks');
 const projectScan = require('./projectScan');
 const reviewer = require('./reviewer');
 const { shouldAutoContinue } = require('./autoContinue');
+const reasoning = require('./reasoningParams'); // 深度思考：跨后端参数映射
 
 const fs = require('fs');
 const os = require('os');
@@ -182,9 +183,13 @@ function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
   const base = cfg.systemPrompt || '你是一位资深工程师，回答简洁准确。';
   const extSection = buildExtensionCommandsSection();
 
+  // 深度思考：模型没有原生思考开关时（deepseek-chat、常规 GPT 等），用提示词兜底
+  const rp = reasoning.buildReasoningParams(cfg, { stream: !cfg.forceNonStream });
+  const deepThinkingHint = rp.promptHint ? '\n\n' + rp.promptHint : '';
+
   if (protocol === 'chat') {
     return `${base}
-
+${deepThinkingHint}
 【当前环境】
 ${envBrief}
 
@@ -226,7 +231,7 @@ ${envBrief}
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
 【当前环境】
-${envBrief}${structured}${nativeSearchHint}${citationGuard}
+${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 
 【工作准则】
 1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。
@@ -500,6 +505,8 @@ class AgentSession {
       // 无需重建会话。否则 this.cfg 是会话创建时缓存的值，UI 切了协议也不会真正改变后续请求。
       if (live && live.apiMode != null) this.cfg.apiMode = live.apiMode;
       if (live && live.transport != null) this.cfg.transport = live.transport;
+      // 深度思考开关同理：聊天窗口顶部的芯片一点即生效，不用重开会话
+      if (live && live.deepThinking) this.cfg.deepThinking = live.deepThinking;
     } catch (_) {}
     const cfg = this.cfg;
     const { appendLog } = require('./log');
@@ -1196,6 +1203,31 @@ class AgentSession {
     }
   }
 
+  /**
+   * 服务端不认识深度思考参数（reasoning_effort / enable_thinking / thinking …）时，
+   * 去掉思考参数用非流式重试一次，避免因为一个可选参数把整轮对话打死。
+   */
+  async retryWithoutReasoning(err, options) {
+    if (this._noReasoningRetried) return null;
+    if (!options || !options.extraBody) return null;
+    if (!reasoning.looksLikeReasoningRejection(err)) return null;
+
+    this._noReasoningRetried = true;
+    console.log('[fox-ai] server rejected reasoning params, retry without them:', err && err.message);
+    this.emit('notice', { text: '当前模型不接受深度思考参数，已自动去掉思考参数重试一次。（可在设置里关闭 foxAi.deepThinking.enabled）' });
+
+    const eb = Object.assign({}, options.extraBody);
+    for (const k of ['reasoning', 'reasoning_effort', 'enable_thinking', 'thinking_budget', 'thinking']) delete eb[k];
+    const opt2 = Object.assign({}, options);
+    if (Object.keys(eb).length) opt2.extraBody = eb; else delete opt2.extraBody;
+    try {
+      const b = selectBackend(this.cfg);
+      return await b.nonStream(opt2);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** 发起一次模型调用（默认流式，解析失败时自动非流式兜底） */
   async callModel(payload, useNative, toolsOverride) {
     return llmLimiter.run(async () => {
@@ -1232,6 +1264,21 @@ class AgentSession {
       onReasoning: (t) => { this.reasoningSeen = true; this.emit('reasoning', { text: t }); },
       onToolCallStart: (name) => this.emit('toolPending', { name })
     };
+
+    // —— 深度思考：按当前 provider/传输/协议映射成各家的思考参数 ——
+    // 走 extraBody 通道并入请求体，四个后端入口（chat 流/非流、responses 流/非流、anthropic）都支持。
+    const willStream = !(cfg.forceNonStream || this.streamBroken);
+    const rp = reasoning.buildReasoningParams(cfg, { stream: willStream });
+    this._reasoningPlan = rp;
+    if (rp.extraBody && Object.keys(rp.extraBody).length) {
+      options.extraBody = Object.assign({}, options.extraBody, rp.extraBody);
+      if (rp.temperature != null) options.temperature = rp.temperature;
+      if (rp.minMaxTokens > 0 && !(options.maxTokens > rp.minMaxTokens)) options.maxTokens = rp.minMaxTokens;
+      console.log('[fox-ai] deepThinking', rp.enabled ? 'ON' : 'OFF', 'strategy=', rp.strategy, rp.reason, JSON.stringify(rp.extraBody));
+    } else if (rp.enabled) {
+      console.log('[fox-ai] deepThinking ON (prompt-fallback) strategy=', rp.strategy, rp.reason);
+    }
+
     const b = selectBackend(cfg);
     const useResp = b.responses;
 
@@ -1265,6 +1312,8 @@ class AgentSession {
       } catch (err) {
         const retried = await this.retryWithoutImages(err, options);
         if (retried) return retried;
+        const retriedNoThink = await this.retryWithoutReasoning(err, options);
+        if (retriedNoThink) return retriedNoThink;
         throw err;
       }
     }
@@ -1277,11 +1326,22 @@ class AgentSession {
       // 服务端明确拒收图片 → 记住这个模型不支持读图，去图重试一次
       const retriedNoImg = await this.retryWithoutImages(err, options);
       if (retriedNoImg) return retriedNoImg;
+      // 服务端不认深度思考参数 → 去掉思考参数重试一次
+      const retriedNoThink = await this.retryWithoutReasoning(err, options);
+      if (retriedNoThink) return retriedNoThink;
       // 流式响应被截断/解析失败时，用非流式再试一次
       if (err && err.canRetryNonStream) {
         console.log('[fox-ai] fallback to non-stream because:', err.message);
         this.streamBroken = true; // 本次会话后续都走非流式，避免反复撞墙
         this.emit('notice', { text: '流式响应解析失败，已自动改用非流式请求…' });
+        // 部分厂商（通义）非流式禁止开思考，这里按非流式重新映射一次思考参数
+        const rpNs = reasoning.buildReasoningParams(cfg, { stream: false });
+        if (options.extraBody) {
+          for (const k of ['reasoning', 'reasoning_effort', 'enable_thinking', 'thinking_budget', 'thinking']) delete options.extraBody[k];
+          Object.assign(options.extraBody, rpNs.extraBody || {});
+        } else if (rpNs.extraBody && Object.keys(rpNs.extraBody).length) {
+          options.extraBody = Object.assign({}, rpNs.extraBody);
+        }
         try {
           const r = await b.nonStream(options);
           // 非流式成功且非空，直接返回（不再把原始流式错误抛出去）
@@ -1292,6 +1352,8 @@ class AgentSession {
           console.log('[fox-ai] non-stream also failed:', fallbackErr.message);
           const retried = await this.retryWithoutImages(fallbackErr, options);
           if (retried) return retried;
+          const retried2 = await this.retryWithoutReasoning(fallbackErr, options);
+          if (retried2) return retried2;
           // 不在这里私自降级到 chat，统一交给 run() 的降级分支处理：
           // Chat 协议会降到 text 协议（仍有工具说明），Responses 协议只能降到 chat。
           throw fallbackErr;
@@ -1932,34 +1994,40 @@ class AgentSession {
     const keep = Math.max(2, as.keepRecent || 6);
     const msgs = this.messages || [];
     const compressible = msgs.length - keep;
-    if (compressible < 4) return; // 早期消息太少，不值得压缩
 
     // 触发条件（满足其一即可）：
-    //  A. 配置了上下文窗口且占用超阈值（防超窗口）——默认阈值 0.75
+    //  A. 配置了上下文窗口且占用超阈值（防超窗口）——默认阈值 0.75。
+    //     此时不再受 compressible<4 限制：防止单条/少量超大消息把上下文撑爆，
+    //     却因「消息轮数不够」而永远不被压缩。
     //  B. 未配置上下文窗口时，按对话轮数触发（累计约 6 条可压缩消息 ≈ 每 3 轮做一次增量摘要），
     //     保证能力⑥「每 3 轮摘要」在没填 contextWindow 时也能达成，而不是永远不压缩。
     const threshold = as.threshold > 0 ? as.threshold : 0.75;
     let should = false;
     let reason = '';
+    let used = 0;
+    let fixedTokens = 0;
     if (cw) {
       const baseSys = buildSystemPrompt(this.cfg, envBrief || '', this.protocol);
       const toolsText = this.protocol === 'native'
         ? JSON.stringify(tools.toOpenAITools())
         : tools.toTextManual();
-      const fixedTokens = contextUsage.estimateTokens(baseSys) + contextUsage.estimateTokens(toolsText) + 800;
-      const used = contextUsage.estimateMessages(msgs) + fixedTokens;
+      fixedTokens = contextUsage.estimateTokens(baseSys) + contextUsage.estimateTokens(toolsText) + 800;
+      used = contextUsage.estimateMessages(msgs) + fixedTokens;
       if (used / cw >= threshold) { should = true; reason = 'usage'; }
     } else if (compressible >= 6) {
       should = true;
       reason = 'turn-based';
     }
     if (!should) return;
+    if (compressible < 1) return; // 没有可压缩消息，无法释放空间
 
     // 取较早消息去压缩，保留最近 keep 条
-    const toCompress = msgs.slice(0, compressible);
-    appendLog('autoSummarize', '[compress] used%=' + Math.round((used / cw) * 100) + ' threshold%=' + Math.round(threshold * 100) + ' compressible=' + toCompress.length);
+    const { clampMessage } = require('./messageSanitize');
+    const toCompress = msgs.slice(0, compressible).map((m) => clampMessage(m, 8000));
+    const usedPct = cw > 0 ? Math.round((used / cw) * 100) : 0;
+    appendLog('autoSummarize', '[compress] used%=' + usedPct + ' threshold%=' + Math.round(threshold * 100) + ' compressible=' + toCompress.length + ' reason=' + reason);
     this.emit('notice', {
-      text: `上下文已用约 ${Math.round((used / cw) * 100)}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`
+      text: `上下文已用约 ${usedPct}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`
     });
 
     try {

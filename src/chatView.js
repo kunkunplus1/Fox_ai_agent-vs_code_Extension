@@ -361,6 +361,51 @@ class ChatViewProvider {
         this.pushStatus();
         break;
       }
+      // 深度思考：芯片单击 = 开关；右键/长按（前端发 pick:true）= 选强度
+      case 'toggleDeepThinking': {
+        const c = config.conf();
+        const now = c.get('deepThinking.enabled', false);
+        const effort = c.get('deepThinking.effort', 'medium');
+
+        if (msg && msg.pick) {
+          const pick = await vscode.window.showQuickPick(
+            [
+              { label: '关闭深度思考', description: '模型直接作答，最快最省 token', value: 'off' },
+              { label: 'low · 浅思考', description: '少量推理，速度优先', value: 'low' },
+              { label: 'medium · 均衡（推荐）', description: '默认强度，兼顾质量与速度', value: 'medium' },
+              { label: 'high · 深思考', description: '充分推理，慢且更贵，适合难题', value: 'high' }
+            ],
+            { title: '深度思考模式', placeHolder: '当前：' + (now ? effort : '关闭') }
+          );
+          if (!pick) { this.pushStatus(); break; }
+          if (pick.value === 'off') {
+            await c.update('deepThinking.enabled', false, vscode.ConfigurationTarget.Global);
+          } else {
+            await c.update('deepThinking.effort', pick.value, vscode.ConfigurationTarget.Global);
+            await c.update('deepThinking.enabled', true, vscode.ConfigurationTarget.Global);
+          }
+        } else {
+          await c.update('deepThinking.enabled', !now, vscode.ConfigurationTarget.Global);
+        }
+
+        // 让改动对「正在跑的会话」也即时生效
+        const nowOn = config.conf().get('deepThinking.enabled', false);
+        const nowEffort = config.conf().get('deepThinking.effort', 'medium');
+        if (this.session && this.session.cfg) {
+          this.session.cfg.deepThinking = Object.assign({}, this.session.cfg.deepThinking, {
+            enabled: nowOn,
+            effort: nowEffort
+          });
+        }
+        this.pushStatus();
+        this.post({
+          type: 'notice',
+          text: nowOn
+            ? '已开启深度思考（' + nowEffort + '）：模型会先推理再作答，耗时与 token 都会增加。'
+            : '已关闭深度思考：模型直接作答。'
+        });
+        break;
+      }
       case 'setApprove': {
         await config.conf().update('agent.autoApprove', msg.value, vscode.ConfigurationTarget.Global);
         this.pushStatus();
@@ -515,6 +560,8 @@ class ChatViewProvider {
       provider: config.providerMeta(id).label,
       model,
       apiMode: cfg.get('apiMode', 'chat'),
+      deepThinking: cfg.get('deepThinking.enabled', false),
+      thinkEffort: cfg.get('deepThinking.effort', 'medium'),
       vision: caps.supportsVision(model, cfg.get('visionMode', 'auto'), config.visionLists()),
       agent: cfg.get('agent.enabled', true),
       approve: cfg.get('agent.autoApprove', 'read'),

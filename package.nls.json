@@ -257,5 +257,9 @@
   "foxai.n257": "下载时优先使用的源",
   "foxai.n258": "安装需要管理员权限的运行时（如 .NET / rustup）时的提权策略。",
   "foxai.n259": "**允许狐狸 AI 调用的其它扩展命令白名单**。只有列在这里的命令，狐狸 AI 才能调用。默认空 = 全部禁止。",
-  "foxai.n260": "白名单内的命令是否免二次确认（仍会记录审计日志）。建议保持关闭。"
+  "foxai.n260": "白名单内的命令是否免二次确认（仍会记录审计日志）。建议保持关闭。",
+  "foxai.n261": "**主控模型深度思考模式**。开启后会向模型下发思考参数（OpenAI/兼容站 `reasoning_effort`、通义 `enable_thinking`、Claude `thinking` 块、Responses API `reasoning.effort`），让模型先推理再作答。也可在聊天窗口顶部的「深度思考」芯片一键开关。注意：思考会显著增加耗时与 token 消耗。",
+  "foxai.n262": "深度思考强度。low = 少思考、快；medium = 均衡（默认）；high = 充分推理、慢且贵。Claude 未单独设置预算时按此强度换算思考预算。",
+  "foxai.n263": "Claude（Anthropic）思考预算 token 数。0 = 按上面的强度自动换算（low≈2048 / medium≈4096 / high≈8192）。",
+  "foxai.n264": "对没有原生思考开关的模型（如 deepseek-chat、常规 GPT），是否用系统提示词兜底要求它先分步推理再作答。"
 }

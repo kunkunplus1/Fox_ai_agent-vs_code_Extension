@@ -24,6 +24,7 @@
   const providerChip = $('providerChip');
   const modelChip = $('modelChip');
   const apiModeChip = $('apiModeChip');
+  const thinkChip = $('thinkChip');
   const agentChip = $('agentChip');
   const approveChip = $('approveChip');
   const btnPlanTasks = $('btnPlanTasks');
@@ -714,6 +715,14 @@
   providerChip.addEventListener('click', () => vscode.postMessage({ type: 'pickProvider' }));
   modelChip.addEventListener('click', () => vscode.postMessage({ type: 'pickModel' }));
   apiModeChip.addEventListener('click', () => vscode.postMessage({ type: 'pickApiMode' }));
+  // 深度思考：左键一键开关，右键弹出强度选择（关闭 / low / medium / high）
+  if (thinkChip) {
+    thinkChip.addEventListener('click', () => vscode.postMessage({ type: 'toggleDeepThinking' }));
+    thinkChip.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      vscode.postMessage({ type: 'toggleDeepThinking', pick: true });
+    });
+  }
   agentChip.addEventListener('click', () => vscode.postMessage({ type: 'toggleAgent' }));
   approveChip.addEventListener('click', () => {
     const i = APPROVE_LEVELS.indexOf(approveLevel);
@@ -989,6 +998,17 @@
     if (msg.provider) $('providerName').textContent = msg.provider;
     if (msg.model) $('modelName').textContent = msg.model;
     if (msg.apiMode) apiModeChip.textContent = t(msg.apiMode === 'responses' ? '协议: Responses' : '协议: Chat');
+
+    if (thinkChip && msg.deepThinking !== undefined) {
+      const on = !!msg.deepThinking;
+      const eff = msg.thinkEffort || 'medium';
+      thinkChip.textContent = on ? '🧠 ' + t('思考') + ': ' + eff : '🧠 ' + t('思考') + ': ' + t('关');
+      thinkChip.classList.toggle('on', on);
+      thinkChip.classList.toggle('off', !on);
+      thinkChip.title = on
+        ? t('深度思考已开启（强度 {0}）：模型先推理再作答。左键关闭，右键改强度', eff)
+        : t('深度思考已关闭：模型直接作答。左键开启，右键选强度');
+    }
 
     agentChip.textContent = msg.agent ? t('智能体') : t('纯问答');
     agentChip.classList.toggle('on', !!msg.agent);

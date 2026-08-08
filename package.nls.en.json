@@ -257,5 +257,9 @@
   "foxai.n257": "Preferred source when downloading",
   "foxai.n258": "Elevation policy when installing runtimes that need admin rights (e.g. .NET / rustup).",
   "foxai.n259": "**Whitelist of other extension commands Fox AI may call.** Only commands listed here can be invoked by Fox AI. Empty default = all forbidden.",
-  "foxai.n260": "Whether whitelisted commands skip secondary confirmation (audit logs are still recorded). Recommended to keep off."
+  "foxai.n260": "Whether whitelisted commands skip secondary confirmation (audit logs are still recorded). Recommended to keep off.",
+  "foxai.n261": "**Deep thinking mode for the main agent model.** When enabled, reasoning parameters are sent to the model (`reasoning_effort` for OpenAI-compatible endpoints, `enable_thinking` for Qwen, the `thinking` block for Claude, `reasoning.effort` for the Responses API) so it reasons before answering. Can also be toggled from the Deep-thinking chip at the top of the chat window. Note: thinking notably increases latency and token usage.",
+  "foxai.n262": "Thinking effort. low = less thinking, faster; medium = balanced (default); high = thorough reasoning, slower and more expensive. For Claude this maps to a thinking budget when no explicit budget is set.",
+  "foxai.n263": "Claude (Anthropic) thinking budget in tokens. 0 = derive automatically from the effort level (low approx 2048 / medium approx 4096 / high approx 8192).",
+  "foxai.n264": "For models without a native thinking switch (e.g. deepseek-chat, regular GPT), fall back to a system-prompt instruction asking the model to reason step by step before answering."
 }

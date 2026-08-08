@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：0.8.82
+> **版本**：0.8.85
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -31,10 +31,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-0.8.82.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
+1. 获取扩展包 `fox-ai-0.8.85.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-0.8.82.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-0.8.85.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏与扩展详情页使用狐狸图标（`media/fox.png`）。
@@ -176,14 +176,18 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - **用量面板**：开启 `foxAi.showContextUsage` 后，面板显示当前上下文 token 数与占比；填写 `foxAi.contextWindow`（如 128000）后才会显示百分比。
 - **自动压缩**：当历史接近窗口上限（阈值 `foxAi.knowledgeBase.autoSummarize.threshold`，默认 0.9）时，自动对较早内容做增量摘要，保留最近 `keepRecent`（默认 6）条，以节省 token。
 
-### 6.12 行内补全
+### 6.12 行内补全（对标 Copilot 的 Tab 补全）
 
-可选的代码行内灰色幽灵文本补全。设置项：
+默认开启的灰色幽灵文本行内补全，对标 GitHub Copilot 的实时补全体验：边打字边给出建议，按 `Tab` 接受、`Esc` 拒绝。仅对本地文件（`file` / `untitled`）触发，并与对话 AI 共用项目上下文，避免“牛头不对马嘴”。
 
-- `foxAi.inlineCompletion.enabled`：总开关。
-- `foxAi.inlineCompletion.useProjectContext`：是否结合项目上下文（默认 true）。
-- `foxAi.inlineCompletion.projectContextChars`：上下文字符数（默认 1000）。
-- `foxAi.inlineCompletion.debounce` / `.contextLines`：触发防抖与上下文行数。
+- `foxAi.inlineCompletion.enabled`：总开关（**默认 true**，开箱即用；命令“狐狸 AI：切换行内补全”可一键开关）。
+- `foxAi.inlineCompletion.model`：**专用补全模型**（对标 Copilot 的独立轻量补全引擎）。留空则复用主对话模型；建议填一个低延迟模型专门做补全，避免拖慢/烧主模型。
+- `foxAi.inlineCompletion.maxTokens`：单次补全最大 token（**默认 256**，支持补全整段函数等多行块）。
+- `foxAi.inlineCompletion.maxFileLines`：超过此行数的大文件跳过补全（**默认 8000**，超大文件限流以省 token，对标 Copilot 行为）。
+- `foxAi.inlineCompletion.debounce` / `.contextLines`：触发防抖（默认 350ms）与上下文行数（默认 60）。
+- `foxAi.inlineCompletion.useProjectContext` / `.projectContextChars`：是否结合项目上下文（默认 true）/ 上下文最大字符数（默认 1000）。
+
+> 提示：每次按键都会向模型发一次请求，若主模型较慢或按量计费，强烈建议配置 `inlineCompletion.model` 指向一个快模型；不需要时可关闭 `enabled`。
 
 ### 6.13 项目概览与文件导航
 
@@ -219,7 +223,36 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 > 若生图内容偶尔跑题（模型本身画歪了，而非抓错图），属生图模型质量问题，本层已兜住“抓错图”这类故障；可更换生图模型或优化描述。
 
-### 6.18 执行步骤时间线
+### 6.18 深度思考模式（主控模型开关）
+
+主控模型可以**一键开启「先推理、再作答」**。对话面板顶部新增 **🧠 思考** 芯片：
+
+- **左键单击** —— 开 / 关深度思考。
+- **右键单击** —— 弹出强度选择：关闭 / `low`（浅思考，快） / `medium`（均衡，推荐） / `high`（充分推理，慢且贵）。
+- 芯片实时显示当前状态（`🧠 思考: 关` / `🧠 思考: medium`），切换后**当前会话立即生效**，无需重开窗口。
+
+扩展会按您当前的服务商与协议，自动翻译成对应厂商的思考参数，您无需关心差异：
+
+| 服务商 / 协议 | 实际下发的参数 |
+| --- | --- |
+| OpenAI（o 系 / gpt-5）、Gemini 2.5+、grok-3-mini、中转站同类模型 | `reasoning_effort: low\|medium\|high` |
+| Responses 协议（OpenAI / DeepSeek v4） | `reasoning: { effort }`（官方 OpenAI 额外带思考摘要） |
+| Claude（原生 Messages API 或中转站 claude 模型） | `thinking: { type: "enabled", budget_tokens }`，并自动把 `temperature` 置 1、抬高 `max_tokens` |
+| 通义千问 Qwen3（DashScope / 硅基流动） | `enable_thinking: true` + `thinking_budget` |
+| 智谱 GLM-4.5 系 | `thinking: { type: "enabled" }` |
+| OpenRouter | `reasoning: { effort }` 或 `reasoning: { max_tokens }` |
+| 无原生开关的模型（deepseek-chat、gpt-4o、本地 Ollama 等） | 用系统提示词兜底，要求模型分步推理后再作答 |
+
+配套细节：
+
+- **关闭也真的关闭**：Qwen3、GLM 这类「默认就思考」的模型，关闭开关时会主动下发 `enable_thinking: false` / `thinking.disabled`，不是放任不管。
+- **非流式自动规避**：DashScope 规定非流式调用不得开启思考，扩展检测到非流式时会自动改走提示词兜底，不会因此报错。
+- **参数不被接受时自动兜底**：若服务端回「不认识 reasoning_effort / enable_thinking」，扩展会去掉思考参数重试一次并提示您，不会让一个可选参数打死整轮对话。
+- **思考内容展示**：模型返回的思考过程仍以可折叠的「深度思考」卡片展示，多轮对话中会正确回传。
+
+> 深度思考会显著增加响应时长与 token 消耗，日常问答建议保持关闭，遇到疑难 bug、架构设计、复杂推理时再临时开启。
+
+### 6.19 执行步骤时间线
 
 智能体执行任务时，对话区顶部会浮现一条**竖向执行步骤时间线**，按真实发生顺序点亮：
 
@@ -237,6 +270,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | --- | --- |
 | 连接 | `foxAi.provider` / `foxAi.baseUrl` / `foxAi.model` / `foxAi.apiKey` |
 | 对话 | `foxAi.temperature` / `foxAi.maxTokens` / `foxAi.maxHistory` / `foxAi.streamFormat` / `foxAi.vision.*`（多模态识图中转） |
+| 深度思考 | `foxAi.deepThinking.enabled`（总开关，默认 false） / `.effort`（low·medium·high，默认 medium） / `.budgetTokens`（Claude 思考预算，0=按强度自动） / `.promptFallback`（无原生开关时用提示词兜底，默认 true） |
 | 生图 | `foxAi.imageGen.enabled` / `.provider` / `.baseUrl` / `.apiKey` / `.model`（独立生图通道，需单独开启） |
 | 审查注入 | `foxAi.review.enabled` / `foxAi.review.injectTimeout`（主控限时等待审查的毫秒数，0 表示完全异步） |
 | 上下文用量 | `foxAi.showContextUsage`（开关面板） / `foxAi.contextWindow`（模型窗口上限，填 0 则只显示 token 数） |
@@ -249,7 +283,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 安全策略 | `foxAi.policy.mode` / `.blockedPaths` / `.blockedCommands` |
 | 知识库检索 | `foxAi.knowledgeBase.bm25Enabled` / `.topK`（检索 Top-K，默认 10） |
 | 项目扫描 | `foxAi.projectScan.cacheEnabled`（结果缓存，默认 true） |
-| 行内补全 | `foxAi.inlineCompletion.enabled` / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
+| 行内补全 | `foxAi.inlineCompletion.enabled`（默认 true） / `.model`（专用模型，默认空=主模型） / `.maxTokens`（默认 256） / `.maxFileLines`（默认 8000） / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
 | 智能体（续） | `foxAi.agent.maxMessageBytes`（历史总字节硬上限，默认 1048576） / `.structuredOutput` / `.projectSkeleton`（L1 代码骨架，默认 true） |
 
 ---

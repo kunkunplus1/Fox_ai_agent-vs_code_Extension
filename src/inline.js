@@ -41,6 +41,16 @@ function cleanup(text) {
 }
 
 /**
+ * 选择本次补全使用的模型：优先专用补全模型（inlineCompletion.model），
+ * 否则回落到主对话模型。对标 Copilot 用独立轻量引擎做补全，避免拖慢/烧主模型。
+ */
+function pickCompletionModel(cfg, resolved) {
+  const m = (cfg.get('inlineCompletion.model', '') || '').trim();
+  if (m) return m;
+  return (resolved && resolved.model) || '';
+}
+
+/**
  * 去掉补全文本中与光标前后已有文本重复的重叠部分，避免插入后出现 "int jka()int jka()" 这种事。
  */
 function trimOverlap(text, lineBefore, lineAfter) {
@@ -66,7 +76,7 @@ function trimOverlap(text, lineBefore, lineAfter) {
     t = t.slice(after.length);
   }
 
-  return t.trimStart();
+  return t;
 }
 
 /** 可被取消的等待，避免旧请求永久挂起 */
@@ -92,6 +102,11 @@ function createInlineProvider(context) {
       }
       if (document.uri.scheme !== 'file' && document.uri.scheme !== 'untitled') {
         log('跳过：非 file/untitled 方案', document.uri.scheme);
+        return null;
+      }
+      const maxFileLines = cfg.get('inlineCompletion.maxFileLines', 8000);
+      if (maxFileLines > 0 && document.lineCount > maxFileLines) {
+        log('跳过：文件过大', document.lineCount, '>', maxFileLines);
         return null;
       }
 
@@ -171,12 +186,12 @@ function createInlineProvider(context) {
         `只输出光标位置需要插入的代码。绝对不要重复「当前行光标前」或「当前行光标后」的已有文本。`
       );
       const prompt = promptParts.join('\n\n');
-      log('请求', document.fileName, 'model=', resolved.model);
+      log('请求', document.fileName, 'model=', pickCompletionModel(cfg, resolved));
 
       const { promise, handle } = chatOnce({
         baseUrl: resolved.baseUrl,
         apiKey: resolved.apiKey,
-        model: resolved.model,
+        model: pickCompletionModel(cfg, resolved),
         messages: [
           { role: 'system', content: SYSTEM },
           { role: 'user', content: prompt }
@@ -221,4 +236,4 @@ function createInlineProvider(context) {
   };
 }
 
-module.exports = { createInlineProvider };
+module.exports = { createInlineProvider, cleanup, trimOverlap, pickCompletionModel };

@@ -84,6 +84,12 @@ async function resolve(context) {
     apiMode: (PROVIDERS[id] && PROVIDERS[id].transport) === 'anthropic'
       ? 'chat'
       : c.get('apiMode', (PROVIDERS[id] && PROVIDERS[id].apiMode) || 'chat'),
+    deepThinking: {
+      enabled: c.get('deepThinking.enabled', false),
+      effort: c.get('deepThinking.effort', 'medium'),
+      budgetTokens: c.get('deepThinking.budgetTokens', 0),
+      promptFallback: c.get('deepThinking.promptFallback', true)
+    },
     visionMode: c.get('visionMode', 'auto'),
     visionModels: c.get('visionModels', []),
     textOnlyModels: c.get('textOnlyModels', []),

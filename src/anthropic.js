@@ -246,6 +246,7 @@ function streamChat(options) {
     maxTokens = 4096,
     timeout = 120000,
     insecureHTTPParser = false,
+    extraBody,
     stopMarker
   } = options;
 
@@ -275,6 +276,14 @@ function streamChat(options) {
   if (antTools) {
     body.tools = antTools;
     body.tool_choice = toAnthropicToolChoice(toolChoice);
+  }
+  // 深度思考等额外字段（thinking 块等）
+  Object.assign(body, extraBody || {});
+  if (body.thinking && body.thinking.type === 'enabled') {
+    // Anthropic 硬性约束：开启思考时 temperature 只能是 1，且 max_tokens 必须大于思考预算
+    body.temperature = 1;
+    const need = (body.thinking.budget_tokens || 0) + 1024;
+    if (!(body.max_tokens > need)) body.max_tokens = need;
   }
 
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -459,7 +468,8 @@ async function chatNonStream(options) {
     temperature = 0.3,
     maxTokens = 4096,
     timeout = 120000,
-    insecureHTTPParser = false
+    insecureHTTPParser = false,
+    extraBody
   } = options;
 
   const { system, messages: antMessages } = toAnthropic(messages);
@@ -470,6 +480,12 @@ async function chatNonStream(options) {
   if (antTools) {
     body.tools = antTools;
     body.tool_choice = toAnthropicToolChoice(toolChoice);
+  }
+  Object.assign(body, extraBody || {});
+  if (body.thinking && body.thinking.type === 'enabled') {
+    body.temperature = 1;
+    const need = (body.thinking.budget_tokens || 0) + 1024;
+    if (!(body.max_tokens > need)) body.max_tokens = need;
   }
 
   const data = await postJson(String(baseUrl).replace(/\/+$/, '') + '/messages', {
