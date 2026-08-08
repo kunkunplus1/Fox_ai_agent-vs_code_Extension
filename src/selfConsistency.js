@@ -72,9 +72,9 @@ function parseToolCall(text) {
     .replace(/```(?:json)?\s*/gi, '')
     .replace(/```/g, '')
     .trim();
-  // 优先匹配 <fox:tool> 标记（容忍单/双引号变体）
-  const m = s.match(/<fox:tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/fox:tool>/i)
-    || s.match(/<fox:tool\s+name=([^\s>]+)\s*>([\s\S]*?)<\/fox:tool>/i);
+  // 优先匹配 <foxtool> / <fox:tool> 标记（容忍单/双引号变体，冒号可选）
+  const m = s.match(/<fox:?tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/fox:?tool>/i)
+    || s.match(/<fox:?tool\s+name=([^\s>]+)\s*>([\s\S]*?)<\/fox:?tool>/i);
   let name = null;
   let argsRaw = null;
   if (m) {
@@ -111,7 +111,7 @@ async function verifyCall(call, messages, cfg, callModel) {
     return { consistent: true, guarded: false };
   }
   const sys = '你正在复核下一步要调用的工具。基于对话，只输出接下来应执行的单个工具调用，'
-    + '格式：<fox:tool name="工具名">JSON参数</fox:tool>。不要解释。';
+    + '格式：<foxtool name="工具名">JSON参数</foxtool>。不要解释。';
   const prompt = '请重新确认：基于以上上下文，下一步最应该调用哪个工具、参数是什么？';
   const out = await callModel([...messages, { role: 'user', content: prompt }], {
     system: sys,

@@ -29,8 +29,9 @@ const os = require('os');
 // 工具名捕获组必须覆盖真实 MCP 命名空间里的连字符/点/斜杠/大写，
 // 例如 mcp__fetch__fetch-url、mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page。
 // 早期版本用 [a-z_]+ 导致带特殊字符的工具名匹配失败、工具从不执行（表现为「返回空」）。
-const TOOL_OPEN = /<fox:tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
-const TOOL_BLOCK = /<fox:tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/fox:tool>/gi;
+// 兼容模型输出 <fox:tool>（规范写法）和 <foxtool>（部分模型会吞掉冒号）两种标签。
+const TOOL_OPEN = /<fox:?tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
+const TOOL_BLOCK = /<fox:?tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/fox:?tool>/gi;
 const TOOL_END = '</fox:tool>';
 
 /** 写一条调试日志到 ~/.fox-ai/logs/agent-<name>.log，失败静默忽略 */
@@ -146,9 +147,9 @@ function buildExtensionCommandsSection() {
 ${lines.join('\n')}
 
 调用示例：
-<fox:tool name="call_extension_command">
+<foxtool name="call_extension_command">
 {"command": "${allowed[0]}"}
-</fox:tool>`;
+</foxtool>`;
 }
 
 function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
@@ -227,12 +228,12 @@ ${envBrief}${structured}${nativeSearchHint}${citationGuard}
 【调用工具的方式】
 你没有原生函数调用，请严格用下面这种格式调用工具，一次只调用一个：
 
-<fox:tool name="工具名">
+<foxtool name="工具名">
 {"参数名": "参数值"}
-</fox:tool>
+</foxtool>
 
-工具块必须独立成段，里面是合法 JSON。写完 </fox:tool> 后立刻停止输出，等待我把结果发给你。
-不需要调用工具时，直接用自然语言回答，绝对不要输出 <fox:tool> 标签。
+工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待我把结果发给你。
+不需要调用工具时，直接用自然语言回答，绝对不要输出 <foxtool> 标签。
 收到工具返回后，必须基于返回内容整理成最终回答；如果工具返回为空、未找到数据或返回格式异常，要明确指出「工具返回为空/未找到」，不能留空。
 
 【可用工具】
@@ -1181,7 +1182,7 @@ class AgentSession {
       // 处理被 stopMarker 截断、结尾缺少闭合标签的情况
       const open = TOOL_OPEN.exec(text);
       if (open) {
-        const body = text.slice(open.index + open[0].length).replace(/<\/fox:tool>[\s\S]*$/, '');
+        const body = text.slice(open.index + open[0].length).replace(/<\/fox:?tool>[\s\S]*$/, '');
         if (body.trim()) out.push({ id: 'text_0', name: open[1], rawArgs: body });
       }
     }
@@ -1192,7 +1193,7 @@ class AgentSession {
   stripToolBlocks(content) {
     return String(content || '')
       .replace(TOOL_BLOCK, '')
-      .replace(/<fox:tool[\s\S]*$/i, '')
+      .replace(/<fox:?tool[\s\S]*$/i, '')
       .trim();
   }
 

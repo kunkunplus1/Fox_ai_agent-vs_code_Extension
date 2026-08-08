@@ -153,6 +153,12 @@ function once(content) {
   });
   check('纯文本回答不会误判为工具', () =>
     assert.strictEqual(session.parseTextCalls('这里没有工具调用').length, 0));
+  check('兼容模型输出的 <foxtool> 无冒号标签', () => {
+    const c = session.parseTextCalls('<foxtool name="web_search">{"query":"test"}</foxtool>');
+    assert.strictEqual(c.length, 1);
+    assert.strictEqual(c[0].name, 'web_search');
+    assert.deepStrictEqual(JSON.parse(c[0].rawArgs), { query: 'test' });
+  });
 
   console.log('\n[4] 危险命令拦截');
   check('拦截 rm -rf /', () => assert.ok(term.isDangerous('rm -rf /')));

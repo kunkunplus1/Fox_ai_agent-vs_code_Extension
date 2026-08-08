@@ -39,6 +39,9 @@ ok('解析带 ```json 围栏的工具调用', tcFence && tcFence.name === 'run_c
 // 容错：单引号 JSON 变体
 const tcSingle = parseToolCall("<fox:tool name=\"edit_file\">{'path':'/a'}</fox:tool>");
 ok('解析单引号 JSON 变体', tcSingle && tcSingle.name === 'edit_file' && tcSingle.args.path === '/a');
+// 容错：部分模型会输出 <foxtool>（不带冒号）
+const tcNoColon = parseToolCall('<foxtool name="run_command">{"command":"pwd"}</foxtool>');
+ok('解析无冒号 foxtool 标签', tcNoColon && tcNoColon.name === 'run_command' && tcNoColon.args.command === 'pwd');
 // 容错：裸 JSON 形态 {name, args}
 const tcBare = parseToolCall('我觉得应该调用 {"name":"write_file","args":{"path":"/b"}}');
 ok('解析裸 JSON 工具调用', tcBare && tcBare.name === 'write_file' && tcBare.args.path === '/b');
