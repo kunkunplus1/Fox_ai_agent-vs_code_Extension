@@ -3,6 +3,10 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
+const os = require('os');
 const config = require('./config');
 const router = require('./router');
 const { AgentSession } = require('./agent');
@@ -96,6 +100,8 @@ class ChatViewProvider {
     this.previews = new Map();
     this.transcript = []; // 供面板重新可见时恢复
     this.attachments = []; // 当前输入框待发送的附件
+    /** 上一轮“真实”用户输入（非切换指令），用于「换agent」时复述原问题重交智能体 */
+    this._lastUserTurn = null;
     this.sessionManager = new SessionManager(context);
     this._sessionChangeListener = null;
     /** 项目任务清单 */
@@ -178,7 +184,7 @@ class ChatViewProvider {
 
   _applySession(session) {
     this.messages = session.messages || [];
-    this.transcript = session.transcript || [];
+    this.transcript = resolveTranscriptImages(session.transcript || []);
     // 存档时剥掉了 base64，切回会话时按原路径补读回来（文件还在就还能继续发）
     this.attachments = (session.attachments || [])
       .map((a) => {
@@ -270,6 +276,10 @@ class ChatViewProvider {
         await vscode.env.clipboard.writeText(msg.code || '');
         vscode.window.setStatusBarMessage(i18n.tw('$(check) 已复制'), 1500);
         break;
+      case 'saveImage': {
+        if (msg.src) await this._saveGeneratedImage(msg.src, msg.name);
+        break;
+      }
       case 'newFile': {
         const doc = await vscode.workspace.openTextDocument({ content: msg.code || '' });
         await vscode.window.showTextDocument(doc, { preview: false });
@@ -443,7 +453,7 @@ class ChatViewProvider {
         if (p && typeof p.then === 'function') p.then(() => {}, () => {});
       } catch (_) {}
     }
-    if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'tool', 'toolUpdate', 'notice', 'error'].includes(msg.type)) {
+    if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'notice', 'error'].includes(msg.type)) {
       this.transcript.push(msg);
       // 限制气泡历史数量，避免长会话内存线性增长
       const TRANSCRIPT_LIMIT = 200;
@@ -816,21 +826,46 @@ class ChatViewProvider {
       }
     }
 
-    // 构建用户消息内容（文本 + 附件）
-    const userContent = buildUserContent(sendText, atts, canSeeImages);
-    const visibleText = buildUserContent(visible, atts, canSeeImages);
-
-    this.post({ type: 'user', id: 'u' + ++this.seq, text: extractTextFromContent(visibleText), attachments: atts });
-    this.messages.push({ role: 'user', content: userContent });
-
-    // 前置路由门控：简单查询直走 RAG，不进智能体主循环（省 Token）
-    // 用户明确要「换agent / 切换智能体」时，强制走智能体主循环，跳过 RAG 直答
+    // 「换agent / 切换智能体」语义升级：复述上一轮真实用户问题（含其图片附件），
+    // 重新交给智能体处理，而不是把「换agent」三个字当成用户输入提交给模型
+    // ——否则模型会误以为用户要“切换模型”，答非所问（多模态识图也因此失效）。
     const SWITCH_AGENT_RE = /(换\s*agent|切换\s*(到\s*)?agent|用\s*agent|换\s*智能体|切换\s*(到\s*)?智能体|用\s*智能体|force\s*agent)/i;
+    let effectiveText = sendText;
+    let effectiveAtts = atts;
     if (SWITCH_AGENT_RE.test(sendText)) {
-      const { appendLog } = require('./log');
-      appendLog('router', '[force-agent] 用户明确要求切换智能体，跳过 RAG 门控');
+      if (this._lastUserTurn && this._lastUserTurn.text && !SWITCH_AGENT_RE.test(this._lastUserTurn.text)) {
+        effectiveText = this._lastUserTurn.text;
+        effectiveAtts = (this._lastUserTurn.attachments && this._lastUserTurn.attachments.length)
+          ? this._lastUserTurn.attachments
+          : atts;
+        const { appendLog } = require('./log');
+        appendLog('router', '[force-agent] 复述上一轮用户问题重交智能体：' + String(effectiveText).slice(0, 80));
+        this.post({
+          type: 'notice',
+          text: '〔已切换智能体〕正在用智能体重新处理你刚才的问题'
+            + (effectiveAtts.length ? '（含 ' + effectiveAtts.length + ' 张图片）' : '') + '：' + effectiveText
+        });
+      } else {
+        const { appendLog } = require('./log');
+        appendLog('router', '[force-agent] 无上一轮真实用户问题，按字面提交');
+      }
     }
-    if (cfg.routing && cfg.routing.gateEnabled && !SWITCH_AGENT_RE.test(sendText)) {
+
+    // 构建用户消息内容（文本 + 附件）
+    const userContent = buildUserContent(effectiveText, effectiveAtts, canSeeImages);
+    const visibleText = buildUserContent(visible, effectiveAtts, canSeeImages);
+
+    this.post({ type: 'user', id: 'u' + ++this.seq, text: extractTextFromContent(visibleText), attachments: effectiveAtts });
+    this.messages.push({ role: 'user', content: userContent });
+    // 仅在“本次不是切换指令”时才更新上一轮缓冲，避免把「换agent」写进缓冲造成死循环
+    if (!SWITCH_AGENT_RE.test(sendText)) {
+      this._lastUserTurn = { text: effectiveText, attachments: effectiveAtts };
+    }
+
+    // 前置路由门控：简单文本查询直走 RAG，不进智能体主循环（省 Token）。
+    // 带图片的输入一律跳过 RAG 直答、直接走智能体——让多模态识图中转生效，
+    // 否则 RAG 会把图片当成知识库查询、给出无关的文档式回答（识图因此“失效”）。
+    if (cfg.routing && cfg.routing.gateEnabled && !SWITCH_AGENT_RE.test(sendText) && imageCount === 0) {
       const { appendLog } = require('./log');
       const route = router.shouldRoute(sendText, cfg);
       if (route) {
@@ -862,6 +897,105 @@ class ChatViewProvider {
     this._saveCurrentSession();
 
     await this._launch();
+  }
+
+  /**
+   * 把对话里生成的图片保存到本地磁盘。
+   * 支持两种来源：data URI（生图工具直接回传的 base64）与远程 URL（生图模型返回的图片链接）。
+   * 通过 VS Code 原生「另存为」对话框让用户选择路径/文件名，写入后提示并在资源管理器打开。
+   * @param {string} src 图片 data URI 或 http(s) URL
+   * @param {string} [name] 文件名提示（取图片 alt）
+   */
+  async _saveGeneratedImage(src, name) {
+    const { URL } = require('url');
+    try {
+      // 1) 解析图片字节与扩展名
+      let buf;
+      let ext;
+      if (typeof src === 'string' && src.startsWith('data:')) {
+        const mm = /^data:([^;]+);base64,(.*)$/.exec(src);
+        if (!mm) {
+          vscode.window.showErrorMessage(i18n.tw('图片格式无法识别，保存失败。'));
+          return;
+        }
+        const mime = mm[1].toLowerCase();
+        ext = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg' })[mime] || 'png';
+        buf = Buffer.from(mm[2], 'base64');
+      } else if (typeof src === 'string' && /^https?:\/\//i.test(src)) {
+        const fetched = await this._downloadImageBytes(src);
+        if (!fetched) {
+          vscode.window.showErrorMessage(i18n.tw('图片下载失败，无法保存。'));
+          return;
+        }
+        buf = fetched.buf;
+        ext = fetched.ext || 'png';
+      } else {
+        vscode.window.showErrorMessage(i18n.tw('不支持的图片来源，无法保存。'));
+        return;
+      }
+      if (!buf || !buf.length) {
+        vscode.window.showErrorMessage(i18n.tw('图片内容为空，保存失败。'));
+        return;
+      }
+
+      // 2) 默认文件名与目录（优先当前工作区，否则用户主目录）
+      const safe = String(name || 'fox-ai-image')
+        .replace(/[\/\\:*?"<>|]+/g, '_')
+        .replace(/\s+/g, '_')
+        .slice(0, 40) || 'fox-ai-image';
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const fileName = safe + '_' + stamp + '.' + ext;
+      const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+      const baseDir = folders[0] || (process.env.USERPROFILE || process.env.HOME || '.');
+      const defaultUri = vscode.Uri.file(path.join(baseDir, fileName));
+
+      const picked = await vscode.window.showSaveDialog({
+        defaultUri,
+        saveLabel: i18n.tw('保存图片'),
+        filters: { '图片': [ext], '所有文件': ['*'] }
+      });
+      if (!picked) return; // 用户取消
+
+      await vscode.workspace.fs.writeFile(picked, new Uint8Array(buf));
+      const open = i18n.tw('在资源管理器中打开');
+      const act = await vscode.window.showInformationMessage(
+        i18n.tw('已保存图片：{0}', picked.fsPath), open
+      );
+      if (act === open) {
+        vscode.commands.executeCommand('revealFileInOS', picked);
+      }
+    } catch (e) {
+      vscode.window.showErrorMessage(i18n.tw('保存图片失败：{0}', (e && e.message) || String(e)));
+    }
+  }
+
+  /** 下载远程图片字节，自动跟随重定向（最多 5 跳）。失败返回 null。 */
+  _downloadImageBytes(urlStr) {
+    return new Promise((resolve) => {
+      const tryGet = (uStr, redirects) => {
+        let u;
+        try { u = new URL(uStr); } catch (_) { return resolve(null); }
+        const lib = u.protocol === 'http:' ? http : https;
+        const req = lib.get(u, { timeout: 30000 }, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects < 5) {
+            res.resume();
+            return tryGet(new URL(res.headers.location, u).toString(), redirects + 1);
+          }
+          if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const buf = Buffer.concat(chunks);
+            const ct = (res.headers['content-type'] || '').toLowerCase();
+            const ext = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp' })[ct] || 'png';
+            resolve({ buf, ext });
+          });
+        });
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+        req.on('error', () => resolve(null));
+      };
+      tryGet(urlStr, 0);
+    });
   }
 
   /**
@@ -1363,7 +1497,7 @@ function stripHeavyMessages(messages) {
     }
     if (Array.isArray(m.images) && m.images.length) {
       copy = Object.assign({}, copy, {
-        images: m.images.map((img) => Object.assign({}, img, { src: img.src && img.src.startsWith('data:') ? '[图片已存档省略]' : img.src }))
+        images: m.images.map((img) => Object.assign({}, img, { src: persistImage(img.src) }))
       });
     }
     return copy;
@@ -1386,9 +1520,60 @@ function stripHeavyTranscript(transcript) {
       copy.attachments = copy.attachments.map((a) => Object.assign({}, a, { base64: '' }));
     }
     if (copy.type === 'image' && copy.src && copy.src.startsWith('data:')) {
-      copy.src = '[图片已存档省略]';
+      copy.src = persistImage(copy.src);
     }
     return copy;
+  });
+}
+
+/** 生成图/截图落盘到用户级图片仓库（按内容 hash 去重），会话里只存轻量引用，重开时再还原 */
+const MIME_EXT = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp',
+  'image/gif': 'gif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg'
+};
+const EXT_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+  gif: 'image/gif', bmp: 'image/bmp', svg: 'image/svg+xml'
+};
+function sessionImagesDir() {
+  const dir = path.join(os.homedir(), '.fox-ai', 'session-images');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  return dir;
+}
+function persistImage(src) {
+  if (typeof src !== 'string' || !src.startsWith('data:')) return src;
+  const mm = /^data:([^;]+);base64,(.*)$/.exec(src);
+  if (!mm) return src;
+  const mime = mm[1].toLowerCase();
+  const ext = MIME_EXT[mime] || 'png';
+  const buf = Buffer.from(mm[2], 'base64');
+  if (!buf.length) return src;
+  const fileName = crypto.createHash('md5').update(buf).digest('hex') + '.' + ext;
+  const fp = path.join(sessionImagesDir(), fileName);
+  try { if (!fs.existsSync(fp)) fs.writeFileSync(fp, buf); } catch (_) { return src; }
+  return 'foximg:' + fileName;
+}
+function resolveImageRef(src) {
+  if (typeof src !== 'string' || !src.startsWith('foximg:')) return src;
+  const fileName = src.slice('foximg:'.length);
+  if (!/^[a-f0-9]+\.[a-z]+$/i.test(fileName)) return null;
+  const fp = path.join(sessionImagesDir(), fileName);
+  try {
+    const buf = fs.readFileSync(fp);
+    const ext = path.extname(fileName).slice(1).toLowerCase();
+    const mime = EXT_MIME[ext] || 'image/png';
+    return 'data:' + mime + ';base64,' + buf.toString('base64');
+  } catch (_) { return null; }
+}
+function resolveTranscriptImages(items) {
+  return (items || []).map((t) => {
+    if (!t) return t;
+    const c = Object.assign({}, t);
+    if (c.type === 'image' && typeof c.src === 'string' && c.src.startsWith('foximg:')) {
+      const r = resolveImageRef(c.src);
+      if (r) c.src = r;
+    }
+    return c;
   });
 }
 

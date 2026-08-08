@@ -209,8 +209,17 @@ body {
   padding: 1px 4px; border-radius: 3px;
   font-family: var(--vscode-editor-font-family, monospace); font-size: .92em;
 }
-.generated-image { margin: 8px 0 4px; }
+.generated-image { position: relative; display: inline-block; max-width: 100%; margin: 8px 0 4px; }
 .generated-image img { max-width: 100%; border-radius: 8px; display: block; }
+.gen-image-save {
+  position: absolute; right: 8px; bottom: 8px;
+  font-size: 11px; padding: 3px 10px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.45));
+  background: var(--vscode-editorWidget-background, rgba(30,30,30,.72));
+  color: var(--vscode-foreground);
+  opacity: .85; font-family: inherit;
+}
+.gen-image-save:hover { opacity: 1; }
 
 /* ---------- 代码块 ---------- */
 .code-block {

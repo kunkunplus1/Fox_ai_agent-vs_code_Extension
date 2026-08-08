@@ -320,6 +320,14 @@
             el.title = img.alt || t('模型生成图片');
             el.onerror = () => { el.style.display = 'none'; wrapper.textContent = '（图片加载失败）'; };
             wrapper.appendChild(el);
+            const saveBtn = document.createElement('button');
+            saveBtn.className = 'gen-image-save';
+            saveBtn.textContent = t('保存');
+            saveBtn.title = t('保存图片到本地');
+            saveBtn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'saveImage', src: img.src, name: img.alt || 'generated-image' });
+            });
+            wrapper.appendChild(saveBtn);
             m.bubble.appendChild(wrapper);
           }
         }

@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "%foxai.n1%",
   "description": "%foxai.n2%",
-  "version": "0.8.65",
+  "version": "0.8.70",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "engines": {

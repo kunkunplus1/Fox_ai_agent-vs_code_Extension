@@ -76,5 +76,13 @@ ok('alwaysInclude 生效: create_plan_task', r4.includes('create_plan_task'));
 const r5 = selectSubsetNames(TOOLS, '搜索文件中与安全自检有关的代码并审查', { enabled: true, topK: 5 });
 ok('子集 ⊆ 全量', r5.every((n) => ALL_NAMES.has(n)));
 
+// 9) 生图通道常驻：generate_image 不在中文 query 的语义命中词里，开启 dynamicSubset 也绝不能被
+//    子集排除，否则用户说“画个女孩”时模型退回用 SVG/代码代替生图。
+ok('generate_image 常驻 CORE_ALWAYS', CORE_ALWAYS.has('generate_image'));
+const r6 = selectSubsetNames(TOOLS, '画个女孩', { enabled: true, topK: 5 });
+ok('generate_image 在动态子集里始终可见（画个女孩）', r6.includes('generate_image'));
+const r7 = selectSubsetNames(TOOLS, '生成一张海报', { enabled: true, topK: 5 });
+ok('generate_image 在动态子集里始终可见（生成海报）', r7.includes('generate_image'));
+
 console.log('\n[toolSelect] 通过 ' + pass + ' 项' + (fail ? '，失败 ' + fail + ' 项' : ''));
 process.exit(fail ? 1 : 0);

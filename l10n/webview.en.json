@@ -187,5 +187,15 @@
   "该任务正在运行中，无需续跑～": "This task is already running; no need to resume~",
   "读取附件失败：{0}": "Failed to read attachment: {0}",
   "没有活动编辑器，代码已复制到剪贴板": "No active editor; code copied to clipboard",
-  "已把 {0} 加入白名单": "Added {0} to the allowlist"
+  "已把 {0} 加入白名单": "Added {0} to the allowlist",
+  "保存": "Save",
+  "保存图片到本地": "Save image to local disk",
+  "保存图片": "Save image",
+  "已保存图片：{0}": "Image saved: {0}",
+  "在资源管理器中打开": "Open in Explorer",
+  "图片格式无法识别，保存失败。": "Unrecognized image format; save failed.",
+  "图片下载失败，无法保存。": "Image download failed; cannot save.",
+  "不支持的图片来源，无法保存。": "Unsupported image source; cannot save.",
+  "图片内容为空，保存失败。": "Image content is empty; save failed.",
+  "保存图片失败：{0}": "Failed to save image: {0}"
 }

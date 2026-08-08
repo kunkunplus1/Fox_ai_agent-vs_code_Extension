@@ -30,7 +30,11 @@ const CORE_ALWAYS = new Set([
   'create_skill', 'use_skill',
   'create_plan_task', 'update_plan_task', 'list_plan_tasks',
   'save_memory', 'get_memory',
-  'write_organize', 'read_organize'
+  'write_organize', 'read_organize',
+  // 生图通道：generate_image 的工具名与中文 query「画/生成图片」几乎不可能语义命中，
+  // 且不是时效/文件/执行类工具；一旦开启 dynamicSubset 就会被子集排除，模型“看不到”也就调不到，
+  // 导致用户说“画个女孩”时模型退回用 SVG/代码代替。必须常驻。
+  'generate_image'
 ]);
 
 function tokenize(text) {
