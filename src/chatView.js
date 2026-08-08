@@ -20,6 +20,7 @@ const { PlanTaskStore } = require('./planTasks');
 const caps = require('./capabilities');
 const storageMgr = require('./storageManager');
 const mcp = require('./tools/mcp');
+const DisposableBag = require('./disposableBag');
 
 const outputChannel = vscode.window.createOutputChannel('狐狸 AI');
 let logLineCount = 0;
@@ -87,6 +88,8 @@ class ChatViewProvider {
     const taskDir = context.globalStorageUri.fsPath;
     this.taskManager = new harness.TaskManager({ dir: taskDir });
     this.view = null;
+    /** 主侧边栏 webview 的监听器收集袋；dispose 时一并释放，避免主进程累加 EventListener */
+    this._disposables = new DisposableBag();
     /** 对话历史（OpenAI 消息格式，含 tool 消息） */
     this.messages = [];
     /** @type {AgentSession|null} */
@@ -139,6 +142,20 @@ class ChatViewProvider {
     }
   }
 
+  /**
+   * 释放本 provider 持有的全部资源（扩展停用、或面板彻底关闭时调用）。
+   * 重点：清理侧边栏 webview 监听器袋，避免主进程 EventListener 残留。
+   * 可移动面板的监听器由各面板自己的 bag 在 onDidDispose 里释放，这里兜底再清一遍。
+   */
+  dispose() {
+    try { if (this._disposables) this._disposables.dispose(); } catch (_) {}
+    for (const panel of Array.from(this.panels || [])) {
+      try { if (panel && panel._bag) panel._bag.dispose(); } catch (_) {}
+    }
+    this.view = null;
+    this.panels = new Set();
+  }
+
   _pushPlanTasks() {
     this.post({ type: 'planTasks', items: this.planTasks.list() });
   }
@@ -160,19 +177,21 @@ class ChatViewProvider {
     };
     webview.html = this.render(webview);
 
-    webview.onDidReceiveMessage(async (msg) => {
+    this._disposables.add(webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.onMessage(msg || {});
       } catch (e) {
         log('onMessage error:', e && e.stack);
         this.post({ type: 'error', text: (e && e.message) || String(e) });
       }
-    });
+    }));
 
-    webviewView.onDidDispose(() => {
+    this._disposables.add(webviewView.onDidDispose(() => {
       this.stop();
+      // 释放侧边栏 webview 相关监听器，避免反复开关累加 EventListener
+      if (this._disposables) this._disposables.dispose();
       this.view = null;
-    });
+    }));
 
     // 加载当前会话
     this._restoreCurrentSession();
@@ -544,24 +563,40 @@ class ChatViewProvider {
       light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'fox.svg'),
       dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'fox.svg')
     };
+    // 限制可移动面板数量上限，避免同时开太多会话导致内存暴涨
+    const MAX_PANELS = 3;
+    while (this.panels.size >= MAX_PANELS) {
+      const oldest = this.panels.values().next().value;
+      if (!oldest) break;
+      try {
+        this.panels.delete(oldest); // 先移出集合，使 size 即时下降，避免 dispose 异步前再次进入循环
+        oldest.dispose();
+      } catch (_) {}
+    }
     this.panels.add(panel);
 
     panel.webview.html = this._renderFor(panel.webview);
     this._syncTo(panel.webview);
 
-    panel.webview.onDidReceiveMessage(async (msg) => {
+    // 每个可移动面板自带一个 disposable 袋，dispose 时彻底释放其监听器
+    const bag = new DisposableBag();
+    panel._bag = bag;
+    bag.add(panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.onMessage(msg || {});
       } catch (e) {
         log('panel onMessage error:', e && e.stack);
         this.post({ type: 'error', text: (e && e.message) || String(e) });
       }
-    });
+    }));
 
-    panel.onDidDispose(() => {
+    bag.add(panel.onDidDispose(() => {
       panel._disposed = true;
+      // 释放面板监听器，避免反复开关累加 EventListener
+      bag.dispose();
+      panel._bag = null;
       this.panels.delete(panel);
-    });
+    }));
   }
 
   _renderFor(webview) {

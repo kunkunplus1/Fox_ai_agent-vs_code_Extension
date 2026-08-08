@@ -15,6 +15,12 @@ const { estimateTokens, messageText } = require('./contextUsage');
 const DEFAULT_MAX_BYTES_PER_MSG = 12000;
 const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024; // 1MB
 
+// 与 capabilities.isImagePart 同语义，但保持本模块零外部依赖，便于离线测试
+const IMAGE_PART_TYPES = new Set(['image_url', 'input_image', 'image']);
+function isImagePartLocal(part) {
+  return !!(part && IMAGE_PART_TYPES.has(part.type));
+}
+
 function clampText(text, maxBytes) {
   if (!text) return text;
   const s = String(text);
@@ -174,4 +180,44 @@ function trimHistory(messages, protocol, maxHistory, opts) {
   });
 }
 
-module.exports = { trimHistory, clampText, clampMessage };
+/**
+ * 就地（in-place）把超出保留窗口的历史图片降级为占位，释放大 base64 字符串占用的内存。
+ * 只处理真正「超窗口」的图片：保留最近 keepTurns 条带图用户消息的完整 base64，
+ * 更早的带图消息里图片 part 被删除、追加一句占位文本，从而断开对大字符串的引用便于 GC。
+ *
+ * @param {Array} messages  会直接被就地修改（this.messages 本体）
+ * @param {number} keepTurns 保留最近几条带图用户消息的 base64
+ * @returns {number} 被移除（释放）的图片张数
+ */
+function stripOldImageBase64(messages, keepTurns) {
+  keepTurns = Math.max(0, keepTurns | 0);
+  if (!Array.isArray(messages) || !messages.length) return 0;
+  const idxs = [];
+  messages.forEach((m, i) => {
+    if (m && Array.isArray(m.content) && m.content.some(isImagePartLocal)) idxs.push(i);
+  });
+  if (idxs.length <= keepTurns) return 0;
+  const keep = new Set(idxs.slice(idxs.length - keepTurns));
+  let removed = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (keep.has(i)) continue;
+    const m = messages[i];
+    if (!m || !Array.isArray(m.content) || !m.content.some(isImagePartLocal)) continue;
+    const keptParts = [];
+    for (const part of m.content) {
+      if (isImagePartLocal(part)) { removed++; continue; }
+      keptParts.push(part);
+    }
+    const note = { type: 'text', text: '\n[历史图片已省略，如需重看请重新上传]' };
+    const allText = keptParts.length && keptParts.every((p) => p && p.type === 'text');
+    messages[i] = Object.assign({}, m, {
+      content: allText
+        ? keptParts.map((p) => p.text).join('\n') + note.text
+        : keptParts.concat([note])
+    });
+  }
+  return removed;
+}
+
+module.exports = { trimHistory, clampText, clampMessage, stripOldImageBase64, isImagePartLocal };
+

@@ -128,6 +128,8 @@ function activate(context) {
   ws.registerDiffProvider(context);
 
   chatProvider = new ChatViewProvider(context);
+  // 扩展停用时统一释放 provider 持有的监听器（侧边栏 webview / 可移动面板）
+  context.subscriptions.push({ dispose: () => { try { chatProvider.dispose(); } catch (_) {} } });
   // 对话窗口现在以可移动编辑器标签页（WebviewPanel）形式存在，不再占用侧边栏
 
   /* ---------------- 会话侧边栏 ---------------- */
@@ -136,7 +138,10 @@ function activate(context) {
     vscode.window.registerTreeDataProvider('foxAi.sessions', sessionTree)
   );
   // 当会话变化时刷新树；注册后再主动刷新一次，避免视图在 provider 就绪前已可见导致空白
-  chatProvider.sessionManager.onChange(() => sessionTree.refresh());
+  // 返回值（Disposable）必须收进 subscriptions，否则每次 activate 都会追加一个残留监听器
+  context.subscriptions.push(
+    chatProvider.sessionManager.onChange(() => sessionTree.refresh())
+  );
   sessionTree.refresh();
 
   /* ---------------- 文件导航树（栏目表点击跳转） ---------------- */
@@ -990,7 +995,7 @@ function updateStatusBar() {
 }
 
 function deactivate() {
-  if (chatProvider) chatProvider.stop();
+  if (chatProvider) { try { chatProvider.dispose(); } catch (_) {} }
 }
 
 module.exports = { activate, deactivate };

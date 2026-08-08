@@ -35,37 +35,55 @@ function debugImageGen(label, obj) {
 }
 
 /**
- * 从任意 JSON 响应对象里递归扫描可能的图片 URL / data URI。
- * 用于兜底识别非标准生图返回格式。
+ * 从「已知图片承载位置」抽取图片 URL / data URI。
+ * 关键：只扫描生图模型约定的图片字段（choices[].message.content / data[]），
+ * 绝不把整个响应对象（含错误页 / 教程页 / debug_info）里的任意 .png 当成生图结果。
+ * @param {object} raw client.chatNonStream 原始响应
+ * @returns {string[]}
  */
-function scanObjectForImages(obj, seen) {
+function extractImagesFromRaw(raw) {
   const out = [];
-  seen = seen || new Set();
-  const push = (s) => {
-    if (!s || seen.has(s)) return;
-    seen.add(s);
-    out.push(s);
-  };
-  if (!obj || typeof obj !== 'object') return out;
-  if (Array.isArray(obj)) {
-    for (const item of obj) out.push(...scanObjectForImages(item, seen));
-    return out;
-  }
-  for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === 'string') {
-      // 显式图片字段
-      if ((k === 'image' || k === 'url' || k === 'image_url' || k === 'b64_json') && v) {
-        if (k === 'b64_json') push('data:image/png;base64,' + v);
-        else push(v);
+  const push = (s) => { if (s && !out.includes(s)) out.push(s); };
+  if (!raw || typeof raw !== 'object') return out;
+
+  // 通义 wan / dashscope 风格：raw.output.choices[].message.content[].image | b64_json
+  const choices = (raw.output && raw.output.choices) || raw.choices || [];
+  if (Array.isArray(choices)) {
+    for (const ch of choices) {
+      const msg = ch && (ch.message || ch);
+      if (!msg) continue;
+      // 部分实现把图片直接挂在 message.image / message.b64_json（无 content 包裹）
+      if (typeof msg.image === 'string') push(msg.image);
+      else if (msg.image_url) {
+        const u = typeof msg.image_url === 'string' ? msg.image_url : (msg.image_url.url || '');
+        if (u) push(u);
+      } else if (msg.b64_json) push('data:image/png;base64,' + msg.b64_json);
+      const content = msg && msg.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (!part) continue;
+          if (typeof part.image === 'string') push(part.image);
+          else if (part.image_url) {
+            const u = typeof part.image_url === 'string' ? part.image_url : (part.image_url.url || '');
+            if (u) push(u);
+          } else if (part.type === 'image' && part.b64_json) {
+            push('data:image/png;base64,' + part.b64_json);
+          }
+        }
+      } else if (typeof content === 'string') {
+        const re = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g;
+        let m;
+        while ((m = re.exec(content))) push(m[0]);
       }
-      // 字符串里嵌的 data URL / 图片链接
-      const dataRe = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g;
-      let m;
-      while ((m = dataRe.exec(v))) push(m[0]);
-      const urlRe = /https?:\/\/[^\s"')<>]+(?:\.(?:png|jpe?g|gif|webp|bmp|svg))(?:\?[^\s"')<>]*)?/gi;
-      while ((m = urlRe.exec(v))) push(m[0]);
-    } else if (typeof v === 'object' && v !== null) {
-      out.push(...scanObjectForImages(v, seen));
+    }
+  }
+
+  // OpenAI images.generate 风格：raw.data[].url | b64_json
+  if (Array.isArray(raw.data)) {
+    for (const d of raw.data) {
+      if (!d) continue;
+      if (d.url) push(d.url);
+      if (d.b64_json) push('data:image/png;base64,' + d.b64_json);
     }
   }
   return out;
@@ -100,8 +118,13 @@ function extractImageUrls(result) {
     const re = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g;
     let m;
     while ((m = re.exec(content))) push(m[0]);
-    const urlRe = /https?:\/\/[^\s"')<>]+(?:\.(?:png|jpe?g|gif|webp|bmp|svg))(?:\?[^\s"')<>]*)?/gi;
-    while ((m = urlRe.exec(content))) push(m[0]);
+    // 仅当 content 整体就是「单个图片链接」时才采信其中的 http(s) 图片；
+    // 普通文本 / 错误说明 / HTML 页面不从中扒链接，避免把错误页、教程页里
+    // 嵌入的图当成生图结果（这正是曾出现「返回动漫教程截图」的根因之一）。
+    const trimmed = content.trim();
+    if (/^https?:\/\/\S+$/i.test(trimmed) && /\.(png|jpe?g|gif|webp|bmp|svg)(\?|$)/i.test(trimmed)) {
+      push(trimmed);
+    }
   } else if (Array.isArray(content)) {
     for (const part of content) {
       if (!part) continue;
@@ -121,9 +144,8 @@ function extractImageUrls(result) {
   }
   if (out.length) return out;
 
-  // 3) 终极兜底：扫描整个原始响应对象
-  // scan 内部会用自己的 seen 去重；扫描结果再交给外层 push 二次去重
-  for (const s of scanObjectForImages(result && result.raw)) push(s);
+  // 3) 定向兜底：只扫描生图模型约定的图片字段，不再全对象扫描
+  for (const s of extractImagesFromRaw(result && result.raw)) push(s);
 
   return out;
 }

@@ -24,6 +24,7 @@ const mcpServers = require('./tools/mcpServers');
 const mcpSetup = require('./tools/mcpSetup');
 const mcpSecurity = require('./tools/mcpSecurity');
 const mcpCatalog = require('./mcpCatalog');
+const DisposableBag = require('./disposableBag');
 const mcpAuthor = require('./tools/mcpAuthor'); // 用户自写 MCP 的磁盘目录清理
 
 let _panel = null;
@@ -422,7 +423,10 @@ function openEnvPanel(context, chatProvider, initialTab) {
   _panel = panel;
   panel.webview.html = getHtml(context, panel.webview);
 
-  panel.webview.onDidReceiveMessage(async (msg) => {
+  // 面板监听器收进袋子，dispose 时一并释放，避免反复打开累加主进程 EventListener
+  const bag = new DisposableBag();
+  panel._bag = bag;
+  bag.add(panel.webview.onDidReceiveMessage(async (msg) => {
     const cfg = vscode.workspace.getConfiguration('foxAi');
 
     async function refreshMcpPanel() {
@@ -871,9 +875,12 @@ function openEnvPanel(context, chatProvider, initialTab) {
     } catch (e) {
       vscode.window.showErrorMessage(tw('环境与插件面板出错：{0}', e.message));
     }
-  });
+  }));
 
-  panel.onDidDispose(() => { _panel = null; });
+  panel.onDidDispose(() => {
+    if (panel._bag) { try { panel._bag.dispose(); } catch (_) {} panel._bag = null; }
+    _panel = null;
+  });
 }
 
 module.exports = { openEnvPanel, scanProject };

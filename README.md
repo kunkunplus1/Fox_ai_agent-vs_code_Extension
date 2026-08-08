@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：0.8.80
+> **版本**：0.8.82
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -31,10 +31,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-0.8.80.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
+1. 获取扩展包 `fox-ai-0.8.82.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-0.8.80.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-0.8.82.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏与扩展详情页使用狐狸图标（`media/fox.png`）。
@@ -131,6 +131,12 @@
 
 每完成一轮代码写操作，智能体会自动调用只读的审查子代理对本次改动执行审查，并将意见以审查卡片展示于对话中。审查子代理仅读取、不修改、不执行命令。可在设置 `foxAi.review.enabled` 中关闭。
 
+审查体验经过多轮优化，兼顾“快”与“准”：
+- **不阻塞主回答**：审查在后台异步运行，您无需等待即可看到智能体的主结论，审查卡片稍后弹出。
+- **限时注入**：主控输出前会限时（默认 8 秒，可在 `foxAi.review.injectTimeout` 调整，0 表示完全异步）等待审查结果；审查快时结论会纳入主控回答，慢时先给答案、卡片后补。
+- **一键修正**：审查卡片底部有「按审查意见修正」按钮，点击后自动把审查意见作为新任务启动修正；若主任务仍在忙会自动排队、结束后应用，不再提示“还在忙”。
+- **基于真实改动**：审查子代理读取文件真实前后状态生成 diff，不会被模型给出的错误编辑参数误导，避免“明明改了却说没改”的循环。
+
 ### 6.7 长期记忆（跨会话）
 
 智能体具备跨会话长期记忆能力，用于保留用户偏好与项目约定。
@@ -194,11 +200,32 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 当主模型不支持图片理解、而对话中包含图片时，可开启多模态识图中转：由独立的视觉模型先将图片转述为文字描述，再交给主模型处理。相关设置位于 `foxAi.vision.*`（enabled / provider / baseUrl / apiKey / model / apiMode）。
 
+> 带图片的输入会跳过知识库直答、直接走智能体，确保识图中转生效；如需让 AI 生成图片，见 6.17。
+
 ### 6.16 输出截断自动继续
 
 当模型单条回复因达到 `max_tokens` 上限而被截断（`finish_reason` 为 `length` 或 `incomplete`）时，扩展会在同一对话气泡内自动插入“继续输出剩余内容”的指令并重调模型，默认最多 `foxAi.agent.maxContinues`（默认 3）次。达到上限后，面板会提示“如需继续请手动发送「继续」”。
 
 > 若长回答频繁被截断，优先调大 `foxAi.maxTokens`，而非依赖自动继续。可在日志 `~/.fox-ai/logs/agent.log` 中查看 `[auto-continue]` 记录。
+
+### 6.17 文生图（generate_image）
+
+智能体可调用独立的生图模型生成图片（插画、海报、图标、概念图等）。生图是独立于主控模型的**第二个模型通道**，需单独配置后才生效：
+
+- **开启与配置**：设置 `foxAi.imageGen.enabled` 为 `true`，并填写 `provider` / `baseUrl` / `apiKey` / `model`（如通义万相兼容端点）。未配置时，AI 会提示“生图通道未开启”而非静默失败。
+- **如何触发**：用自然语言描述即可，例如“画一棵大树”“生成一张活动海报”。生图工具已设为常驻，AI 会主动调用而非用 SVG/代码替代（除非您明确要矢量图）。
+- **保存与持久化**：生成的图片在对话中展示，每张图右下角有「保存」按钮，可一键另存到本地磁盘；会话中的图片会以轻量引用存档，关闭窗口再打开也能原样恢复，不再丢失。
+- **结果可信**：生图结果只从约定的图片字段提取，若模型返回错误页/无关内容会明确提示“未返回可识别图片”，而不会把页面里的无关图静默渲染成“生成结果”。
+
+> 若生图内容偶尔跑题（模型本身画歪了，而非抓错图），属生图模型质量问题，本层已兜住“抓错图”这类故障；可更换生图模型或优化描述。
+
+### 6.18 执行步骤时间线
+
+智能体执行任务时，对话区顶部会浮现一条**竖向执行步骤时间线**，按真实发生顺序点亮：
+
+- 🧠 调用模型 → 🔍 读取 → ✏️ 修改 → 🖥️ 执行命令 → ⏳ 等待审批 → ✅ 完成，运行中节点呼吸闪烁。
+- 点击任意步骤可展开查看详情（如工具参数、输出摘要）。
+- 关闭窗口再打开，时间线会从会话记录中自动恢复。
 
 ---
 
@@ -210,6 +237,8 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | --- | --- |
 | 连接 | `foxAi.provider` / `foxAi.baseUrl` / `foxAi.model` / `foxAi.apiKey` |
 | 对话 | `foxAi.temperature` / `foxAi.maxTokens` / `foxAi.maxHistory` / `foxAi.streamFormat` / `foxAi.vision.*`（多模态识图中转） |
+| 生图 | `foxAi.imageGen.enabled` / `.provider` / `.baseUrl` / `.apiKey` / `.model`（独立生图通道，需单独开启） |
+| 审查注入 | `foxAi.review.enabled` / `foxAi.review.injectTimeout`（主控限时等待审查的毫秒数，0 表示完全异步） |
 | 上下文用量 | `foxAi.showContextUsage`（开关面板） / `foxAi.contextWindow`（模型窗口上限，填 0 则只显示 token 数） |
 | 自动压缩 | `foxAi.knowledgeBase.autoSummarize.enabled` / `.threshold`（触发阈值，默认 0.9） / `.keepRecent`（保留最近条数，默认 6） / `.dir` |
 | 存储位置 | `foxAi.sessions.storagePath` / `foxAi.memory.storagePath` / `foxAi.skills.storagePath` / `foxAi.planTasks.storagePath` |
@@ -245,7 +274,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 智能体在完成任务时可调用的工具（部分）：
 
-`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` 等。
+`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` 等。
 
 > 智能体工作准则要求：用户要求“读 / 看 / 打开 / 检查某文件”时，必须立即调用 `read_file` 读取真实内容，不凭记忆猜测或编造。
 
@@ -269,6 +298,9 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 多步骤任务想先确认再执行 | 开启“规划确认模式”（`foxAi.planAndExecute.enabled`），会先提交计划卡片待您确认 |
 | 扩展进程内存占用偏高 | 已内置多项治理；若仍偏高，可减少知识库超大文件、关闭非必要路径，或调小 `foxAi.agent.maxMessageBytes` |
 | 知识库检索不到想要内容 | 可调大 `foxAi.knowledgeBase.topK`，或开启“知识库整理”使目录全量注入 |
+| 让 AI 画图没反应 / 总提示“通道未开启” | 生图是独立通道，需在设置开启 `foxAi.imageGen.enabled` 并配置生图模型（provider/baseUrl/apiKey/model），详见 6.17 |
+| 生成的图片不是我想要的（内容跑题） | 属生图模型质量问题；若返回完全不相关的图（如教程截图），多为模型返回异常，抓取逻辑已加固，可更换生图模型或优化描述 |
+| 对话里的图片 / 生图重开窗口后消失 | 图片已做持久化存档（轻量引用），重开自动恢复；若仍丢失请检查存储路径 `foxAi.sessions.storagePath` |
 
 ---
 
@@ -304,6 +336,9 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 **Q5：会话数据保存在哪里？**
 会话、记忆、技能、任务清单均有独立存储路径，可在设置的“存储位置”分组中查看与迁移（命令“狐狸 AI：打开 … 目录”可一键打开）。
+
+**Q6：怎么让狐狸 AI 帮我画图？**
+需在设置中开启生图通道：把 `foxAi.imageGen.enabled` 设为 `true`，并配置一个生图模型（provider / baseUrl / apiKey / model）。配置好后直接说“画一个 XX”即可，生成的图可一键保存到本地，且会话重开不丢失。详见 6.17。
 
 ---
 

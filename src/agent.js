@@ -26,6 +26,15 @@ const { shouldAutoContinue } = require('./autoContinue');
 const fs = require('fs');
 const os = require('os');
 
+// —— 模块级 LLM 并发限流 ——
+// 跨所有 session / 可移动面板限制「同时飞向模型的请求数」。多个面板/会话同时跑任务时，
+// 若不限制会瞬间并发多个 LLM 请求（主请求 + 审查子代理 + 多模态识图 + planner 子模型），
+// 每个响应都可能带很长 reasoning / 工具结果，瞬时内存与 token 峰值很高。
+// 用全局计数信号量把并发压到 MAX_CONCURRENT_LLM，超出则排队等待，避免同时撑爆。
+const { createLimiter } = require('./concurrency');
+const MAX_CONCURRENT_LLM = 2;
+const llmLimiter = createLimiter(MAX_CONCURRENT_LLM);
+
 // 工具名捕获组必须覆盖真实 MCP 命名空间里的连字符/点/斜杠/大写，
 // 例如 mcp__fetch__fetch-url、mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page。
 // 早期版本用 [a-z_]+ 导致带特殊字符的工具名匹配失败、工具从不执行（表现为「返回空」）。
@@ -940,7 +949,7 @@ class AgentSession {
     const cfg = this.cfg;
     const b = selectBackend(cfg);
     const isReview = !!opts.review;
-    return b.nonStream({
+    return llmLimiter.run(() => b.nonStream({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
       model: cfg.model,
@@ -952,7 +961,7 @@ class AgentSession {
       insecureHttpParser: cfg.insecureHttpParser,
       streamFormat: cfg.streamFormat,
       signal: this._abortCtrl ? this._abortCtrl.signal : undefined
-    });
+    }));
   }
 
   /** 自动代码审查：本轮有代码写操作后触发一次只读审查子代理（后台异步，不阻塞主代理回复） */
@@ -1128,12 +1137,11 @@ class AgentSession {
       maxTokens: v.maxTokens,
       timeout: v.timeout
     };
-    const r =
-      v.transport === 'anthropic'
-        ? await anthropic.chatNonStream(opts)
-        : v.apiMode === 'responses'
-        ? await chatNonStreamResponses(opts)
-        : await chatNonStream(opts);
+    const r = await llmLimiter.run(async () => {
+      if (v.transport === 'anthropic') return anthropic.chatNonStream(opts);
+      if (v.apiMode === 'responses') return chatNonStreamResponses(opts);
+      return chatNonStream(opts);
+    });
     return (r && r.content) || '';
   }
 
@@ -1190,6 +1198,7 @@ class AgentSession {
 
   /** 发起一次模型调用（默认流式，解析失败时自动非流式兜底） */
   async callModel(payload, useNative, toolsOverride) {
+    return llmLimiter.run(async () => {
     const cfg = this.cfg;
     const isDeepResp = cfg.provider === 'deepseek' && cfg.apiMode === 'responses';
     const queryForTools = (() => {
@@ -1290,6 +1299,7 @@ class AgentSession {
       }
       throw err;
     }
+    });
   }
 
   /**
@@ -1372,7 +1382,7 @@ class AgentSession {
     const plannerModel = cfg.planner.model || 'deepseek-chat'; // 不设就用便宜模型，不使用主模型（避免慢+贵）
     const callModel = async (msgs, opts) => {
       const live = await config.resolve(this.context);
-      const r = await client.chatNonStream({
+      const r = await llmLimiter.run(() => client.chatNonStream({
         baseUrl: cfg.planner.baseUrl || live.baseUrl,
         apiKey: live.apiKey,
         model: plannerModel,
@@ -1380,7 +1390,7 @@ class AgentSession {
         temperature: opts.temperature,
         maxTokens: opts.maxTokens,
         timeout: plannerTimeout
-      });
+      }));
       return r && r.content ? r.content : '';
     };
 
@@ -1417,14 +1427,14 @@ class AgentSession {
   _scCallModel(messages, opts) {
     const client = require('./client');
     const cfg = this.cfg;
-    return client.chatNonStream({
+    return llmLimiter.run(() => client.chatNonStream({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
       model: cfg.model,
       messages,
       temperature: opts.temperature,
       maxTokens: opts.maxTokens
-    }).then((r) => (r && r.content) ? r.content : '');
+    })).then((r) => (r && r.content) ? r.content : '');
   }
 
   /** 执行单个工具（含审批、结果回填） */
@@ -2021,8 +2031,21 @@ class AgentSession {
   }
 
   trimHistory() {
-    const { trimHistory: clean } = require('./messageSanitize');
+    const { trimHistory: clean, stripOldImageBase64 } = require('./messageSanitize');
     const cfg = this.cfg || {};
+    // 运行期就地释放超出保留窗口的历史图片 base64，避免几 MB 的大字符串常驻 this.messages。
+    // 只清「更早的图片」，最近 keepImageTurns 轮的图片仍保留供模型回看。
+    if (Array.isArray(this.messages) && this.messages.length) {
+      try {
+        const removed = stripOldImageBase64(this.messages, cfg.keepImageTurns || 1);
+        if (removed && !this._warnedImageFree) {
+          this._warnedImageFree = true;
+          this.emit('notice', { text: `已释放 ${removed} 张较早图片的 base64（移出上下文以省内存），如需重看请重新上传。` });
+        }
+      } catch (_) {
+        // 清理失败不应阻断正常发送
+      }
+    }
     return clean(this.messages, this.protocol, cfg.maxHistory || 20, {
       maxBytesPerMessage: cfg.maxToolOutput || 8000,
       maxTotalBytes: cfg.maxMessageBytes || 1024 * 1024

@@ -28,6 +28,13 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// —— 模块级 MCP 调用并发限流 ——
+// 慢 IO（playwright 浏览器操作 / web_search / fetch 等）限流：跨所有连接器限制
+// 同时进行的远程工具调用数，避免多个会话并发触发大量浏览器/网络操作把内存和 CPU 打爆。
+const { createLimiter } = require('../concurrency');
+const MAX_CONCURRENT_MCP = 4;
+const mcpLimiter = createLimiter(MAX_CONCURRENT_MCP);
+
 /** 写一条调试日志到 ~/.fox-ai/logs/mcp-<name>.log，失败静默忽略（避免污染 stdout） */
 function writeMcpLog(name, lines) {
   try {
@@ -212,7 +219,7 @@ async function executeRemote(tool, args, ctx) {
   writeMcpLog('execute', [`>> executeRemote ${callKey}`, `args=${JSON.stringify(args || {})}`]);
   let result;
   try {
-    result = await c.callTool(tool.remoteName, args || {});
+    result = await mcpLimiter.run(() => c.callTool(tool.remoteName, args || {}));
   } catch (err) {
     writeMcpLog('execute', [`<< executeRemote ${callKey} ERROR`, String(err && err.message ? err.message : err)]);
     throw err;

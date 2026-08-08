@@ -19,7 +19,9 @@ ok('images[].b64', extractImageUrls({ images: [{ b64: 'QUJD' }] }).join() === 'd
 
 // 2) 字符串 content 里嵌 data URL / URL
 ok('string content data URL', extractImageUrls({ content: '看图：' + b64 + ' 结束' }).join() === b64);
-ok('string content url', extractImageUrls({ content: '见 https://y.com/b.jpg 与 https://z.com/c.png' }).length === 2);
+// 自由文本里夹的图片链接不再抓取（防把错误页/教程页的图当结果）；只有整条就是单个链接才采信
+ok('string content url not scraped from prose', extractImageUrls({ content: '见 https://y.com/b.jpg 与 https://z.com/c.png' }).length === 0);
+ok('string content single url', extractImageUrls({ content: 'https://y.com/b.jpg' }).length === 1);
 
 // 3) 通义 wan2.1-image 风格：content 数组含 {type:'image', image:'data:...'}
 ok('wan array image string', extractImageUrls({ content: [{ type: 'text', text: 'ok' }, { type: 'image', image: b64 }] }).join() === b64);
