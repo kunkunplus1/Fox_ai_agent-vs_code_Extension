@@ -11,6 +11,8 @@ const reviewChanges = require('./reviewChanges'); // 原始版 vs 修改版对�
 const securityAudit = require('./securityAudit'); // 只读代码安全自检（自检 Agent）
 const referee = require('./referee'); // 只读第三方裁判 Agent（双盲交叉验证）
 const imageGen = require('./imageGen'); // 生图通道（独立第二模型，服务总控 agent，类似 vision 识图但反向）
+const subagents = require('../subagents'); // 子代理 / 并行 agent / agent teams
+const codebaseIndex = require('./codebaseIndex'); // 全仓库语义索引（RAG）
 const bridge = require('../extensionBridge'); // 跨扩展命令调用桥
 const kb = require('../knowledgeBase'); // 会话隔离与跨会话授权
 
@@ -261,41 +263,100 @@ const TOOLS = [
     kind: 'edit',
     title: (a) => `记住：${(a.text || '').slice(0, 24)}`,
     description:
-      '保存一条长期记忆（用户偏好、项目约定、踩过的坑等），下次对话会自动注入作为参考。text 为记忆内容；tags 可选，逗号分隔标签；category 可选：preference/project/lesson/general。',
+      '保存一条长期记忆（用户偏好、项目约定、踩过的坑、架构决策等），跨会话持久保存，下次对话会按相关性自动注入。记忆会被自动归类到主题文件里（用户可直接手动编辑），内容近似重复时会自动跳过。topic 可选，不传会自动判断：project-conventions（项目约定/规范）｜user-preferences（用户偏好）｜debugging-lessons（踩坑教训）｜architecture-decisions（架构技术选型）｜workflows（操作流程）｜domain-knowledge（业务领域知识）｜general。',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要记住的内容，一句话说清' },
+        text: { type: 'string', description: '要记住的内容，一句话说清，自包含（别写「像上次那样」这种没有上下文看不懂的）' },
+        topic: {
+          type: 'string',
+          enum: ['project-conventions', 'user-preferences', 'debugging-lessons', 'architecture-decisions', 'workflows', 'domain-knowledge', 'general'],
+          description: '可选，指定归入哪个主题；不传则自动判断'
+        },
         tags: { type: 'string', description: '可选，逗号分隔的标签，如 偏好,Python' },
-        category: { type: 'string', description: '可选分类：preference / project / lesson / general' }
+        category: { type: 'string', description: '（兼容旧字段）preference / project / lesson / general' }
       },
       required: ['text']
     },
     run: (a, c) => {
       const store = c && c.memory;
-      if (!store) return '记忆存储不可用';
+      const topics = c && c.topicMemory;
       const tags = a.tags ? String(a.tags).split(',').map((t) => t.trim()).filter(Boolean) : [];
-      const item = store.add({ text: a.text, tags, category: a.category });
-      return item ? `已记住：${item.text}` : '记忆内容为空，未保存';
+      // 结构化主题记忆（新）：自动路由主题 + 近重复去重
+      let topicNote = '';
+      if (topics) {
+        const legacyMap = { preference: 'user-preferences', project: 'project-conventions', lesson: 'debugging-lessons', general: 'general' };
+        const topic = a.topic || legacyMap[a.category] || '';
+        const r = topics.write(a.text, { topic: topic || undefined, source: '主动记忆' });
+        if (r && r.ok) {
+          const { TOPICS } = require('../memoryTopics');
+          topicNote = `（归入「${(TOPICS[r.topic] && TOPICS[r.topic].title) || r.topic}」）`;
+        } else if (r && r.duplicated) {
+          return `这条记忆已经存在（内容近似），未重复保存：${r.text}`;
+        }
+      }
+      // 扁平记忆（旧）：保留写入，兼容既有注入与 UI
+      if (store) store.add({ text: a.text, tags, category: a.category });
+      if (!store && !topics) return '记忆存储不可用';
+      const t = String(a.text || '').trim();
+      return t ? `已记住${topicNote}：${t}` : '记忆内容为空，未保存';
     }
   },
   {
     name: 'get_memory',
     kind: 'read',
     title: (a) => (a.query ? `回忆「${a.query}」` : '回忆全部记忆'),
-    description: '检索已有长期记忆。query 为空返回全部；带 query 时按内容/标签关键字模糊匹配。用于确认之前是否记过某件事。',
+    description: '检索跨会话长期记忆。带 query 时按主题相关性 + 关键字召回；query 为空时返回各主题概况（有哪些主题、各多少条）。用于确认之前是否记过某件事、或主动回忆项目约定与踩过的坑。',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '可选检索关键字' }
+        query: { type: 'string', description: '可选检索关键字或问题描述' },
+        topic: {
+          type: 'string',
+          enum: ['project-conventions', 'user-preferences', 'debugging-lessons', 'architecture-decisions', 'workflows', 'domain-knowledge', 'general'],
+          description: '可选，只看某个主题'
+        }
       }
     },
     run: (a, c) => {
       const store = c && c.memory;
-      if (!store) return '记忆存储不可用';
-      const items = store.search(a.query);
-      if (!items.length) return a.query ? `没找到与「${a.query}」相关的记忆` : '还没有任何长期记忆';
-      return items.map((it) => `- ${it.text}`).join('\n');
+      const topics = c && c.topicMemory;
+      const out = [];
+
+      if (topics) {
+        if (a.topic) {
+          const items = topics.read(a.topic);
+          const { TOPICS } = require('../memoryTopics');
+          const title = (TOPICS[a.topic] && TOPICS[a.topic].title) || a.topic;
+          out.push(items.length ? `## ${title}\n` + items.map((t) => '- ' + t).join('\n') : `主题「${title}」下还没有记忆。`);
+        } else if (a.query) {
+          const r = topics.loadRelevant(a.query, { maxTopics: 4 });
+          if (r.text) out.push(r.text);
+        } else {
+          const list = topics.listTopics().filter((t) => t.count);
+          if (list.length) {
+            out.push('长期记忆主题概况（共 ' + topics.totalCount + ' 条）：');
+            for (const t of list) out.push(`- ${t.title} \`${t.slug}\`：${t.count} 条 —— ${t.desc}`);
+            out.push('\n想看某个主题的全部内容，带 topic 参数再调一次。');
+          }
+        }
+      }
+
+      // 合并旧版扁平记忆（历史数据兼容）
+      if (store) {
+        const items = store.search(a.query);
+        if (items.length) {
+          const seen = new Set(out.join('\n'));
+          const extra = items.map((it) => '- ' + it.text).filter((l) => !seen.has(l));
+          if (extra.length) out.push((out.length ? '\n### 其它记忆\n' : '') + extra.join('\n'));
+        }
+      }
+
+      if (!out.length) {
+        if (!store && !topics) return '记忆存储不可用';
+        return a.query ? `没找到与「${a.query}」相关的记忆` : '还没有任何长期记忆';
+      }
+      return out.join('\n');
     }
   },
   {
@@ -628,6 +689,163 @@ const TOOLS = [
     run: (a, ctx) => referee.run(a, ctx)
   },
   {
+    name: 'search_codebase',
+    kind: 'read',
+    title: (a) => `语义检索「${String((a && a.query) || '').slice(0, 24)}」`,
+    description: `**全仓库语义检索**（TF-IDF 余弦 + BM25 混合打分）。用自然语言描述「你想找什么功能/逻辑」，它会返回最相关的代码片段（文件 + 行号 + 原文）。索引未建立或过期时会自动建立。
+
+# 什么时候用它 vs search_text
+- 知道确切的标识符、字符串、正则 → 用 \`search_text\`（精确、快）
+- 只知道「大概想干什么」，不知道叫什么名字 → 用 \`search_codebase\`
+  例：「用户登录后 token 是在哪里刷新的」「哪里处理了文件上传的分片」「配置是怎么热更新的」
+- 刚进入一个陌生项目、要快速定位相关模块 → 优先 \`search_codebase\``,
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '用自然语言描述你想找的功能或逻辑，越具体越好' },
+        topK: { type: 'integer', description: '返回条数，默认 8，最多 20' },
+        pathFilter: { type: 'string', description: '可选，只在匹配该正则的路径里找，如 "^src/" 或 "\\\\.py$"' },
+        withText: { type: 'boolean', description: '是否返回片段原文，默认 true；只想看命中位置可设 false' }
+      },
+      required: ['query']
+    },
+    run: (a, ctx) => codebaseIndex.runSearch(a, ctx)
+  },
+  {
+    name: 'index_codebase',
+    kind: 'read',
+    title: (a) => (a && a.force ? '重建代码索引' : '更新代码索引'),
+    description: '建立或增量更新全仓库语义索引（供 search_codebase 使用）。按文件修改时间增量更新，未变更的文件会跳过；删除的文件会自动清出索引。一般不用手动调用——search_codebase 会在索引缺失或过期时自动建立；只有在你刚做了大量改动、想立刻让检索反映最新代码时才需要主动调。force=true 会丢弃旧索引完全重建。',
+    parameters: {
+      type: 'object',
+      properties: {
+        force: { type: 'boolean', description: '是否完全重建（默认 false，增量更新）' }
+      }
+    },
+    run: (a, ctx) => codebaseIndex.runIndex(a, ctx)
+  },
+  {
+    name: 'spawn_subagent',
+    kind: 'exec',
+    title: (a) => {
+      const n = Array.isArray(a && a.agents) ? a.agents.length : 0;
+      return n > 1 ? `派生 ${n} 个子代理` : '派生子代理';
+    },
+    description: `派生**隔离上下文的子代理**替你干活，可并行、可组队。适合：①需要同时推进多条互不相干的支线（如「查 A 模块」+「查 B 模块」+「查依赖版本」）；②某个子任务会产生大量中间过程（翻十几个文件），你不想让它污染主上下文——子代理的探索过程**不会**进入你的上下文，你只会收到它的最终结论。
+
+# 角色（role）与权限
+${subagents.renderRoleCatalog()}
+
+# 用法
+- 并行：给多个无 depends_on 的 agents，它们同时跑。
+- 组队：给 depends_on 声明依赖，会按依赖拓扑分批（批内并行、批间串行），前置成员的结论自动注入后置成员上下文。
+
+# 纪律
+- 每个子代理的 task 必须**具体、自包含、可独立完成**，别写「帮我看看」这种没头没尾的。
+- 需要背景信息就写进 context，子代理看不到你和用户的对话。
+- 子代理不能再派生子代理，也不能建技能/建 MCP。
+- 一次最多 8 个。别为了一件小事派代理——你自己一次工具调用能搞定的，就别派。`,
+    parameters: {
+      type: 'object',
+      properties: {
+        goal: { type: 'string', description: '这批子代理共同服务的总目标，一句话' },
+        agents: {
+          type: 'array',
+          description: '要派生的子代理列表（1~8 个）',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: '简短标识，如 find-auth、fix-login；用于 depends_on 引用' },
+              role: { type: 'string', enum: ['explorer', 'coder', 'reviewer', 'tester', 'researcher', 'planner', 'generalist'], description: '角色，决定它能用哪些工具' },
+              task: { type: 'string', description: '具体、自包含的任务描述（必填）' },
+              context: { type: 'string', description: '子代理需要知道的背景信息（它看不到你和用户的对话）' },
+              depends_on: { type: 'array', items: { type: 'string' }, description: '依赖的其它子代理 name；有依赖则等前置跑完并继承其结论' }
+            },
+            required: ['task']
+          }
+        }
+      },
+      required: ['agents']
+    },
+    run: async (a, ctx) => {
+      if (!ctx || typeof ctx.spawnSubagents !== 'function') {
+        return '当前环境不支持派生子代理（缺少运行时上下文），请自己完成该任务。';
+      }
+      return ctx.spawnSubagents({ goal: a.goal || '', agents: a.agents || [] });
+    }
+  },
+  {
+    name: 'run_background_agent',
+    kind: 'exec',
+    title: (a) => `后台任务：${String((a && (a.title || a.task)) || '').slice(0, 30)}`,
+    description: `把一件**耗时的活儿丢到后台跑**，立刻返回、不占用当前对话。用户可以继续和你聊别的，任务在后台独立推进。
+
+# 什么时候用
+- 用户说「你先在后台帮我把 X 做了」「顺便把测试补上，我先干别的」这类**明确要求异步**的。
+- 一件活儿明显要跑很久（全项目补测试、大范围重构、批量整理文档），同步做会让用户干等。
+
+# 什么时候**不要**用
+- 用户在等这个结果 —— 那就当场做，别丢后台。
+- 一两次工具调用就能搞定的小事。
+- 需要中途问用户的活儿 —— 后台没有交互通道。
+
+# 运行环境（重要）
+- 在 git 仓库里，后台任务会自动开一份 **独立 worktree + 独立分支**，改动**不会碰用户正在编辑的文件**；结束后产出补丁与分支供 review。
+- 不是 git 仓库（或仓库还没有任何提交）时，后台任务自动降级为**只读调研**，只给结论不改文件。
+- 后台任务没法弹窗确认，需要人工确认的高危操作会被直接拒绝。
+
+# 纪律
+- task 必须自包含：后台任务看不到你和用户的对话，背景信息要写全。
+- 提交后**立刻**回复用户「已在后台开始」，然后继续处理别的事，**不要**在原地反复查询等它跑完。`,
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: '具体、自包含的任务描述（必填）。要写清目标、涉及范围、完成标准。' },
+        title: { type: 'string', description: '简短标题，如「补全 auth 模块测试」，用于列表展示与分支命名' },
+        role: {
+          type: 'string',
+          enum: ['explorer', 'coder', 'reviewer', 'tester', 'researcher', 'planner', 'generalist'],
+          description: '执行角色，决定它能用哪些工具。只读调研用 explorer/researcher，改代码用 coder，补测试用 tester。'
+        },
+        create_pr: { type: 'boolean', description: '完成且有改动时，是否推送分支并尝试创建 PR（需要远端与 gh CLI）。默认 false。' },
+        timeout_minutes: { type: 'number', description: '超时分钟数，默认 15，最长 60' }
+      },
+      required: ['task']
+    },
+    run: async (a, ctx) => {
+      if (!ctx || typeof ctx.runBackgroundAgent !== 'function') {
+        return '当前环境不支持后台任务（缺少运行时上下文），请在当前对话里直接完成。';
+      }
+      return ctx.runBackgroundAgent(a || {});
+    }
+  },
+  {
+    name: 'background_jobs',
+    kind: 'read',
+    title: (a) => {
+      const act = (a && a.action) || 'list';
+      if (act === 'get') return `查看后台任务 ${(a && a.id) || ''}`;
+      if (act === 'cancel') return `取消后台任务 ${(a && a.id) || ''}`;
+      if (act === 'clear') return '清理后台任务记录';
+      return '查看后台任务列表';
+    },
+    description: '查看 / 取消 / 清理后台任务。用户问「后台那个跑完了吗」「结果呢」时用 action=get 取回结论；用户说「别跑了」时用 action=cancel。后台任务结束后结论不会自动出现在对话里，必须主动查。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'get', 'cancel', 'clear'], description: '操作类型，默认 list' },
+        id: { type: 'string', description: '任务号，action 为 get / cancel 时必填' },
+        limit: { type: 'number', description: 'list 时最多返回几条，默认 12' }
+      }
+    },
+    run: async (a, ctx) => {
+      if (!ctx || typeof ctx.backgroundJobs !== 'function') {
+        return '当前环境不支持后台任务查询（缺少运行时上下文）。';
+      }
+      return ctx.backgroundJobs(a || {});
+    }
+  },
+  {
     name: 'call_extension_command',
     kind: 'exec',
     title: (a) => `调用扩展命令 ${a.command || ''}`,
@@ -706,8 +924,127 @@ const TOOLS = [
       if (!list.length) return '当前没有其他会话的压缩摘要文件。';
       return list.map((s) => `• ${s.sessionId}：${s.title}`).join('\n');
     }
+  },
+  {
+    name: 'run_slash_command',
+    kind: 'read',
+    title: (a) => `命令模板 /${(a && a.name) || ''}`,
+    description:
+      '读取用户自定义的 Slash Command 模板（.fox-ai/commands/<name>.md 或用户级 commands 目录），把 $ARGUMENTS / $1..$9 替换成参数后返回展开的指令原文。' +
+      '用于「用户提到某个自定义命令」或「你想复用项目里已经写好的标准流程」时——先用 action=list 看有哪些模板，再用 action=render 展开并按其内容执行。' +
+      '本工具只做模板展开，不会自动执行里面的步骤：拿到展开文本后，你要按它的要求继续调用相应工具。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'render'], description: 'list=列出全部可用命令；render=展开指定命令。默认 render' },
+        name: { type: 'string', description: '命令名（不带斜杠），如 review' },
+        args: { type: 'string', description: '传给模板的参数串，会替换 $ARGUMENTS 与 $1..$9' }
+      }
+    },
+    run: async (a, c) => {
+      const slash = require('../slashCommands');
+      const dirs = _slashDirs(c);
+      const action = (a && a.action) || (a && a.name ? 'render' : 'list');
+      if (action === 'list') {
+        const items = slash.listCommands(dirs);
+        if (!items.length) return '当前没有任何自定义命令模板。可在工作区 .fox-ai/commands/ 下新建 <名字>.md 来添加。';
+        return items.map((i) => `• /${i.name}（${i.source === 'workspace' ? '本项目' : '用户级'}）${i.description ? '：' + i.description : ''}`).join('\n');
+      }
+      if (!a || !a.name) return '请提供 name（命令名）。';
+      const r = slash.renderCommand(a.name, a.args || '', dirs);
+      if (!r.ok) {
+        return r.error + (r.available && r.available.length ? `\n可用命令：${r.available.map((n) => '/' + n).join('、')}` : '');
+      }
+      return `命令模板 /${r.name} 展开结果（请按下面的要求继续执行）：\n\n${r.text}`;
+    }
+  },
+  {
+    name: 'best_of_n',
+    kind: 'read',
+    title: (a) => `Best-of-N 多模型对比：${String((a && a.prompt) || '').slice(0, 24)}`,
+    description:
+      '**Best-of-N 多模型对比**：把同一个 prompt 同时发给 N 个候选模型（可来自不同 provider），并发跑完后按评委策略挑出“最准确、最完整、最贴合要求”的那一份作为最终回答，其余作为参考摘要附带。' +
+      '适合：①同一个问题你拿不准哪个模型答得更好，想择优；②关键内容（如对外文案、重要解释）希望多模型交叉验证后再定稿；③想横向比较几个模型在同一任务上的差异。' +
+      '默认评委为 length（按有效内容长度挑最长且非空者），可在调用或设置里改 judge=llm（用主模型当评委挑最优，更准但多一次 LLM 调用）。' +
+      '候选模型来自 foxAi.bestOfN.candidates（配置 N 个 {provider,model,baseUrl,apiKey}，anthropic 类可加 transport:"anthropic"），也可在调用时直接传 candidates 覆盖。' +
+      '未开启 foxAi.bestOfN 且未传 candidates 时，本工具会提示如何配置。',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '要发给所有候选模型的同一个问题/任务描述（必填）' },
+        system: { type: 'string', description: '可选，统一的 system 指令，会加在每个候选请求前' },
+        candidates: {
+          type: 'array',
+          description: '可选，覆盖默认候选模型列表；每项 {provider,model,baseUrl,apiKey,transport?}',
+          items: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' }, baseUrl: { type: 'string' }, apiKey: { type: 'string' }, transport: { type: 'string' } } }
+        },
+        judge: { type: 'string', enum: ['length', 'llm', 'first'], description: '挑选策略，默认 length；llm 用主模型当评委（更准但多一次调用）' },
+        temperature: { type: 'number', description: '可选，覆盖候选调用的温度' }
+      },
+      required: ['prompt']
+    },
+    run: async (a, c) => {
+      const prompt = a && a.prompt;
+      if (!prompt || !String(prompt).trim()) return '请提供 prompt（要对比的问题/任务描述）。';
+      const vcfg = vscode.workspace.getConfiguration('foxAi');
+      const cfg = vcfg.get('bestOfN', {}) || {};
+      const enabled = !!cfg.enabled;
+      const candidates = (a.candidates && Array.isArray(a.candidates)) ? a.candidates : (cfg.candidates || []);
+      const judge = a.judge || cfg.judge || 'length';
+      if (!enabled && (!candidates || !candidates.length)) {
+        return 'Best-of-N 未开启且没有候选模型。请在设置开启 foxAi.bestOfN（enabled=true）并配置 candidates（N 个 {provider,model,baseUrl,apiKey}），或在调用时直接传入 candidates。';
+      }
+      if (!c || typeof c.callModel !== 'function') {
+        return '当前环境不支持 Best-of-N（缺少模型调用上下文），请在当前对话里直接完成。';
+      }
+      const bestOfN = require('../bestOfN');
+      const res = await bestOfN.runBestOfN({
+        prompt,
+        system: a.system,
+        candidates,
+        judge,
+        callModel: c.callModel,
+        llm: judge === 'llm' ? c.llm : undefined,
+        temperature: (a.temperature != null) ? a.temperature : (cfg.temperature != null ? cfg.temperature : undefined)
+      });
+      if (!res.ok) return res.error || 'Best-of-N 执行失败。';
+      if (!res.best) {
+        return '所有候选模型都未能返回有效回答：\n' + res.results.map((r) => `• ${r.id}：${r.error || '空响应'}`).join('\n');
+      }
+      const lines = [];
+      lines.push(`✅ 最优回答来自【${res.best.provider || '?'} / ${res.best.model || res.best.id}】（评委：${res.judge}${res.fromCache ? ' · 命中缓存' : ''}）`);
+      lines.push('');
+      lines.push(res.best.text);
+      const others = res.results.filter((r) => r.index !== res.best.index);
+      if (others.length) {
+        lines.push('');
+        lines.push('— 其它候选摘要 —');
+        for (const r of others) {
+          const head = (r.text || '').slice(0, 200).replace(/\n/g, ' ');
+          lines.push(`• ${r.id}（score=${r.score}${r.error ? '，错误：' + r.error : ''}）：${head || '(空)'}`);
+        }
+      }
+      return lines.join('\n');
+    }
   }
 ];
+
+/** 命令模板目录：工作区优先、用户级兜底。工具层单独实现一份，避免依赖 chatView */
+function _slashDirs(c) {
+  const slash = require('../slashCommands');
+  const dirs = [];
+  try {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length) dirs.push(slash.workspaceCommandsDir(folders[0].uri.fsPath));
+  } catch (_) {}
+  try {
+    const base = vscode.workspace.getConfiguration('foxAi').get('slashCommands.storagePath', '');
+    dirs.push(slash.userCommandsDir(base || undefined));
+  } catch (_) {
+    dirs.push(slash.userCommandsDir());
+  }
+  return dirs.filter(Boolean);
+}
 
 function webSearchToolEnabled() {
   const cfg = vscode.workspace.getConfiguration('foxAi');
@@ -928,6 +1265,27 @@ function toOpenAITools(query, cfg) {
   return out;
 }
 
+/**
+ * 按工具定义列表转 OpenAI function calling 格式（不做子集精简、不注入 provider 原生工具）。
+ * 子代理用：它的工具集由角色白名单严格决定，不能再被动态子集二次裁剪，
+ * 否则「探索员拿不到 read_file」这种荒唐事就会发生。
+ */
+function toOpenAIToolsFrom(list) {
+  const out = [];
+  for (const t of (list || [])) {
+    if (!t || !t.name) continue;
+    out.push({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: (t.description || '').slice(0, 800),
+        parameters: sanitizeSchema(t.parameters)
+      }
+    });
+  }
+  return out;
+}
+
 /** 文本协议用的说明书（给不支持 tools 的模型）。可选 query/cfg 用于动态子集精简 */
 function toTextManual(query, cfg) {
   const list = filterForPrompt(query, cfg) || allTools();
@@ -1020,4 +1378,4 @@ function _truncate(result, ctx) {
   return text;
 }
 
-module.exports = { TOOLS, getTool, toOpenAITools, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema };
+module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema };

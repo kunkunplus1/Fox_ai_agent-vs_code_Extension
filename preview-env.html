@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>狐狸 AI · 环境与插件面板预览</title>
+<link rel="stylesheet" href="media/env.css"/>
+<style>
+  :root {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --vscode-foreground: #cccccc;
+    --vscode-editor-background: #1e1e1e;
+    --vscode-button-background: #0e639c;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #1177bb;
+    --vscode-input-background: #252526;
+    --vscode-input-foreground: #cccccc;
+    --vscode-input-border: rgba(128,128,128,0.25);
+    --vscode-list-activeSelectionBackground: #094771;
+    --vscode-list-activeSelectionForeground: #ffffff;
+    --vscode-list-hoverBackground: rgba(128,128,128,0.12);
+    --vscode-panel-border: rgba(128,128,128,0.18);
+    --vscode-focusBorder: #0e639c;
+    --vscode-errorForeground: #f48771;
+    --vscode-editor-inactiveSelectionBackground: rgba(128,128,128,0.08);
+    --vscode-textCodeBlock-background: rgba(128,128,128,0.12);
+    --vscode-textPreformat-foreground: #d7ba7d;
+    --vscode-charts-blue: #3794ff;
+    --vscode-charts-orange: #d18616;
+    --vscode-charts-green: #3fb950;
+    --vscode-charts-purple: #b180d7;
+    --vscode-charts-yellow: #ffcc00;
+  }
+</style>
+</head>
+<body>
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tab="env" role="button">🐾 运行环境</div>
+    <div class="tab" data-tab="ext" role="button">🔌 插件联动</div>
+    <div class="tab" data-tab="audit" role="button">📜 审计日志</div>
+    <div class="tab" data-tab="kb" role="button">📚 知识库</div>
+    <div class="tab" data-tab="tasks" role="button">📋 任务</div>
+    <div class="tab" data-tab="project" role="button">🗺️ 项目</div>
+    <div class="tab" data-tab="mcp" role="button">🌐 MCP</div>
+  </div>
+
+  <div class="pane active" id="env">
+    <h2>运行环境管理</h2>
+    <div class="row"><label>安装根目录</label><input style="flex:1;min-width:220px" value="C:\\Users\\asis\\.fox-ai\\runtimes"/><button>选择目录</button></div>
+    <div class="row"><label>优先镜像</label><select><option>自动（官方优先，失败用镜像）</option><option>清华镜像优先</option></select></div>
+    <div class="row"><label>管理员提权</label><select><option>每次都弹 UAC 确认</option><option>该会话内不再询问</option></select></div>
+    <p class="hint danger">⚠️ 所有下载仅允许来自内置官方源白名单，安装/改 PATH 前会弹窗确认，全程写入审计日志。</p>
+
+    <div class="card" data-rt="python">
+      <div class="rt-head"><b>Python</b><span class="ver">默认 3.13.4</span></div>
+      <div class="rt-actions"><input class="ver-input" value="3.13.4"/><button class="install-btn">安装</button><span class="status">✓ 3.13.4</span></div>
+    </div>
+    <div class="card" data-rt="node">
+      <div class="rt-head"><b>Node.js</b><span class="ver">默认 22.22.2</span></div>
+      <div class="rt-actions"><input class="ver-input" value="22.22.2"/><button class="install-btn">安装</button><span class="status">✓ 22.22.2</span></div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <div class="rt-head"><b>🧰 工具箱</b></div>
+      <p class="hint">类似 PCL2 百宝箱：释放内存、清理狐狸 AI 自身产生的缓存与数据。</p>
+      <div class="row"><button>内存优化</button><button>清理狐狸 AI 垃圾</button></div>
+    </div>
+  </div>
+
+  <div class="pane" id="ext">
+    <h2>插件联动（跨扩展调用）</h2>
+    <p class="hint danger">⚠️ 默认禁止一切跨插件调用。勾选命令将其加入白名单后，狐狸 AI 才能调用它；调用前仍会弹确认。</p>
+    <div class="row" style="position:sticky;top:0;background:var(--vscode-editor-background);z-index:10;padding:6px 0;border-bottom:1px solid var(--vscode-panel-border);margin-bottom:8px;">
+      <label><input type="checkbox" checked/> 白名单命令免二次确认</label>
+      <input type="text" placeholder="搜索扩展或命令…" style="flex:1;min-width:180px;margin-left:12px;"/>
+    </div>
+    <div class="ext-group">
+      <div class="ext-group-title">✅ 已启用（白名单）</div>
+      <div class="ext" data-ext-id="ms-vscode.vscode-json">
+        <b>JSON Language Features</b> <span class="hint">ms-vscode.vscode-json</span>
+        <div class="cmds"><label><input type="checkbox" checked/> <span>格式化 JSON <code>json.format</code></span> <button class="call-cmd">调用</button></label></div>
+      </div>
+    </div>
+    <div class="ext-group">
+      <div class="ext-group-title" style="opacity:.7">⬜ 未启用</div>
+      <div class="ext" data-ext-id="some.other">
+        <b>Other Extension</b> <span class="hint">some.other</span>
+        <div class="cmds"><label><input type="checkbox"/> <span>Hello World <code>other.hello</code></span> <button class="call-cmd">调用</button></label></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="tasks">
+    <h2>任务管理器（Harness 长期记忆）</h2>
+    <p class="hint">每次对话 / 智能体任务都会记录状态与步骤，崩溃后也可在此查看遗留任务。</p>
+    <div class="row"><button>刷新</button><button>清空已完成</button><label><input type="checkbox"/> 显示已完成</label></div>
+    <div class="task-wrap">
+      <div class="task-item active">
+        <span class="task-toggle">▼</span>
+        <span class="task-state">[运行中]</span>
+        <span class="task-title">自动整理本地知识库</span>
+        <span class="task-meta">background · 12 步 · 14:20</span>
+        <span class="task-actions-row"><button>⏹</button><button>🗑</button></span>
+      </div>
+      <div class="task-detail">
+        <div><b>自动整理本地知识库</b> <span class="hint">(running)</span></div>
+        <div class="hint">类型：background · 创建：14:00</div>
+        <pre>步骤 12: 正在写入知识库索引...</pre>
+        <div class="actions"><button>停止任务</button><button>删除记录</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="project">
+    <h2>项目概览 / 地图</h2>
+    <p class="hint">自动识别关键文档、程序入口、配置文件、AI 模型等；像文件管理器一样展开目录并勾选文件。</p>
+    <div class="row"><button>刷新</button><button>让 AI 梳理项目</button><button>将选中文件发给 AI</button><span class="hint" id="project-selection">已选 0 个文件</span></div>
+    <div class="row"><label>展开深度</label><select><option>1 层</option><option selected>2 层</option><option>3 层</option></select><label><input type="checkbox"/> 只看源码</label></div>
+    <div class="file-tree">
+      <div class="tree-node"><span class="tree-toggle">▼</span><span class="tree-icon">📁</span><span class="tree-name">fox-ai</span><span class="tree-role">项目根</span></div>
+      <div class="tree-children">
+        <div class="tree-node"><span class="tree-toggle"></span><input type="checkbox" class="tree-checkbox"/><span class="tree-icon">📄</span><span class="tree-name">extension.js</span><span class="tree-role">入口</span><span class="tree-size">18 KB</span></div>
+        <div class="tree-node"><span class="tree-toggle">▶</span><span class="tree-icon">📁</span><span class="tree-name">src</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane" id="mcp">
+    <h2>MCP 服务器管理</h2>
+    <p class="hint">MCP（Model Context Protocol）让狐狸 AI 能调用外部服务器提供的工具。</p>
+    <div class="row"><label style="width:auto">总开关</label><input type="checkbox" checked/><span class="hint" id="mcp-status">已启用 2 个服务器</span></div>
+    <div class="row"><button>刷新状态</button><button>+ 添加服务器</button><button>检查并安装依赖</button><button>导入 VS Code 配置</button></div>
+    <div class="card">
+      <div class="rt-head"><b>filesystem</b><span class="ver" style="color:var(--vscode-charts-green)">[运行中]</span></div>
+      <div class="hint">stdio: npx -y @modelcontextprotocol/server-filesystem C:/path/to/folder</div>
+      <div class="rt-actions"><label><input type="checkbox" checked/> 启用</label><button>编辑</button><button>测试连接</button><button>删除</button></div>
+    </div>
+  </div>
+
+<script>
+  document.getElementById('tabs').addEventListener('click', (e) => {
+    const t = e.target.closest('.tab');
+    if (!t) return;
+    const tabName = t.dataset.tab;
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const pane = document.getElementById(tabName);
+    if (pane) pane.classList.add('active');
+  });
+</script>
+</body>
+</html>

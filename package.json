@@ -2,9 +2,14 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "0.8.90",
+  "version": "1.1.5",
   "publisher": "foxai",
   "license": "GPL-3.0",
+  "icon": "media/fox-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kunkunplus1/fox-ai"
+  },
   "engines": {
     "vscode": "^1.93.0"
   },
@@ -28,7 +33,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/approvalState.js && node test/planTasksClear.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -36,7 +41,7 @@
         {
           "id": "foxAi",
           "title": "%foxai.n3%",
-          "icon": "media/fox.png"
+          "icon": "media/fox.svg"
         }
       ]
     },
@@ -365,6 +370,36 @@
         "title": "%foxai.n114%",
         "category": "%foxai.n115%",
         "icon": "$(graph)"
+      },
+      {
+        "command": "foxAi.showBackgroundJobs",
+        "title": "%foxai.n301%",
+        "category": "狐狸 AI"
+      },
+      {
+        "command": "foxAi.rollbackCheckpoint",
+        "title": "%foxai.n302%",
+        "category": "狐狸 AI"
+      },
+      {
+        "command": "foxAi.rebuildCodeIndex",
+        "title": "%foxai.n303%",
+        "category": "狐狸 AI"
+      },
+      {
+        "command": "foxAi.openHooksConfig",
+        "title": "%foxai.n304%",
+        "category": "狐狸 AI"
+      },
+      {
+        "command": "foxAi.openTopicMemory",
+        "title": "%foxai.n305%",
+        "category": "狐狸 AI"
+      },
+      {
+        "command": "foxAi.runHeadless",
+        "title": "运行 Headless 调用（CLI/CI）",
+        "category": "狐狸 AI"
       }
     ],
     "submenus": [
@@ -753,6 +788,203 @@
             "default": true,
             "markdownDescription": "%foxai.n264%",
             "order": 23
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 项目规则 (Project Rules)",
+        "properties": {
+          "foxAi.projectRules.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "自动读取项目根目录的 CLAUDE.md / AGENTS.md / .fox-ai/rules 等约定文件，注入到每次对话的系统提示词。可在大型仓库里关掉以省 token。"
+          },
+          "foxAi.projectRules.budget": {
+            "type": "number",
+            "default": 0,
+            "markdownDescription": "项目规则注入的 token 预算上限（0 = 不限制）。超过则按重要性截断，控制上下文体积。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 智能体模式 (Agent Modes)",
+        "properties": {
+          "foxAi.modes.current": {
+            "type": "string",
+            "default": "code",
+            "enum": ["code", "architect", "ask", "debug"],
+            "enumDescriptions": [
+              "编码：读写代码、跑命令、改 bug，全权限（默认）",
+              "架构：只做方案与设计，只能写文档类文件，不改代码、不跑命令",
+              "问答：纯只读答疑，绝不改动任何东西",
+              "排错：先取证再动手，可读可改可跑命令，只做最小修复"
+            ],
+            "markdownDescription": "当前智能体工作模式，决定工具范围、可写路径与系统提示词人格。"
+          },
+          "foxAi.modes.overrides": {
+            "type": "object",
+            "default": {},
+            "markdownDescription": "按模式覆盖定义，例如 {\"architect\":{\"editGlobs\":[\"**/*.md\"],\"model\":\"claude-opus\"}}。可用于放开/收紧某模式的文件限制或更换模型。"
+          },
+          "foxAi.modes.models": {
+            "type": "object",
+            "default": {},
+            "markdownDescription": "每模式独立模型，例如 {\"architect\":\"claude-opus\",\"ask\":\"deepseek-chat\"}。留空则该模式用主对话模型。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 自定义命令 (Slash Commands)",
+        "properties": {
+          "foxAi.slashCommands.storagePath": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "用户级命令模板目录（留空用默认 ~/.fox-ai/commands）。项目级优先用 <workspace>/.fox-ai/commands。模板里用 $ARGUMENTS 占位，在对话输入 /<名字> 触发。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · Auto Mode（自动门控）",
+        "properties": {
+          "foxAi.autoMode.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "开启后用一次轻量 LLM 分类，对写/改/删/执行类动作做 allow / deny / ask 门控。关闭则恢复默认人工审批。"
+          },
+          "foxAi.autoMode.allow": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "markdownDescription": "工具名白名单，命中即自动放行（零 LLM 开销）。例如 [\"read_file\",\"get_diagnostics\"]。"
+          },
+          "foxAi.autoMode.deny": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "markdownDescription": "工具名黑名单，命中即拒绝。例如 [\"delete_file\",\"run_command\"]。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · Best-of-N 多模型对比",
+        "properties": {
+          "foxAi.bestOfN.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "开启后 best_of_n 工具可从下方 candidates 取候选模型；未开启且未显式传 candidates 时该工具仅提示如何配置。"
+          },
+          "foxAi.bestOfN.judge": {
+            "type": "string",
+            "default": "length",
+            "enum": ["length", "llm", "first"],
+            "enumDescriptions": [
+              "按有效内容长度挑最长且非空者（默认，零额外调用）",
+              "用主模型当评委挑最优（更准，但多一次 LLM 调用）",
+              "直接取第一个成功返回的候选"
+            ],
+            "markdownDescription": "挑选最优回答的策略。"
+          },
+          "foxAi.bestOfN.temperature": {
+            "type": "number",
+            "default": 0.3,
+            "markdownDescription": "候选模型调用的温度（可被调用时传入的 temperature 覆盖）。"
+          },
+          "foxAi.bestOfN.candidates": {
+            "type": "array",
+            "default": [],
+            "markdownDescription": "候选模型列表，每项 {\"provider\":\"deepseek\",\"model\":\"deepseek-chat\",\"baseUrl\":\"...\",\"apiKey\":\"...\"，anthropic 类可加 \"transport\":\"anthropic\"}。配置 N 个即做 N 路对比。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 冲突感知 (Conflict Watch)",
+        "properties": {
+          "foxAi.conflictWatch.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "开启后，agent 写文件前会比对「读取时」与「现在」的文件快照（mtime/size），若被人工/外部改过则暂停写操作转人工裁决。被动生效，不常驻监听。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 本地自动化 (Automations)",
+        "properties": {
+          "foxAi.automations.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "开启后按 automations.json 里的 cron/interval 定时触发，或经本地 webhook（GitHub/Slack 等）触发；触发后由后台 agent 异步执行。纯本地，不依赖云端。"
+          },
+          "foxAi.automations.storagePath": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "自动化定义文件路径（留空用默认 ~/.fox-ai/automations.json）。用「管理自动化」命令可创建/打开示例。"
+          },
+          "foxAi.automations.webhookPort": {
+            "type": "number",
+            "default": 0,
+            "markdownDescription": "本地 webhook 监听端口（0 = 不开启）。开启后只收指令、绝不回传任何内部资料（知识库/记忆等）。"
+          },
+          "foxAi.automations.webhookSecret": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "webhook 校验密钥；调用方需在 body 带相同 secret 才被接受（避免未授权触发）。"
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · Headless / CI",
+        "properties": {
+          "foxAi.headless.enabled": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "允许在编辑器内通过「运行 Headless 调用」命令，用当前主对话模型做一次无状态非流式调用（结果弹信息提示）。CI 场景直接用根目录 `foxai` 脚本，无需开启本项。"
+          },
+          "foxAi.headless.provider": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Headless 默认预设服务商（留空继承主对话 provider）。环境变量 FOXAI_PROVIDER 亦可覆盖。"
+          },
+          "foxAi.headless.baseUrl": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Headless 默认 API 基址（留空继承主对话 baseUrl）。环境变量 FOXAI_BASE_URL 亦可覆盖。"
+          },
+          "foxAi.headless.apiKey": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Headless 默认 API Key（留空继承主对话 key）。环境变量 FOXAI_API_KEY 亦可覆盖。"
+          },
+          "foxAi.headless.model": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Headless 默认模型（留空继承主对话 model）。环境变量 FOXAI_MODEL 亦可覆盖。"
+          },
+          "foxAi.headless.apiMode": {
+            "type": "string",
+            "default": "",
+            "enum": ["", "chat", "responses"],
+            "markdownDescription": "Headless 协议：chat=OpenAI /chat/completions，responses=OpenAI Responses API（留空继承）。"
+          },
+          "foxAi.headless.transport": {
+            "type": "string",
+            "default": "",
+            "enum": ["", "openai", "anthropic"],
+            "markdownDescription": "Headless 传输：openai=OpenAI 兼容，anthropic=原生 Messages 协议（留空继承）。"
+          },
+          "foxAi.headless.temperature": {
+            "type": "number",
+            "default": 0.3,
+            "markdownDescription": "Headless 调用温度。"
+          },
+          "foxAi.headless.maxTokens": {
+            "type": "number",
+            "default": 4096,
+            "markdownDescription": "Headless 单次最大生成 token。"
+          },
+          "foxAi.headless.timeout": {
+            "type": "number",
+            "default": 120000,
+            "markdownDescription": "Headless 调用超时（毫秒）。"
           }
         }
       },
@@ -1593,7 +1825,14 @@
             "type": "string",
             "default": "auto",
             "order": 6,
-            "enum": ["auto", "diffusion", "codellama", "deepseek", "starcoder", "none"],
+            "enum": [
+              "auto",
+              "diffusion",
+              "codellama",
+              "deepseek",
+              "starcoder",
+              "none"
+            ],
             "enumDescriptions": [
               "自动：根据模型名选择 FIM 格式（推荐）",
               "通用 <fim_prefix>/<fim_suffix>/<fim_middle>",
@@ -1683,6 +1922,185 @@
             "default": false,
             "order": 5,
             "description": "%foxai.n260%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n271%",
+        "properties": {
+          "foxAi.subagents.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n272%"
+          },
+          "foxAi.subagents.concurrency": {
+            "type": "number",
+            "default": 3,
+            "minimum": 1,
+            "maximum": 6,
+            "description": "%foxai.n273%"
+          },
+          "foxAi.subagents.maxSteps": {
+            "type": "number",
+            "default": 6,
+            "minimum": 1,
+            "maximum": 16,
+            "description": "%foxai.n274%"
+          },
+          "foxAi.subagents.maxToolCalls": {
+            "type": "number",
+            "default": 14,
+            "minimum": 1,
+            "maximum": 40,
+            "description": "%foxai.n275%"
+          },
+          "foxAi.subagents.timeoutMs": {
+            "type": "number",
+            "default": 180000,
+            "minimum": 10000,
+            "maximum": 600000,
+            "description": "%foxai.n276%"
+          },
+          "foxAi.subagents.autoApproveWrites": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n277%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n278%",
+        "properties": {
+          "foxAi.background.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n279%"
+          },
+          "foxAi.background.maxConcurrent": {
+            "type": "number",
+            "default": 2,
+            "minimum": 1,
+            "maximum": 4,
+            "description": "%foxai.n280%"
+          },
+          "foxAi.background.timeoutMs": {
+            "type": "number",
+            "default": 900000,
+            "minimum": 10000,
+            "maximum": 3600000,
+            "description": "%foxai.n281%"
+          },
+          "foxAi.background.maxSteps": {
+            "type": "number",
+            "default": 14,
+            "minimum": 1,
+            "maximum": 16,
+            "description": "%foxai.n282%"
+          },
+          "foxAi.background.maxToolCalls": {
+            "type": "number",
+            "default": 36,
+            "minimum": 1,
+            "maximum": 40,
+            "description": "%foxai.n283%"
+          },
+          "foxAi.background.allowMainWorkspaceWrites": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n284%"
+          },
+          "foxAi.background.keepWorktree": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n285%"
+          },
+          "foxAi.background.maxHistory": {
+            "type": "number",
+            "default": 60,
+            "minimum": 5,
+            "maximum": 500,
+            "description": "%foxai.n286%"
+          },
+          "foxAi.background.storagePath": {
+            "type": "string",
+            "default": "",
+            "description": "%foxai.n287%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n288%",
+        "properties": {
+          "foxAi.checkpoints.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n289%"
+          },
+          "foxAi.checkpoints.maxSnapshots": {
+            "type": "number",
+            "default": 200,
+            "minimum": 10,
+            "maximum": 2000,
+            "description": "%foxai.n290%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n291%",
+        "properties": {
+          "foxAi.hooks.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n292%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n293%",
+        "properties": {
+          "foxAi.rag.extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "%foxai.n294%"
+          },
+          "foxAi.rag.maxFiles": {
+            "type": "number",
+            "default": 6000,
+            "minimum": 100,
+            "maximum": 50000,
+            "description": "%foxai.n295%"
+          },
+          "foxAi.rag.autoRebuildHours": {
+            "type": "number",
+            "default": 24,
+            "minimum": 1,
+            "maximum": 720,
+            "description": "%foxai.n296%"
+          }
+        }
+      },
+      {
+        "title": "%foxai.n297%",
+        "properties": {
+          "foxAi.memory.topics.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n298%"
+          },
+          "foxAi.memory.topics.budget": {
+            "type": "number",
+            "default": 2500,
+            "minimum": 200,
+            "maximum": 20000,
+            "description": "%foxai.n299%"
+          },
+          "foxAi.memory.topics.autoHarvest": {
+            "type": "boolean",
+            "default": true,
+            "description": "%foxai.n300%"
           }
         }
       }

@@ -443,6 +443,32 @@ class ChatViewProvider {
           }
         }
         break;
+      case 'planTaskClearCompleted': {
+        const items = this.planTasks.list();
+        const completed = items.filter((x) => x.status === 'completed');
+        if (!completed.length) {
+          vscode.window.showInformationMessage(i18n.tw('没有已完成的任务可清理'));
+          // 即使没有清理，也发一次列表刷新，让前端按钮恢复可用状态
+          this.post({ type: 'planTasks', items: this.planTasks.list() });
+          break;
+        }
+        const ok = await vscode.window.showWarningMessage(
+          i18n.tw('确定清理 {0} 条已完成的任务吗？此操作不可恢复。', completed.length),
+          { modal: true },
+          i18n.tw('清理')
+        );
+        if (ok === i18n.tw('清理')) {
+          const removed = this.planTasks.clearCompleted();
+          this.post({ type: 'planTasks', items: this.planTasks.list() });
+          if (removed) {
+            vscode.window.showInformationMessage(i18n.tw('已清理 {0} 条完成任务', removed));
+          }
+        } else {
+          // 用户点取消/关闭弹窗，也需要恢复前端按钮状态
+          this.post({ type: 'planTasks', items: this.planTasks.list() });
+        }
+        break;
+      }
       case 'planApprove': {
         const session = this._planPendingSession;
         if (!session) break;
@@ -854,6 +880,30 @@ class ChatViewProvider {
       return;
     }
 
+    // 拦截自定义 Slash Commands：`/review src/a.js` -> 展开 .fox-ai/commands/review.md 模板后再发给模型。
+    // 懒加载：只有输入确实以 `/单词` 开头时才 require 模块并扫目录，普通聊天零开销。
+    if (typeof sendText === 'string' && !options._slashExpanded && /^\s*\/[a-zA-Z0-9]/.test(sendText)) {
+      const expanded = this._expandSlashCommand(sendText);
+      if (expanded && expanded.ok) {
+        // 展开后的完整 prompt 作为隐藏消息发给模型，聊天区仍显示用户敲的那句 `/xxx ...`
+        // _slashExpanded 防止模板正文本身以 / 开头时无限递归展开
+        return this.ask(visible, Object.assign({}, options, {
+          hidden: expanded.text,
+          showText: visible,
+          _slashExpanded: true
+        }));
+      }
+      if (expanded && expanded.notFound) {
+        this.post({
+          type: 'notice',
+          text: expanded.available && expanded.available.length
+            ? `没有自定义命令 /${expanded.name}。当前可用：${expanded.available.map((n) => '/' + n).join('、')}（命令目录：狐狸 AI: 打开命令模板目录）`
+            : `没有自定义命令 /${expanded.name}。可执行「狐狸 AI: 打开命令模板目录」新建一个 ${expanded.name}.md 模板。`
+        });
+        return;
+      }
+    }
+
     // 若用户消息里显式引用了 MCP 工具命名空间，但 MCP 未启用或未注入模型，给出操作提示
     if (typeof sendText === 'string' && /mcp__\w+/i.test(sendText)) {
       const policy = mcp.getPolicy();
@@ -1185,6 +1235,44 @@ class ChatViewProvider {
   }
 
   /**
+   * 展开自定义 Slash Command 模板（.fox-ai/commands/<name>.md）。
+   * 懒加载模块 + 目录 mtime 缓存，命中不了就返回 notFound 让上层提示，绝不抛错打断发送。
+   * @returns {{ok:true,text:string}|{notFound:true,name:string,available:string[]}|null}
+   */
+  _expandSlashCommand(raw) {
+    try {
+      const slash = require('./slashCommands');
+      const parsed = slash.parseInput(raw);
+      if (!parsed) return null;
+      // /mcp 已被上面单独处理；这里排除掉内置前缀，避免误判
+      if (/^mcp$/i.test(parsed.name)) return null;
+      const dirs = this._commandDirs();
+      const r = slash.renderCommand(parsed.name, parsed.args, dirs);
+      if (r.ok) return { ok: true, text: r.text };
+      return { notFound: true, name: parsed.name, available: r.available || [] };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** 命令模板目录：工作区优先，其次用户级 */
+  _commandDirs() {
+    const slash = require('./slashCommands');
+    const dirs = [];
+    try {
+      const folders = vscode.workspace.workspaceFolders;
+      if (folders && folders.length) dirs.push(slash.workspaceCommandsDir(folders[0].uri.fsPath));
+    } catch (_) {}
+    try {
+      const base = vscode.workspace.getConfiguration('foxAi').get('slashCommands.storagePath', '');
+      dirs.push(slash.userCommandsDir(base || undefined));
+    } catch (_) {
+      dirs.push(slash.userCommandsDir());
+    }
+    return dirs.filter(Boolean);
+  }
+
+  /**
    * 处理 /mcp 斜杠命令：显式调用某个 MCP 服务器工具，绕过模型自动决策。
    * 用法：
    *   /mcp <serverId>.<toolName> [JSON参数或普通文本]
@@ -1352,6 +1440,8 @@ class ChatViewProvider {
     if (prevPlanPending) session._planPending = true;
     this.session = session;
     this.pushStatus('running');
+    // 自动化桥：把当前会话的后台 agent 入口注册给 extension 的调度/触发回调复用
+    try { require('./automationsBridge').setRunner((spec) => session.runBackgroundAgent(spec)); } catch (_) {}
 
     try {
       log('session.run start', 'resume=', !!resumeTaskId);
@@ -1520,9 +1610,15 @@ class ChatViewProvider {
         self.pushStatus();
       },
       requestApproval: (req, cb) => {
-        this.approvalResolvers.set(req.id, cb);
         this.post({ type: 'approval', id: req.id, name: req.name, kind: req.kind, title: req.title });
         this.post({ type: 'step', id: 'ap-' + req.id, kind: 'approval', title: i18n.tw('等待审批：{0}', req.title || req.name), status: 'running' });
+        // 包装回调：用户决策后同步刷新 step 状态，避免「已允许」后步骤列表仍显示 running
+        const wrappedCb = (decision) => {
+          const status = decision === 'reject' || decision === 'reject-cancel' ? 'error' : 'ok';
+          this.post({ type: 'step', id: 'ap-' + req.id, kind: 'approval', title: i18n.tw(decision === 'reject' ? '已拒绝：{0}' : '已允许：{0}', req.title || req.name), status });
+          cb(decision);
+        };
+        this.approvalResolvers.set(req.id, wrappedCb);
       },
       step: ({ id, kind, title, detail, status }) => {
         self._stepSeq = self._stepSeq || 0;

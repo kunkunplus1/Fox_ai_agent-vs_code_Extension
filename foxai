@@ -1,0 +1,21 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * 狐狸 AI Headless / CI 命令行入口（无扩展名，Windows 用 `node foxai` 运行）。
+ * 仅做一件事：把命令行参数交给 src/headless.js 的 cli()，退出码反映调用成败。
+ */
+
+const path = require('path');
+
+async function main() {
+  // 兼容两种放置：仓库根 `foxai` 或打包后仍保留于扩展根。
+  const headless = require(path.join(__dirname, 'src', 'headless.js'));
+  const exitCode = await headless.cli(process.argv.slice(2), process.stdout, process.stderr);
+  process.exitCode = exitCode;
+}
+
+main().catch((e) => {
+  process.stderr.write('[fox-ai headless] 致命错误: ' + ((e && e.stack) || String(e)) + '\n');
+  process.exitCode = 2;
+});

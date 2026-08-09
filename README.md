@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：0.8.90
+> **版本**：1.1.5
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -19,6 +19,8 @@
 
 本说明书面向最终使用者，说明如何安装、配置并正确使用本扩展的各项功能。有关实现细节与历史变更，请以源代码与发布说明为准。
 
+> **🦊 1.0.0 重大更新（对标主流 Agent 框架）**：本版本补齐了六大能力短板——① **子代理 / 并行 Agent / Agent Teams**（`spawn_subagent`）；② **后台 / 异步 Agent**（`run_background_agent`，git 仓库内独立 worktree 隔离干活）；③ **Checkpoint 回滚**（一键回滚到历史节点）；④ **生命周期 Hooks**（preToolUse / postToolUse 等节点挂载脚本）；⑤ **全仓库向量 RAG 索引**（`search_codebase` / `index_codebase`）；⑥ **结构化长期记忆**（按主题文件组织，可手动编辑）。详见第六节 6.20–6.25。
+
 ---
 
 ## 二、许可证
@@ -33,13 +35,13 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-0.8.90.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得）。
+1. 获取扩展包 `fox-ai-1.1.5.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-0.8.90.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-1.1.5.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
-> 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏与扩展详情页使用狐狸图标（`media/fox.png`）。
+> 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏使用狐狸图标（`media/fox.svg`），扩展详情页使用新头像图标（`media/fox-icon.png`）。
 
 ---
 
@@ -269,6 +271,138 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - 点击任意步骤可展开查看详情（如工具参数、输出摘要）。
 - 关闭窗口再打开，时间线会从会话记录中自动恢复。
 
+### 6.20 子代理 / 并行 Agent / Agent Teams
+
+复杂任务可拆分给多个**子代理（Subagent）并行**执行，主代理负责调度与结果聚合：
+
+- **角色分工**：内置 `coder`（写代码）/ `tester`（测试验证）/ `explorer`（只读调研）/ `researcher`（资料检索）等角色，也可自定义角色提示词。
+- **工具 `spawn_subagent`**：主代理在需要时派生一个或多个子代理并行干活，互不阻塞，结果回传主对话。
+- **典型场景**：大规模重构（拆模块并行改）、跨模块调研、批量修复 + 自动测试、长链路任务分治。
+- 并行度、单步上限、工具调用上限、超时等可在「子代理与并行」设置组调整（见第七节）。
+
+### 6.21 后台 / 异步 Agent
+
+不阻塞当前对话的**后台智能体**：提交任务后立即返回，任务在后台独立运行，进度通过通知回流，您可以继续聊别的。
+
+- **安全隔离**：在 git 仓库内自动开**独立 worktree + 独立分支**干活，**绝不碰您的主工作区文件**；非 git 仓库（或无提交）自动降级为**只读调研**。
+- **可选产出 PR**：提交时带 `create_pr`，任务完成后推送分支并用 `gh` 创建 Pull Request（无 `gh` 时给出手动推送指引）。
+- **治理护栏**：并发上限（默认 2，硬上限 4）、任务超时（默认 15 分钟，硬上限 1 小时）、队列上限（12）、历史保留（默认 60 条）均在「后台任务」设置组可调。
+- **查看与管理**：工具 `background_jobs`（action: list/get/cancel/clear）或命令面板 **「狐狸 AI：查看后台任务」** 可视化列表（查看详情 / 打开补丁 / 取消 / 删除记录）。
+
+### 6.22 Checkpoint 回滚
+
+智能体在关键步骤自动打**检查点（快照）**，出错或想换思路时可一键回滚到任意历史节点：
+
+- 命令面板 **「狐狸 AI：回滚到检查点」** → 选择检查点 → 确认即回滚。
+- 设置组「检查点与回滚」：`foxAi.checkpoints.enabled` / `foxAi.checkpoints.maxSnapshots`。
+
+### 6.23 生命周期 Hooks
+
+在智能体运行的**生命周期节点**挂载自定义脚本，实现自动化与治理：
+
+- **钩子时机**：`preToolUse` / `postToolUse`（工具调用前后）、会话开始 / 结束等。
+- **用途**：自动格式化、安全拦截危险命令、入参/出参审计、自动打标签、外部系统联动等。
+- 命令面板 **「狐狸 AI：打开 Hooks 配置」** 直接编辑（首次打开写入含示例的模板）；设置 `foxAi.hooks.enabled` 总开关。
+
+### 6.24 全仓库向量 RAG 索引
+
+对**整个代码仓库**建立语义索引，支持自然语言代码检索，跨大代码库也能精准定位：
+
+- **工具 `search_codebase`**：用语义检索找到相关代码（不知道叫什么名字、刚进陌生项目时优先用）。
+- **工具 `index_codebase`**：手动增量或强制重建索引；索引按文件修改时间增量更新，自动跳过未变更文件、清理已删除文件。
+- 设置组「代码库语义索引」：`foxAi.rag.extensions`（纳入索引的扩展名）/ `foxAi.rag.maxFiles` / `foxAi.rag.autoRebuildHours`（自动重建间隔）。
+- 命令面板 **「狐狸 AI：重建代码索引」** 可强制全量重建并带进度。
+
+### 6.25 结构化长期记忆（主题化）
+
+长期记忆按**主题文件**组织，可手动编辑、跨会话持久、按相关性自动注入：
+
+- **主题分类**：项目约定 / 用户偏好 / 踩坑教训 / 架构决策 / 操作流程 / 领域知识等。
+- **工具 `save_memory`**（支持 `topic` 参数自动归类）、`get_memory`（按主题或相关性取回）。
+- 命令面板 **「狐狸 AI：打开主题记忆」** 浏览记忆目录。
+- 设置组「结构化长期记忆」：`foxAi.memory.topics.enabled` / `.budget`（单主题预算）/ `.autoHarvest`（自动收割）。
+
+---
+
+### 6.26 项目规则自动读取（Project Rules）
+
+开启后，扩展会在每次对话开始时自动读取**项目根目录的约定文件**（如 `CLAUDE.md` / `AGENTS.md` / `.fox-ai/rules` 等），注入到系统提示词，让智能体遵循项目既有规范。
+
+- 设置组「项目规则」：`foxAi.projectRules.enabled`（默认开）/ `foxAi.projectRules.budget`（token 预算，0=不限制，超出按重要性截断以控上下文体积）。
+- 关掉可省 token；大型仓库建议保留以统一风格。
+
+### 6.27 智能体模式（Architect / Ask / Debug）
+
+对标 Roo Code 的多模式人格：同一套智能体按模式改变**工具范围、可写路径与系统提示词**，并支持**每模式独立模型**。
+
+- 切换命令：**「狐狸 AI：切换智能体模式」**（或设置 `foxAi.modes.current`）。
+- 四种内置模式：
+  - **编码 code**（默认）：全权限读写、跑命令、改 bug。
+  - **架构 architect**：只做方案与设计，只允许写 Markdown/文档类文件（`editGlobs`），不改代码、不跑命令。
+  - **问答 ask**：纯只读答疑，绝不改动任何东西。
+  - **排错 debug**：先取证再动手，可读可改可跑命令，只做最小修复。
+- 每模式独立模型：`foxAi.modes.models`（如 `{"architect":"claude-opus","ask":"deepseek-chat"}`，留空用主模型）。
+- 覆盖定义：`foxAi.modes.overrides`（放开/收紧某模式文件限制或更换模型）。
+
+### 6.28 自定义 Slash Commands
+
+支持把常用工作流写成模板，在对话输入 `/<名字>` 即可调用，模板里用 `$ARGUMENTS` 占位。
+
+- 项目级优先：`<workspace>/.fox-ai/commands/<名字>.md`；用户级：`~/.fox-ai/commands/<名字>.md`（可在设置 `foxAi.slashCommands.storagePath` 改）。
+- 打开命令：**「狐狸 AI：打开命令模板目录」** 会自动创建示例 `review.md`。
+
+### 6.29 Auto Mode（自动门控）
+
+开启后，对**写/改/删/执行类动作**先用一次轻量 LLM 分类做 **allow / deny / ask** 门控，减少人工审批负担。
+
+- 设置组「Auto Mode」：`foxAi.autoMode.enabled` / `foxAi.autoMode.allow`（白名单，命中即放行、零 LLM 开销）/ `foxAi.autoMode.deny`（黑名单，命中即拒绝）。
+- 规则快路径（allow/deny 名单命中）不调用 LLM；其余情况由 LLM 判定。关闭则恢复默认人工审批。
+
+### 6.30 Best-of-N 多模型对比
+
+一次提问并发跑 N 个候选模型，由**评委**挑出最优回答，适合对关键任务做交叉验证。
+
+- 工具：`best_of_n`（参数 `prompt`、`candidates`、`judge`、`temperature`）。
+- 设置组「Best-of-N」：`foxAi.bestOfN.enabled` / `foxAi.bestOfN.judge`（`length`=按内容长度，`llm`=用主模型当评委更准但多一次调用，`first`=取第一个）/ `foxAi.bestOfN.candidates`（N 个 `{provider,model,baseUrl,apiKey}`，anthropic 类加 `transport:"anthropic"`）/ `foxAi.bestOfN.temperature`。
+- 纯 Node、有界并发、有界缓存（命中缓存直接返回），默认关、按需懒加载。
+
+### 6.31 冲突感知（Conflict Watch）
+
+人类在智能体读取文件后**又改了该文件**时，智能体写前会检测到冲突并**暂停写操作转人工裁决**，避免覆盖人工改动。
+
+- 设置：`foxAi.conflictWatch.enabled`（默认开，被动生效）。
+- 机制：读文件时记 mtime/size 快照；写前比对，若被外部改动则暂停；agent 自己写入后刷新快照，不会误报。有界缓存，不常驻监听。
+
+### 6.32 本地自动化（Automations · 纯本地）
+
+纯本地定时/事件触发，把重复任务交给**后台 agent 异步执行**，不依赖云端、无需关机常驻。
+
+- 两种触发：
+  - **定时**：cron 表达式（`0 18 * * *`）或 interval（毫秒）。
+  - **本地 webhook**：GitHub / Slack 等作为来源，向本机端口 POST 触发（只收指令、绝不回传任何内部资料，符合红线）。
+- 设置组「本地自动化」：`foxAi.automations.enabled` / `foxAi.automations.storagePath`（默认 `~/.fox-ai/automations.json`）/ `foxAi.automations.webhookPort`（0=不开启）/ `foxAi.automations.webhookSecret`。
+- 管理命令：**「狐狸 AI：管理自动化」** 创建/打开示例（含 `daily-summary` 与 `hourly-ping`）。
+
+### 6.33 Headless / CI 集成
+
+把狐狸 AI 当成一个**无状态的非流式调用**嵌入 CI / 脚本 / 命令行，输出到 stdout，退出码表成败。
+
+- **根目录脚本**：`node foxai --prompt "..." -P deepseek`（或管道 `echo "..." | node foxai`）。支持 `--base-url`/`--api-key`/`--model`/`--transport`/`--api-mode`/`--system`/`--json`/`--verbose`/`--file` 等参数，凭据亦可用环境变量 `FOXAI_*` 注入（优先级：显式参数 > 环境变量 > 预设默认值）。
+- **流式输出**：加 `-S` / `--stream`，文本逐块写到 stdout、reasoning 写到 stderr（CI 里像真人打字一样实时滚）；`--json` 时仍等结束再输出完整 JSON。
+- **多轮对话（两种形态）**：
+  - `--session <file>`：跨调用持久化。首次 `node foxai -p "记住我叫小明" --session chat.json -P llamacpp` 会把历史写入 `chat.json`；之后再 `node foxai -p "我刚说我叫什么？" --session chat.json -P llamacpp` 会自动带上前文。
+  - `--turns <file>`：一次性批量多轮。`file` 可为 JSON 数组 `["问题1","问题2"]`，或 `{ "messages": [...种子历史], "turns": ["问题1","问题2"] }`；每个 turn 也支持 `{ "role": "user"|"assistant", "content": "..." }`。
+  - 多轮模式下聊天状态只落盘到 `session`/`turns` 文件，进程本身**无常驻、无内存累积**，符合「用完即弃」约束。
+- **编辑器内命令**：**「狐狸 AI：运行 Headless 调用」**（`foxAi.runHeadless`，需在设置开启 `foxAi.headless.enabled`），用当前主对话模型做一次调用，结果落到输出面板。
+- 纯 Node、零 vscode 依赖，复用主对话的 client/anthropic 协议层；无缓存、无常驻监听、用完即弃，内存占用恒定。
+
+### 6.34 统一视觉风格（1.1.4）
+
+- **聊天面板**：`media/chat.css` 已升级为高级感主题，含统一圆角、accent 渐变辉光、毛玻璃顶栏/输入区、精致代码块与思考链卡片，动效仅走 `transform`/`opacity`（GPU 友好）。
+- **环境与插件面板**：`media/env.css` 从 `src/envView.js` 内联样式抽出，复用同一套设计 token（圆角、卡片阴影、渐变按钮、细滚动条），标签页改用 pill 胶囊样式，运行环境/插件/任务/文件树/MCP 等模块统一卡片化。
+- **左侧活动栏与树视图**：活动栏图标换用 `media/fox.svg`；会话树的分组带 `calendar`/`history`/`calendar-week`/`archive` 图标，当前会话用狐狸 SVG 图标，描述改为相对时间（"3 分钟前"）；文件导航树的分组带主题色图标，文件按操作类型着色。
+- 所有颜色仍基于 VS Code 主题变量（`--vscode-*`），深浅主题自适应；不引入外部字体，保持轻量。
+
 ---
 
 ## 七、设置项参考
@@ -294,6 +428,20 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 项目扫描 | `foxAi.projectScan.cacheEnabled`（结果缓存，默认 true） |
 | 行内补全 | `foxAi.inlineCompletion.enabled`（默认 true） / `.provider`（供应商，默认空=主模型） / `.baseUrl` / `.apiKey` / `.model`（专用模型，默认空=主模型） / `.maxTokens`（默认 256） / `.maxFileLines`（默认 8000） / `.suffixLines`（后缀行数，默认 30） / `.fimStrategy`（FIM 格式，默认 auto） / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
 | 智能体（续） | `foxAi.agent.maxMessageBytes`（历史总字节硬上限，默认 1048576） / `.structuredOutput` / `.projectSkeleton`（L1 代码骨架，默认 true） |
+| 子代理与并行 | `foxAi.subagents.enabled` / `.concurrency`（并行度，默认 2） / `.maxSteps` / `.maxToolCalls` / `.timeoutMs` / `.autoApproveWrites` |
+| 后台任务 | `foxAi.background.enabled` / `.maxConcurrent`（默认 2，硬上限 4） / `.timeoutMs`（默认 900000） / `.maxSteps` / `.maxToolCalls` / `.allowMainWorkspaceWrites` / `.keepWorktree` / `.maxHistory`（默认 60） / `.storagePath` |
+| 检查点与回滚 | `foxAi.checkpoints.enabled` / `.maxSnapshots` |
+| 生命周期钩子 | `foxAi.hooks.enabled` |
+| 代码库语义索引 | `foxAi.rag.extensions` / `.maxFiles` / `.autoRebuildHours` |
+| 结构化长期记忆 | `foxAi.memory.topics.enabled` / `.budget` / `.autoHarvest` |
+| 项目规则 | `foxAi.projectRules.enabled` / `.budget`（token 预算，0=不限制） |
+| 智能体模式 | `foxAi.modes.current`（code·architect·ask·debug）/ `foxAi.modes.overrides` / `foxAi.modes.models`（每模式独立模型） |
+| 自定义命令 | `foxAi.slashCommands.storagePath`（用户级模板目录） |
+| Auto Mode | `foxAi.autoMode.enabled` / `foxAi.autoMode.allow`（白名单）/ `foxAi.autoMode.deny`（黑名单） |
+| Best-of-N | `foxAi.bestOfN.enabled` / `foxAi.bestOfN.judge`（length·llm·first）/ `foxAi.bestOfN.candidates` / `foxAi.bestOfN.temperature` |
+| 冲突感知 | `foxAi.conflictWatch.enabled`（默认开，被动生效） |
+| 本地自动化 | `foxAi.automations.enabled` / `foxAi.automations.storagePath` / `foxAi.automations.webhookPort` / `foxAi.automations.webhookSecret` |
+| Headless / CI | `foxAi.headless.enabled` / `foxAi.headless.provider` / `foxAi.headless.baseUrl` / `foxAi.headless.apiKey` / `foxAi.headless.model` / `foxAi.headless.apiMode` / `foxAi.headless.transport` / `foxAi.headless.temperature` / `foxAi.headless.maxTokens` / `foxAi.headless.timeout` |
 
 ---
 
@@ -304,12 +452,22 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - `狐狸 AI：打开对话面板` —— 打开/聚焦对话面板。
 - `狐狸 AI：打开记忆文件` —— 查看与编辑长期记忆。
 - `狐狸 AI：打开用户技能目录` —— 打开用户自建技能目录。
-- `狐狸 AI：打开任务清单` —— 查看与编辑项目任务清单。
+- `狐狸 AI：打开任务清单` —— 查看与编辑项目任务清单。在对话面板顶部「📋 任务」清单里，也支持点击「清理已完成」一键清掉已完成的任务。
 - `狐狸 AI：打开环境管理器` —— 查看环境与端口等信息。
 - `狐狸 AI：打开知识库` / `狐狸 AI：整理知识库` —— 知识库浏览与整理。
 - `狐狸 AI：让狐狸 AI 修复这个问题` —— 通过 Quick Fix 灯泡菜单触发，针对错误处请求修复。
 - `狐狸 AI：暂停` / `取消` / `继续` —— 过程控制。
 - `狐狸 AI：撤销上次编辑` / `狐狸 AI：重做上次撤销的编辑` —— 文件改动回滚与恢复。
+- `狐狸 AI：查看后台任务` —— 可视化查看后台 Agent 任务列表（详情 / 打开补丁 / 取消 / 删除记录）。
+- `狐狸 AI：回滚到检查点` —— 选择检查点并一键回滚到该历史节点。
+- `狐狸 AI：重建代码索引` —— 强制全量重建全仓库语义索引（带进度）。
+- `狐狸 AI：打开 Hooks 配置` —— 编辑生命周期钩子配置（首次写入含示例的模板）。
+- `狐狸 AI：打开主题记忆` —— 浏览结构化长期记忆的主题目录。
+- `狐狸 AI：切换智能体模式` —— 在 编码 / 架构 / 问答 / 排错 之间切换（对应 6.27）。
+- `狐狸 AI：打开命令模板目录` —— 创建/打开 Slash Command 模板目录（对应 6.28）。
+- `狐狸 AI：切换 Auto Mode` —— 开关自动门控（对应 6.29）。
+- `狐狸 AI：管理自动化` —— 创建/打开本地自动化定义文件（对应 6.32）。
+- `狐狸 AI：运行 Headless 调用` —— 用当前主对话模型做一次无状态调用（对应 6.33，需开启 `foxAi.headless.enabled`）。
 
 ---
 
@@ -317,7 +475,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 智能体在完成任务时可调用的工具（部分）：
 
-`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` 等。
+`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` `search_codebase` `index_codebase` `spawn_subagent` `run_background_agent` `background_jobs` 等。
 
 > 智能体工作准则要求：用户要求“读 / 看 / 打开 / 检查某文件”时，必须立即调用 `read_file` 读取真实内容，不凭记忆猜测或编造。
 

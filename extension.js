@@ -133,7 +133,8 @@ function activate(context) {
   // 对话窗口现在以可移动编辑器标签页（WebviewPanel）形式存在，不再占用侧边栏
 
   /* ---------------- 会话侧边栏 ---------------- */
-  const sessionTree = new SessionTreeProvider(chatProvider.sessionManager, chatProvider);
+  const foxIconUri = vscode.Uri.joinPath(context.extensionUri, 'media', 'fox.svg');
+  const sessionTree = new SessionTreeProvider(chatProvider.sessionManager, chatProvider, foxIconUri);
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('foxAi.sessions', sessionTree)
   );
@@ -205,6 +206,62 @@ function activate(context) {
     }
   };
   registerConfiguredServers();
+
+  /* ---------------- 本地自动化调度（cron + 本地 webhook） ----------------
+     默认关；开启后按 automations.json 里的定义定时触发，或经本地 webhook 触发。
+     GitHub/Slack 等均可作为 webhook 来源打到本地端点。触发后复用当前会话的
+     后台 agent（automationsBridge）执行 prompt。关机不跑（仅扩展存活期间生效）。 */
+  const automations = require('./src/automations');
+  const automationsBridge = require('./src/automationsBridge');
+  let _autoStore = null, _autoSched = null, _autoServer = null;
+  function autoFire(a) {
+    if (!a) return;
+    const runner = automationsBridge.getRunner();
+    const spec = { task: a.prompt || a.name || '', title: a.name || '自动化任务', role: a.role || 'generalist' };
+    if (runner) {
+      try {
+        const r = runner(spec);
+        vscode.window.showInformationMessage('[狐狸 AI] 自动化「' + (a.name || a.id) + '」已触发' + (r && r.ok ? '，后台任务已提交' : '，但提交失败：' + ((r && r.error) || '未知')));
+      } catch (e) {
+        vscode.window.showWarningMessage('[狐狸 AI] 自动化「' + (a.name || a.id) + '」执行异常：' + (e && e.message || e));
+      }
+    } else {
+      vscode.window.showWarningMessage('[狐狸 AI] 自动化「' + (a.name || a.id) + '」触发，但当前无活动会话，已忽略。');
+    }
+  }
+  function autoStart() {
+    try { autoStop(); } catch (_) {}
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    if (!cfg.get('automations.enabled', false)) return;
+    const storagePath = cfg.get('automations.storagePath', '') || require('path').join(require('os').homedir(), '.fox-ai', 'automations.json');
+    _autoStore = new automations.AutomationStore(storagePath);
+    _autoSched = new automations.AutomationScheduler(_autoStore, autoFire);
+    _autoSched.start();
+    const port = Number(cfg.get('automations.webhookPort', 0));
+    if (port > 0) {
+      const secret = cfg.get('automations.webhookSecret', '') || '';
+      _autoServer = automations.createWebhookServer({
+        port,
+        secret,
+        allowedIds: _autoStore.list().map((x) => x.id),
+        dispatch: (id) => { const a = _autoStore.get(id); autoFire(a); return require('crypto').randomBytes(6).toString('hex'); }
+      });
+      console.log('[狐狸 AI] 自动化 webhook 已监听端口', port);
+    }
+    console.log('[狐狸 AI] 本地自动化调度已启动，共', _autoStore.enabledList().length, '个启用项');
+  }
+  function autoStop() {
+    if (_autoSched) { try { _autoSched.stop(); } catch (_) {} _autoSched = null; }
+    if (_autoServer) { try { _autoServer.close(); } catch (_) {} _autoServer = null; }
+    _autoStore = null;
+  }
+  autoStart();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('foxAi.automations')) autoStart();
+    })
+  );
+  context.subscriptions.push({ dispose: autoStop });
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -657,6 +714,311 @@ function activate(context) {
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify({ version: 1, items: [] }, null, 2), 'utf8');
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
     await vscode.window.showTextDocument(doc, { preview: false });
+  });
+
+  /* ---------------- 1.0.0 新能力入口 ---------------- */
+
+  // 后台任务：列表 → 查看结论 / 取消 / 打开补丁
+  reg('foxAi.showBackgroundJobs', async () => {
+    const bg = require('./src/background');
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const store = new bg.BackgroundJobStore({
+      baseDir: cfg.get('background.storagePath', '') || context.globalStorageUri.fsPath,
+      maxJobs: cfg.get('background.maxHistory', 60)
+    });
+    const jobs = store.list({ limit: 40 });
+    if (!jobs.length) {
+      vscode.window.showInformationMessage(tw('当前没有后台任务。让智能体「在后台帮我做…」即可创建。'));
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      jobs.map((j) => ({
+        label: `${bg.STATUS_ICON[j.status] || '•'} ${j.title}`,
+        description: `${bg.STATUS_LABEL[j.status] || j.status}${j.changedFiles && j.changedFiles.length ? ' · ' + j.changedFiles.length + ' 文件改动' : ''}`,
+        detail: j.id + (j.endedAt ? ' · ' + bg.fmtAgo(j.endedAt) : ''),
+        job: j
+      })),
+      { placeHolder: tw('选择一个后台任务查看详情') }
+    );
+    if (!picked) return;
+    const j = picked.job;
+    const actions = [tw('查看详情')];
+    if (j.patchPath && require('fs').existsSync(j.patchPath)) actions.push(tw('打开补丁文件'));
+    if (j.status === 'running' || j.status === 'queued') actions.push(tw('取消任务'));
+    actions.push(tw('删除记录'));
+    const act = await vscode.window.showQuickPick(actions, { placeHolder: j.title });
+    if (!act) return;
+    if (act === tw('打开补丁文件')) {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(j.patchPath));
+      await vscode.window.showTextDocument(doc, { preview: false });
+      return;
+    }
+    if (act === tw('取消任务')) {
+      // 真正的取消需要由持有 runner 的会话执行，这里只能改档案状态并提示
+      vscode.window.showWarningMessage(tw('请在对话里说「取消后台任务 {0}」，由智能体调用取消，才能真正停止正在跑的任务。', j.id));
+      return;
+    }
+    if (act === tw('删除记录')) {
+      store.remove(j.id);
+      vscode.window.showInformationMessage(tw('已删除后台任务记录 {0}', j.id));
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument({ content: bg.renderJob(j, { progressLimit: 20 }), language: 'markdown' });
+    await vscode.window.showTextDocument(doc, { preview: false });
+  });
+
+  // 检查点回滚：选一个检查点，把之后被改动的文件全部还原
+  reg('foxAi.rollbackCheckpoint', async () => {
+    const { CheckpointStore } = require('./src/checkpoints');
+    const folders = vscode.workspace.workspaceFolders;
+    let sid = 'default';
+    try {
+      if (chatProvider && chatProvider.sessionManager) sid = chatProvider.sessionManager.currentId() || 'default';
+    } catch (_) {}
+    const store = new CheckpointStore({
+      baseDir: context.globalStorageUri.fsPath,
+      workspaceRoot: folders && folders.length ? folders[0].uri.fsPath : '',
+      sessionId: sid,
+      enabled: true
+    });
+    const entries = store.list(50);
+    if (!entries.length) {
+      vscode.window.showInformationMessage(tw('当前会话还没有检查点。智能体写文件时会自动创建。'));
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      entries.map((e) => ({
+        label: e.label || tw('检查点'),
+        description: new Date(e.at || Date.now()).toLocaleString(),
+        detail: (e.files || []).map((f) => f.rel || f.path).slice(0, 5).join('、'),
+        id: e.id
+      })),
+      { placeHolder: tw('选择要回滚到的检查点（该时刻之后的改动会被还原）') }
+    );
+    if (!picked) return;
+    const yes = await vscode.window.showWarningMessage(
+      tw('确定回滚到「{0}」吗？该检查点之后被智能体改动的文件会还原成当时的内容。', picked.label),
+      { modal: true },
+      tw('回滚')
+    );
+    if (yes !== tw('回滚')) return;
+    try {
+      const r = store.rollbackTo(picked.id);
+      if (r && r.ok === false) {
+        vscode.window.showErrorMessage(tw('回滚失败：{0}', r.error || ''));
+        return;
+      }
+      const bits = [];
+      if (r.restored && r.restored.length) bits.push(tw('还原 {0} 个文件', String(r.restored.length)));
+      if (r.deleted && r.deleted.length) bits.push(tw('删除 {0} 个新增文件', String(r.deleted.length)));
+      if (r.failed && r.failed.length) bits.push(tw('{0} 个失败', String(r.failed.length)));
+      vscode.window.showInformationMessage(tw('回滚完成：{0}', bits.join('、') || tw('无变化')));
+    } catch (e) {
+      vscode.window.showErrorMessage(tw('回滚失败：{0}', (e && e.message) || String(e)));
+    }
+  });
+
+  // 重建全仓库语义索引
+  reg('foxAi.rebuildCodeIndex', async () => {
+    const ci = require('./src/tools/codebaseIndex');
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: tw('狐狸 AI：重建代码库语义索引'), cancellable: false },
+      async (progress) => {
+        try {
+          const out = await ci.runIndex({ force: true }, {
+            onStream: (text) => progress.report({ message: String(text || '').trim() })
+          });
+          vscode.window.showInformationMessage(tw('索引完成：{0}', String(out).split('\n')[0]));
+        } catch (e) {
+          vscode.window.showErrorMessage(tw('索引失败：{0}', (e && e.message) || String(e)));
+        }
+      }
+    );
+  });
+
+  // 编辑生命周期钩子配置
+  reg('foxAi.openHooksConfig', async () => {
+    const hooks = require('./src/hooks');
+    const fs = require('fs');
+    const path = require('path');
+    const folders = vscode.workspace.workspaceFolders;
+    const wsFile = folders && folders.length ? hooks.workspaceHooksFile(folders[0].uri.fsPath) : '';
+    const choices = [{ label: tw('用户级钩子（对所有项目生效）'), file: hooks.userHooksFile() }];
+    if (wsFile) choices.push({ label: tw('工作区钩子（只对当前项目生效）'), file: wsFile });
+    const picked = choices.length === 1 ? choices[0] : await vscode.window.showQuickPick(choices, { placeHolder: tw('选择要编辑的钩子配置') });
+    if (!picked) return;
+    try {
+      fs.mkdirSync(path.dirname(picked.file), { recursive: true });
+      if (!fs.existsSync(picked.file)) {
+        // SAMPLE_CONFIG 是对象，必须序列化后再写，否则文件里会是 [object Object]
+        const sample = typeof hooks.SAMPLE_CONFIG === 'string'
+          ? hooks.SAMPLE_CONFIG
+          : JSON.stringify(hooks.SAMPLE_CONFIG, null, 2);
+        fs.writeFileSync(picked.file, sample + '\n', 'utf8');
+      }
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(picked.file));
+      await vscode.window.showTextDocument(doc, { preview: false });
+    } catch (e) {
+      vscode.window.showErrorMessage(tw('打开钩子配置失败：{0}', (e && e.message) || String(e)));
+    }
+  });
+
+  // 打开结构化记忆目录
+  reg('foxAi.openTopicMemory', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const base = cfg.get('memory.storagePath', '') || context.globalStorageUri.fsPath;
+    const dir = path.join(base, 'memory-topics');
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(dir));
+    } catch (_) {
+      vscode.window.showInformationMessage(tw('结构化记忆目录：{0}', dir));
+    }
+  });
+
+  /* ---------------- Agent 模式切换（code / architect / ask / debug） ---------------- */
+  reg('foxAi.setAgentMode', async () => {
+    const modes = require('./src/modes');
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const current = cfg.get('modes.current', modes.DEFAULT_MODE);
+    const items = modes.listModes().map((m) => ({
+      label: `${m.emoji} ${m.label}` + (m.id === current ? '（当前）' : ''),
+      description: m.id,
+      detail: m.description,
+      id: m.id
+    }));
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: tw('选择智能体工作模式') });
+    if (!picked) return;
+    await cfg.update('modes.current', picked.id, vscode.ConfigurationTarget.Global);
+    const m = modes.resolveMode(picked.id, cfg.get('modes.overrides', null));
+    const mm = modes.modelFor(picked.id, cfg.get('modes.models', null));
+    vscode.window.showInformationMessage(
+      `${m.emoji} ${tw('已切换到')}「${m.label}」${tw('模式')}` + (mm ? `（${tw('模型')}：${mm}）` : '')
+    );
+  });
+
+  /* ---------------- Auto Mode 开关 ---------------- */
+  reg('foxAi.toggleAutoMode', async () => {
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const on = !cfg.get('autoMode.enabled', false);
+    await cfg.update('autoMode.enabled', on, vscode.ConfigurationTarget.Global);
+    if (on) {
+      const allow = (cfg.get('autoMode.allow', []) || []);
+      const deny = (cfg.get('autoMode.deny', []) || []);
+      vscode.window.showInformationMessage(
+        tw('Auto Mode 已开启：写/改/删/执行类动作将先由 LLM 分类门控（allow/deny/ask）') +
+        (allow.length || deny.length ? `（名单 放行${allow.length}/拒绝${deny.length}）` : '')
+      );
+    } else {
+      vscode.window.showInformationMessage(tw('Auto Mode 已关闭：动作恢复默认人工审批。'));
+    }
+  });
+
+  /* ---------------- 自定义命令模板目录 ---------------- */
+  reg('foxAi.openCommandsDir', async () => {
+    const slash = require('./src/slashCommands');
+    const fs = require('fs');
+    const path = require('path');
+    const folders = vscode.workspace.workspaceFolders;
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const choices = [];
+    if (folders && folders.length) {
+      choices.push({ label: tw('本项目命令（.fox-ai/commands）'), dir: slash.workspaceCommandsDir(folders[0].uri.fsPath) });
+    }
+    choices.push({
+      label: tw('用户级命令（对所有项目生效）'),
+      dir: slash.userCommandsDir(cfg.get('slashCommands.storagePath', '') || undefined)
+    });
+    const picked = choices.length === 1 ? choices[0] : await vscode.window.showQuickPick(choices, { placeHolder: tw('选择命令模板目录') });
+    if (!picked) return;
+    try {
+      fs.mkdirSync(picked.dir, { recursive: true });
+      // 空目录时写一个示例模板，用户照着改就能用
+      const sample = path.join(picked.dir, 'review.md');
+      if (!fs.readdirSync(picked.dir).some((f) => f.toLowerCase().endsWith('.md'))) {
+        fs.writeFileSync(sample, slash.SAMPLE_COMMAND, 'utf8');
+      }
+      slash.invalidate();
+      await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(picked.dir));
+      vscode.window.showInformationMessage(tw('命令模板目录：{0}。新建 <名字>.md 后，在对话框输入 /<名字> 即可调用。', picked.dir));
+    } catch (e) {
+      vscode.window.showErrorMessage(tw('打开命令模板目录失败：{0}', (e && e.message) || String(e)));
+    }
+  });
+
+  /* ---------------- 本地自动化定义管理 ---------------- */
+  reg('foxAi.manageAutomations', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const storagePath = cfg.get('automations.storagePath', '') || path.join(require('os').homedir(), '.fox-ai', 'automations.json');
+    let created = false;
+    if (!fs.existsSync(storagePath)) {
+      fs.mkdirSync(path.dirname(storagePath), { recursive: true });
+      const sample = [
+        { id: 'daily-summary', name: '每日代码摘要', enabled: false, prompt: '总结今天工作区的代码改动，列出要点', schedule: { type: 'cron', expr: '0 18 * * *' } },
+        { id: 'hourly-ping', name: '每小时探测', enabled: false, prompt: '检查并报告工作区是否有异常日志', schedule: { type: 'interval', ms: 3600000 } }
+      ];
+      fs.writeFileSync(storagePath, JSON.stringify(sample, null, 2));
+      created = true;
+    }
+    const doc = await vscode.workspace.openTextDocument(storagePath);
+    await vscode.window.showTextDocument(doc);
+    vscode.window.showInformationMessage(
+      (created ? tw('已创建自动化示例文件，编辑后保存即生效。') : tw('自动化定义文件已打开。')) +
+      tw('需在设置开启 foxAi.automations.enabled；webhook 需配置 webhookPort 与 webhookSecret。')
+    );
+  });
+
+  /* ---------------- Headless / CI 调用（无状态，复用当前主对话模型） ---------------- */
+  reg('foxAi.runHeadless', async () => {
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    if (!cfg.get('headless.enabled', false)) {
+      vscode.window.showWarningMessage(tw('Headless 未开启：请在设置开启 foxAi.headless.enabled，或在 CI 中直接用根目录 `foxai` 脚本。'));
+      return;
+    }
+    const headless = require('./src/headless');
+    const prompt = await vscode.window.showInputBox({
+      placeHolder: tw('输入要发给模型的提示词（或用选定文本）'),
+      prompt: tw('Headless 单次调用')
+    });
+    if (!prompt || !prompt.trim()) return;
+
+    let resolved;
+    try {
+      resolved = await config.resolve(context);
+    } catch (e) {
+      vscode.window.showErrorMessage(tw('读取主对话配置失败：{0}', (e && e.message) || String(e)));
+      return;
+    }
+    // headless 配置段可覆盖主对话默认值
+    const hc = cfg.get('headless', {}) || {};
+    const r = await headless.runHeadless({
+      prompt,
+      system: (hc.system || '') || resolved.systemPrompt,
+      config: {
+        provider: hc.provider || resolved.providerId,
+        baseUrl: hc.baseUrl || resolved.baseUrl,
+        apiKey: hc.apiKey || resolved.apiKey,
+        model: hc.model || resolved.model,
+        transport: hc.transport || resolved.transport,
+        apiMode: hc.apiMode || resolved.apiMode
+      },
+      temperature: hc.temperature != null ? hc.temperature : resolved.temperature,
+      maxTokens: hc.maxTokens != null ? hc.maxTokens : resolved.maxTokens,
+      timeout: hc.timeout != null ? hc.timeout : resolved.timeout
+    });
+    if (r.ok) {
+      const ch = vscode.window.createOutputChannel('狐狸 AI · Headless');
+      ch.appendLine(r.text || '(空响应)');
+      if (r.reasoning) ch.appendLine('\n[reasoning]\n' + r.reasoning);
+      ch.show(true);
+      vscode.window.showInformationMessage(tw('Headless 调用成功（{0}）', (r.meta && r.meta.model) || ''));
+    } else {
+      vscode.window.showErrorMessage(tw('Headless 调用失败：{0}', r.error || '未知错误'));
+    }
   });
 
   /* ---------------- 存储位置管理 ---------------- */

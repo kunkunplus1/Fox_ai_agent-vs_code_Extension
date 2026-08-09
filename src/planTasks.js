@@ -119,6 +119,18 @@ class PlanTaskStore {
     return this.update(id, { status });
   }
 
+  /** 一键清理所有 completed 状态的任务，返回被清理的任务数量 */
+  clearCompleted() {
+    const before = this.items.length;
+    this.items = this.items.filter((x) => x.status !== STATUS.COMPLETED);
+    const removed = before - this.items.length;
+    if (removed) {
+      this._persist();
+      this._notify();
+    }
+    return removed;
+  }
+
   remove(id) {
     const before = this.items.length;
     this.items = this.items.filter((x) => x.id !== id);

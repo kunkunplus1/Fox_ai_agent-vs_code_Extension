@@ -33,7 +33,11 @@ const TOOLS = [
   { name: 'list_plan_tasks', description: '列出计划任务', parameters: {} },
   { name: 'get_memory', description: '获取长期记忆', parameters: {} },
   { name: 'write_organize', description: '写入知识库', parameters: {} },
-  { name: 'read_organize', description: '读取知识库', parameters: {} }
+  { name: 'read_organize', description: '读取知识库', parameters: {} },
+  { name: 'spawn_subagent', description: '派生隔离上下文的子代理，可并行执行也可按依赖组队', parameters: {} },
+  { name: 'search_codebase', description: '全仓库语义检索代码片段', parameters: {} },
+  { name: 'run_background_agent', description: '把耗时任务丢到后台异步执行', parameters: {} },
+  { name: 'background_jobs', description: '查看取消清理后台任务', parameters: {} }
 ];
 const ALL_NAMES = new Set(TOOLS.map((t) => t.name));
 

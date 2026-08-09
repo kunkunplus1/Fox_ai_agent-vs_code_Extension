@@ -55,6 +55,7 @@ function getHtml(context, webview) {
   function escAttr(v){ return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   const mediaRoot = vscode.Uri.joinPath(context.extensionUri, 'media');
   const envUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'env.js')).toString(); // foxAiMcpModulesPathInjected
+  const cssUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'env.css')).toString();
 
 
   return `<!DOCTYPE html>
@@ -64,68 +65,7 @@ function getHtml(context, webview) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${csp} https: data:; style-src ${csp} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 <meta name="foxai-mcp-modules" content="${escAttr(modulesPath)}" />
-<style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; }
-  h2 { font-size: 14px; margin: 6px 0 10px; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 12px; position: relative; z-index: 1; }
-  .tab { padding: 5px 12px; cursor: pointer; border: 1px solid var(--vscode-panel-border); border-radius: 6px; pointer-events: auto; user-select: none; outline: none; }
-  .tab:hover { background: var(--vscode-list-hoverBackground); }
-  .tab:focus { border-color: var(--vscode-focusBorder); }
-  .tab.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-  .pane { display: none; }
-  .pane.active { display: block; }
-  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-  .row label { width: 110px; opacity: .85; }
-  .card { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
-  .rt-head { display: flex; justify-content: space-between; }
-  .ver { opacity: .6; font-size: 12px; }
-  .rt-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-  input, select { background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border); border-radius: 4px; padding: 4px 6px; }
-  .ver-input { width: 180px; }
-  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-    border: 0; border-radius: 4px; padding: 5px 12px; cursor: pointer; pointer-events: auto; }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  button:active { transform: translateY(1px); }
-  button.pick-btn { padding: 5px 16px; min-width: 60px; font-weight: 500; }
-  .status { font-size: 12px; opacity: .8; }
-  .ext { border: 1px solid var(--vscode-panel-border); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; }
-  .ext .cmds { margin-top: 6px; font-size: 12px; opacity: .85; }
-  .ext-group { margin-bottom: 14px; }
-  .ext-group-title { font-size: 13px; font-weight: 600; margin: 8px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--vscode-panel-border); }
-  .hint { opacity: .6; font-size: 12px; margin: 6px 0; }
-  code { background: rgba(128,128,128,.15); padding: 1px 4px; border-radius: 3px; }
-  .danger { color: var(--vscode-errorForeground); }
-  .mcp-field { margin-bottom: 4px; }
-  #mcp-editor { box-shadow: 0 4px 12px rgba(0,0,0,.15); }
-  .field-help { margin: -2px 0 8px 118px; font-size: 12px; opacity: .7; line-height: 1.45; }
-  .preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 14px; align-items: center; }
-  .preset-btn { padding: 3px 10px; font-size: 12px; }
-  .file-tree { user-select: none; }
-  .file-tree .tree-node { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; }
-  .file-tree .tree-node:hover { background: var(--vscode-list-hoverBackground); }
-  .file-tree .tree-node.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-  .file-tree .tree-toggle { width: 14px; text-align: center; font-size: 10px; opacity: .7; }
-  .file-tree .tree-checkbox { margin: 0; }
-  .file-tree .tree-icon { width: 16px; text-align: center; }
-  .file-tree .tree-children { padding-left: 18px; }
-  .file-tree .tree-role { opacity: .7; font-size: 11px; margin-left: 6px; }
-  .file-tree .tree-size { opacity: .5; font-size: 11px; margin-left: auto; }
-  .task-wrap { border: 1px solid var(--vscode-panel-border); border-radius: 6px; margin-bottom: 6px; overflow: hidden; }
-  .task-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; cursor: pointer; user-select: none; }
-  .task-item:hover { background: var(--vscode-list-hoverBackground); }
-  .task-item.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-  .task-item .task-toggle { width: 14px; text-align: center; font-size: 10px; opacity: .7; }
-  .task-item .task-state { font-weight: 600; min-width: 56px; }
-  .task-item .task-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .task-item .task-meta { opacity: .6; font-size: 11px; white-space: nowrap; }
-  .task-actions-row { display: none; gap: 6px; margin-left: auto; }
-  .task-item:hover .task-actions-row { display: flex; }
-  .task-detail { border-top: 1px solid var(--vscode-panel-border); padding: 8px; font-size: 12px; background: rgba(128,128,128,.05); }
-  .task-detail pre { white-space: pre-wrap; max-height: 240px; overflow: auto; background: rgba(128,128,128,.08); padding: 8px; border-radius: 6px; margin: 6px 0; }
-  .task-detail .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-  .task-detail button { font-size: 12px; padding: 4px 10px; }
-</style>
+<link rel="stylesheet" href="${cssUri}" />
 </head>
 <body>
   <div class="tabs" id="tabs">

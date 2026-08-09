@@ -21,6 +21,14 @@ const IGNORE_DIRS = new Set([
 
 const MAX_PER_DIR = 1200;
 
+const OP_COLOR = {
+  '读': 'charts.blue',
+  '写': 'charts.orange',
+  '修改': 'charts.green',
+  '引用': 'charts.purple',
+  '打开': 'charts.blue'
+};
+
 class FileItem extends vscode.TreeItem {
   constructor(opts) {
     super(path.basename(opts.path), vscode.TreeItemCollapsibleState.None);
@@ -28,7 +36,8 @@ class FileItem extends vscode.TreeItem {
     this.resourceUri = vscode.Uri.file(opts.path);
     this.tooltip = opts.path + (opts.line ? ' :' + opts.line : '');
     this.description = opts.description || '';
-    this.iconPath = new vscode.ThemeIcon('file');
+    const colorKey = OP_COLOR[opts.op] || 'charts.purple';
+    this.iconPath = new vscode.ThemeIcon('file', new vscode.ThemeColor(colorKey));
     this.command = {
       command: 'foxAi.openFileAt',
       title: '打开',
@@ -44,8 +53,13 @@ class DirItem extends vscode.TreeItem {
     this.id = 'dir:' + dirPath;
     this.pathValue = dirPath;
     this.resourceUri = vscode.Uri.file(dirPath);
-    this.iconPath = new vscode.ThemeIcon('folder');
+    this.iconPath = new vscode.ThemeIcon('folder', new vscode.ThemeColor('charts.yellow'));
   }
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
 
 class GroupItem extends vscode.TreeItem {
@@ -53,6 +67,9 @@ class GroupItem extends vscode.TreeItem {
     super(label, vscode.TreeItemCollapsibleState.Expanded);
     this.contextValue = 'foxAi.navGroup';
     this.id = id;
+    this.iconPath = id === 'session'
+      ? new vscode.ThemeIcon('history', new vscode.ThemeColor('charts.orange'))
+      : new vscode.ThemeIcon('folder-opened', new vscode.ThemeColor('charts.blue'));
   }
 }
 

@@ -249,7 +249,10 @@ ${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 13. 编码类任务收尾时，除了系统已自动做的语法校验（node --check / 写后诊断），还应主动用 run_command 运行该项目的测试验证（如 package.json 的 test 脚本、pytest、go test、cargo test 等）；若项目没有测试，至少跑一次构建或类型检查。把测试结果写入最终总结。
 14. 系统提示词中的【本地知识库参考】已包含用户整理好的知识库文件内容，回答相关问题时请优先基于其中信息，不要调用 find_files / search_text 去工作区“找知识库文件”，也不要因检索关键词未命中就声称没有知识库。
 15. 保持谨慎：动手改文件或跑命令前，先想清楚影响范围，优先用可逆的最小改动；删除 / 覆盖 / 移动 / 重命名文件，以及 rm -rf、git reset --hard 这类不可逆命令，务必确认目标与后果，autoApprove 关闭时先征求用户同意。声称“完成”之前，必须用工具核实结果（get_diagnostics / 跑测试 / 读回文件），不要凭假设说成功；意图或风险拿不准时，先问清楚再动手，绝不瞎猜。
-16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 去读真实内容，不要反问“你的意思是…？”、不要凭记忆猜测、不要编造文件内容。读完后再基于原文回答或继续操作。\n17. 自动代码审查：你每完成一轮代码写操作（edit_file / write_file / delete_file），系统会用只读的审查子代理对改动做一次检查，并把审查意见作为后续观察发回给你。若审查意见指出明显问题（尤其 🔴 严重项），请在本轮结束前据以修正，不要带着低级错误直接收尾；若审查认为无问题，正常继续即可。\\n18. 自我验证：输出结论或声称“完成”前，先自检——事实是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题。剔除不准确或冗余信息。\n19. 安全自检双盲校验：调用 security_audit 做代码安全自检时，其结果仅供参考，**禁止作为修复的唯一依据**。当你据自检结论做了修复后，必须再调用只读的 referee_review（裁判 Agent）对比「修复前 HEAD 原版 vs 修复后工作区」的语义差异；若裁判判定「修复前后逻辑等价」（即自检疑似误报），必须**强制挂起转人工**，不得自行放行或忽略。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n20. 规划确认模式已开启：面对需要多个步骤才能完成的任务（如新建或修改多个文件、跑测试、跨模块改动），先用 create_plan_task 把完整计划逐条列出（含每步目标），再调用 present_plan 把计划提交给用户确认；调用 present_plan 之后必须停止，不得执行任何写文件或执行命令的操作，耐心等待用户确认。用户确认后你再逐步执行，每完成一步用 update_plan_task 标记状态。执行过程中若需调整计划（增删步骤或改变目标），必须先调用 update_plan_task / create_plan_task 改好计划，再调用 revise_plan 并说明原因，等待用户再次确认后才继续，不得擅自偏离已确认的计划。` : '') + extSection + '\n\n' + mcpAuthor.MCP_AUTHORING_GUIDE;
+16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 去读真实内容，不要反问“你的意思是…？”、不要凭记忆猜测、不要编造文件内容。读完后再基于原文回答或继续操作。\n17. 自动代码审查：你每完成一轮代码写操作（edit_file / write_file / delete_file），系统会用只读的审查子代理对改动做一次检查，并把审查意见作为后续观察发回给你。若审查意见指出明显问题（尤其 🔴 严重项），请在本轮结束前据以修正，不要带着低级错误直接收尾；若审查认为无问题，正常继续即可。\\n18. 自我验证：输出结论或声称“完成”前，先自检——事实是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题。剔除不准确或冗余信息。\n19. 安全自检双盲校验：调用 security_audit 做代码安全自检时，其结果仅供参考，**禁止作为修复的唯一依据**。当你据自检结论做了修复后，必须再调用只读的 referee_review（裁判 Agent）对比「修复前 HEAD 原版 vs 修复后工作区」的语义差异；若裁判判定「修复前后逻辑等价」（即自检疑似误报），必须**强制挂起转人工**，不得自行放行或忽略。
+20. 子代理编排：遇到「多条互不相干的支线可以同时查」或「某个子任务要翻十几个文件、会产生大量中间过程」时，用 spawn_subagent 把它们派出去——子代理有独立上下文，它的探索过程不会占用你的上下文，你只收到最终结论，这能显著省 token 也更快。角色按权限选（explorer 只读探索 / coder 可改代码 / reviewer 只读挑错 / tester 可跑命令 / researcher 可联网 / planner 只做拆解）。每个 task 必须具体自包含，需要的背景写进 context（子代理看不到你和用户的对话）。有先后依赖就用 depends_on 组队，会自动分批并把前置结论传给后置。**但别滥用**：一两次工具调用能搞定的事自己做，简单任务派代理反而更慢。
+
+21. 后台任务：只有当用户**明确表达异步意图**（「你先在后台帮我做 X，我干点别的」「顺手把测试补了，不用等」）或任务明显极耗时（全项目补测试、大范围重构）时，才用 run_background_agent 丢后台。丢完立刻回复「已在后台开始处理」并继续处理用户的其它需求，**不要**原地反复查询等它跑完。用户此刻在等结果的活儿，一律当场做。后台任务在 git 仓库里会自动开独立分支与副本，不会碰用户正在编辑的文件；非 git 仓库则自动降级为只读调研。后台任务结束后结论**不会**自动出现在对话里，用户问起时用 background_jobs（action=get）把结论取回来再回答。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：面对需要多个步骤才能完成的任务（如新建或修改多个文件、跑测试、跨模块改动），先用 create_plan_task 把完整计划逐条列出（含每步目标），再调用 present_plan 把计划提交给用户确认；调用 present_plan 之后必须停止，不得执行任何写文件或执行命令的操作，耐心等待用户确认。用户确认后你再逐步执行，每完成一步用 update_plan_task 标记状态。执行过程中若需调整计划（增删步骤或改变目标），必须先调用 update_plan_task / create_plan_task 改好计划，再调用 revise_plan 并说明原因，等待用户再次确认后才继续，不得擅自偏离已确认的计划。` : '') + extSection + '\n\n' + mcpAuthor.MCP_AUTHORING_GUIDE;
 
 
 
@@ -336,8 +339,495 @@ class AgentSession {
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
     this.memory = new MemoryStore(gsDir, c.get('memory.storagePath', ''));
+    // 结构化跨会话记忆：按主题分文件存 Markdown，按需加载而非全量注入
+    this.topicMemory = opts.topicMemory || null;
+    if (!this.topicMemory) {
+      try {
+        const { TopicMemory } = require('./memoryTopics');
+        this.topicMemory = new TopicMemory({
+          baseDir: c.get('memory.storagePath', '') || gsDir,
+          enabled: c.get('memory.topics.enabled', true),
+          budget: c.get('memory.topics.budget', 2500)
+        });
+      } catch (_) {
+        this.topicMemory = null;
+      }
+    }
     this.skills = new UserSkillStore(gsDir, c.get('skills.storagePath', ''));
     this.planTasks = opts.planTasks || new PlanTaskStore(gsDir, { customDir: c.get('planTasks.storagePath', '') });
+    // ---- 生命周期钩子（确定性策略，事件驱动，不依赖模型自觉）----
+    this.hooks = opts.hooks || null;
+    if (!this.hooks) {
+      try {
+        const { HookRunner } = require('./hooks');
+        const folders = vscode.workspace.workspaceFolders;
+        this.hooks = new HookRunner({
+          workspaceRoot: folders && folders.length ? folders[0].uri.fsPath : '',
+          enabled: c.get('hooks.enabled', true)
+        });
+      } catch (_) {
+        this.hooks = null;
+      }
+    }
+    // ---- Checkpoint 快照（写文件前自动存档，可一键回滚）----
+    this.checkpoints = opts.checkpoints || null;
+    if (!this.checkpoints) {
+      try {
+        const { CheckpointStore } = require('./checkpoints');
+        const folders = vscode.workspace.workspaceFolders;
+        this.checkpoints = new CheckpointStore({
+          baseDir: gsDir,
+          workspaceRoot: folders && folders.length ? folders[0].uri.fsPath : '',
+          sessionId: this.sessionId,
+          enabled: c.get('checkpoints.enabled', true),
+          maxSnapshots: c.get('checkpoints.maxSnapshots', 200)
+        });
+      } catch (_) {
+        this.checkpoints = null;
+      }
+    }
+    // ---- 子代理 / 并行 agent（懒建：需要用到时才按当前 cfg 构造）----
+    this._subagentRunner = null;
+    this._subagentBatch = 0;
+    // ---- 后台 / 异步 agent（懒建；store 跨会话共享，所以挂在 opts 上可注入）----
+    this._background = opts.background || null;
+  }
+
+  /**
+   * 拿到（或懒建）后台任务调度器。
+   * 后台任务的存档是**跨会话**的，因此 store 与 runner 一次建好长期复用。
+   */
+  _bg() {
+    if (this._background) return this._background;
+    try {
+      const bg = require('./background');
+      const c = config.conf();
+      const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
+      const root = this._workspaceRoot();
+      const store = new bg.BackgroundJobStore({
+        baseDir: c.get('background.storagePath', '') || gsDir,
+        maxJobs: c.get('background.maxHistory', 60)
+      });
+      // 上次 VS Code 被关掉时还在跑的任务，状态要修正，不能永远显示「进行中」
+      store.markInterrupted();
+      const runner = new bg.BackgroundRunner({
+        store,
+        workspaceRoot: root,
+        git: root ? new bg.GitOps({ root }) : null,
+        limits: {
+          maxConcurrent: c.get('background.maxConcurrent', 2),
+          timeoutMs: c.get('background.timeoutMs', 900000),
+          allowMainWrites: c.get('background.allowMainWorkspaceWrites', false),
+          keepWorktree: c.get('background.keepWorktree', false)
+        },
+        onEvent: (e) => this._onBackgroundEvent(e),
+        runTask: (p) => this._backgroundRunTask(p)
+      });
+      this._background = { bg, store, runner };
+    } catch (e) {
+      try { require('./log').appendLog('background', '[init-fail] ' + ((e && e.message) || e)); } catch (_) {}
+      this._background = null;
+    }
+    return this._background;
+  }
+
+  /**
+   * 提交后台任务：**立即返回**，任务在后台跑，主对话不阻塞。
+   * @returns {string} 给模型看的回执文本
+   */
+  runBackgroundAgent(req) {
+    const c = config.conf();
+    if (!c.get('background.enabled', true)) {
+      return '后台任务功能已在设置中关闭（foxAi.background.enabled）。请在当前对话里直接完成。';
+    }
+    const h = this._bg();
+    if (!h) return '后台任务调度器初始化失败，请改为在当前对话里直接完成。';
+    const r = h.runner.submit({
+      task: (req && req.task) || '',
+      title: (req && req.title) || '',
+      role: (req && req.role) || 'generalist',
+      pr: !!(req && req.create_pr),
+      timeoutMs: req && req.timeout_minutes ? Number(req.timeout_minutes) * 60000 : 0,
+      sessionId: this.sessionId
+    });
+    if (!r.ok) return '后台任务未能提交：' + r.error;
+    const job = r.job;
+    this.emit('notice', { text: `🛰️ 已把「${job.title}」丢到后台跑（任务号 ${job.id}），你可以继续聊别的` });
+    const L = [];
+    L.push(`已提交后台任务 \`${job.id}\`：${job.title}`);
+    L.push('任务在后台独立运行，**不会占用当前对话**。');
+    L.push('用 background_jobs（action=get, id=' + job.id + '）随时查进度与结论。');
+    L.push('现在请直接回复用户「已在后台开始处理」，然后继续处理用户的其它需求，**不要**在这里空等结果。');
+    return L.join('\n');
+  }
+
+  /** 查询 / 取消 / 清理后台任务 */
+  backgroundJobs(req) {
+    const h = this._bg();
+    if (!h) return '后台任务调度器不可用。';
+    const bg = h.bg;
+    const action = (req && req.action) || 'list';
+    if (action === 'get') {
+      const id = req && req.id;
+      if (!id) return '查询单个任务需要提供 id。';
+      const job = h.store.get(id);
+      if (!job) return '找不到后台任务 ' + id + '。用 action=list 看看有哪些。';
+      return bg.renderJob(job);
+    }
+    if (action === 'cancel') {
+      const id = req && req.id;
+      if (!id) return '取消任务需要提供 id。';
+      const r = h.runner.cancel(id);
+      if (!r.ok) return '取消失败：' + r.error;
+      this.emit('notice', { text: `🚫 已请求取消后台任务 ${id}` });
+      return r.queued ? `任务 ${id} 还在排队，已直接取消。` : `已向任务 ${id} 发出取消请求，它会在当前这一步结束后停下。`;
+    }
+    if (action === 'clear') {
+      const n = h.store.clearFinished();
+      return n ? `已清理 ${n} 条已结束的后台任务记录。` : '没有可清理的已结束任务。';
+    }
+    const jobs = h.store.list({ limit: Number(req && req.limit) > 0 ? Number(req.limit) : 12 });
+    const active = jobs.filter((j) => j.status === 'running' || j.status === 'queued').length;
+    const head = active ? `（${active} 个进行中）\n` : '';
+    return head + bg.renderJobList(jobs);
+  }
+
+  /** 后台任务事件 → UI 提示。后台任务的意义就是「别打扰你」，所以只在关键节点冒泡 */
+  _onBackgroundEvent(e) {
+    if (!e) return;
+    try {
+      if (e.type === 'jobStart') {
+        this.emit('notice', { text: `🛰️ 后台任务开始：${e.title}（${e.id}）` });
+      } else if (e.type === 'jobEnd') {
+        const bits = [];
+        if (e.changed) bits.push(`${e.changed} 个文件改动`);
+        if (e.branch) bits.push('分支 ' + e.branch);
+        if (e.prUrl) bits.push('PR ' + e.prUrl);
+        const tail = bits.length ? '（' + bits.join(' · ') + '）' : '';
+        this.emit('notice', {
+          text: `${e.ok ? '✅' : '❌'} 后台任务${e.ok ? '完成' : '结束'}：${e.title}${tail}　用 background_jobs 查看结论（id=${e.id}）`
+        });
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * 后台任务的实际执行体：复用子代理引擎，但工作目录指向独立 worktree。
+   * 与主对话完全解耦——它自己的中间过程不进主上下文，只在结束时回流一条结论。
+   */
+  async _backgroundRunTask({ job, cwd, readOnly, onProgress, isCancelled }) {
+    const sub = require('./subagents');
+    const c = config.conf();
+    const role = readOnly && (job.role === 'coder' || job.role === 'tester') ? 'explorer' : job.role;
+    if (readOnly && role !== job.role) {
+      onProgress('当前环境不允许后台写入，已降级为只读调研（角色 ' + role + '）');
+    }
+    let toolCalls = 0;
+    const runner = new sub.SubagentRunner({
+      listTools: () => tools.allTools(),
+      isCancelled: () => isCancelled() || this.cancelled,
+      extraSystem: this._backgroundExtraSystem(cwd, readOnly),
+      limits: {
+        // 后台任务不占用户注意力，可以给比子代理更宽的预算
+        maxSteps: c.get('background.maxSteps', 14),
+        maxToolCalls: c.get('background.maxToolCalls', 36),
+        timeoutMs: c.get('background.timeoutMs', 900000),
+        concurrency: 1
+      },
+      onEvent: (e) => {
+        if (e && e.type === 'subagentTool') {
+          toolCalls++;
+          onProgress('第 ' + (e.step || toolCalls) + ' 步：' + e.tool + (e.ok === false ? '（失败）' : ''));
+        }
+      },
+      callModel: (p) => this._subagentCallModel(p),
+      execute: (name, args, meta) => this._backgroundExecute(name, args, meta, { cwd, readOnly, job })
+    });
+    const spec = sub.normalizeSpec({ name: job.title || job.id, role, task: job.task }, 0);
+    const res = await runner.spawn(spec);
+    return {
+      ok: !!res.ok,
+      summary: res.summary || '',
+      error: res.ok ? '' : (res.stopReason || ''),
+      steps: res.steps || 0,
+      toolCalls: res.toolCalls || toolCalls,
+      stopReason: res.stopReason || ''
+    };
+  }
+
+  /** 后台任务的项目级约定：明确告诉它在哪个目录干活、能不能写 */
+  _backgroundExtraSystem(cwd, readOnly) {
+    const L = [];
+    L.push('你是**后台任务**：用户此刻正在做别的事，看不到你的中间过程，只会看到你最后的结论。');
+    if (cwd) L.push(`你的工作目录是：${cwd}。这是一份**独立签出的副本**，改这里不会影响用户正在编辑的文件。`);
+    if (readOnly) {
+      L.push('当前为**只读模式**：禁止写文件、禁止执行会改动磁盘的命令。只做调研并给出可执行的结论与改法建议。');
+    } else {
+      L.push('你可以在工作目录内自由修改文件，完成后你的改动会被打成补丁交给用户 review。');
+    }
+    L.push('禁止改动 node_modules、.git、dist、out 等目录。');
+    L.push('结论要自包含：说明你做了什么、改了哪些文件、还有什么风险，用户不会追问你。');
+    return L.join('\n');
+  }
+
+  /**
+   * 后台任务的工具执行：把相对路径重定向到 worktree 副本，并强制只读约束。
+   */
+  async _backgroundExecute(name, args, meta, envInfo) {
+    const kind = tools.kindOf(name);
+    const isWrite = kind === 'edit' || kind === 'write' || kind === 'delete';
+    if (envInfo.readOnly && (isWrite || kind === 'exec')) {
+      throw new Error('后台任务当前为只读模式，不能执行写入或命令类工具。请把建议的改动写进结论。');
+    }
+    const hook = await this.fireHook('preToolUse', {
+      tool: name, kind, args, cwd: envInfo.cwd, background: envInfo.job.id
+    });
+    if (hook.decision === 'deny') {
+      throw new Error('被生命周期钩子拦截：' + (hook.reason || '不允许该操作'));
+    }
+    if (this.policy && (isWrite || kind === 'exec')) {
+      const op = kind === 'exec' ? harness.OP.EXEC : harness.OP.WRITE;
+      const popts = kind === 'exec' ? { command: args && args.command } : { path: args && args.path };
+      let verdict = null;
+      try { verdict = this.policy.evaluate(op, popts); } catch (_) { verdict = null; }
+      if (verdict && verdict.decision === 'deny') {
+        throw new Error('被安全策略拒绝：' + (verdict.reason || '高危操作'));
+      }
+      // 后台任务没有 UI 通道，需要人工确认的操作一律拒绝。
+      // 在独立 worktree 里改文件是安全的（用户 review 补丁后才合并），
+      // 但删库跑路级别的命令仍然过不了策略引擎这一关。
+      if (verdict && verdict.decision === 'ask' && envInfo.job.workspace.mode !== 'worktree') {
+        throw new Error('该操作需要用户确认，后台任务无法执行。请把这一步写进结论交给主对话执行。');
+      }
+    }
+    const redirected = this._redirectArgsToCwd(args, envInfo);
+    return tools.execute(name, redirected, {
+      maxToolOutput: 4000,
+      sessionId: this.sessionId,
+      background: envInfo.job.id,
+      skipConfirm: true,
+      // worktree 副本在工作区之外，需要显式放行越界写入
+      outsideConfirmed: envInfo.job.workspace.mode === 'worktree'
+    });
+  }
+
+  /** 把工具参数里的相对路径重写到后台任务自己的工作目录下 */
+  _redirectArgsToCwd(args, envInfo) {
+    const cwd = envInfo && envInfo.cwd;
+    if (!cwd || !args || typeof args !== 'object') return args;
+    if (!envInfo.job || !envInfo.job.workspace || envInfo.job.workspace.mode !== 'worktree') return args;
+    const path0 = require('path');
+    const out = Object.assign({}, args);
+    for (const key of ['path', 'root', 'cwd']) {
+      const v = out[key];
+      if (typeof v !== 'string' || !v.trim()) continue;
+      const raw = v.trim();
+      if (path0.isAbsolute(raw) || /^[a-zA-Z]:[\\/]/.test(raw)) continue; // 绝对路径按原样，不擅自改写
+      out[key] = path0.join(cwd, raw);
+    }
+    return out;
+  }
+
+  /**
+   * 派生子代理执行任务（并行 / 组队），返回汇总 Markdown 回灌主上下文。
+   * 子代理拥有**独立的 messages**，其中间探索过程不会进入主会话上下文。
+   * 任何异常都收敛成文字结果，绝不打断主流程。
+   */
+  async spawnSubagents(req) {
+    const sub = require('./subagents');
+    const c = config.conf();
+    if (!c.get('subagents.enabled', true)) {
+      return '子代理功能已在设置中关闭（foxAi.subagents.enabled）。请自己完成该任务。';
+    }
+    const specs = sub.normalizeSpecs((req && req.agents) || []);
+    if (!specs.length) return '没有可派生的子代理：每个 agent 必须带具体的 task。';
+    const goal = (req && req.goal) || '';
+
+    const batchId = ++this._subagentBatch;
+    const runner = new sub.SubagentRunner({
+      listTools: () => tools.allTools(),
+      isCancelled: () => this.cancelled,
+      extraSystem: this._subagentExtraSystem(),
+      limits: {
+        maxSteps: c.get('subagents.maxSteps', 6),
+        maxToolCalls: c.get('subagents.maxToolCalls', 14),
+        timeoutMs: c.get('subagents.timeoutMs', 180000),
+        concurrency: c.get('subagents.concurrency', 3)
+      },
+      onEvent: (e) => this._onSubagentEvent(batchId, e),
+      callModel: (p) => this._subagentCallModel(p),
+      execute: (name, args, meta) => this._subagentExecute(name, args, meta)
+    });
+
+    const hasDeps = specs.some((s) => s.dependsOn && s.dependsOn.length);
+    this.emit('notice', {
+      text: `🧩 派生 ${specs.length} 个子代理${hasDeps ? '（按依赖分批协作）' : '（并行）'}：${specs.map((s) => s.name).join('、')}`
+    });
+
+    let results;
+    try {
+      if (hasDeps) {
+        const out = await runner.runTeam({ goal, members: specs });
+        results = out.results;
+      } else {
+        results = await runner.runParallel(specs);
+      }
+    } catch (e) {
+      return `子代理编排失败：${(e && e.message) || String(e)}。请自己完成该任务。`;
+    }
+    const okCount = results.filter((r) => r.ok).length;
+    this.emit('notice', { text: `🧩 子代理完成：${okCount}/${results.length} 成功` });
+    return sub.renderResults(results, { goal });
+  }
+
+  /**
+   * 任务收尾时从本轮对话里自动沉淀记忆（规则式抽取，零模型调用）。
+   * 只抓用户明确的纠正 / 约定 / 偏好（「以后都用…」「不要…」「记住…」），闲聊一律不收。
+   * 失败绝不影响主流程。
+   */
+  _harvestMemories() {
+    if (!this.topicMemory) return;
+    try {
+      if (!config.conf().get('memory.topics.autoHarvest', true)) return;
+      // 只看本轮新增的用户消息，避免整段历史被反复扫描
+      const from = this._harvestMark || 0;
+      const slice = this.messages.slice(from);
+      this._harvestMark = this.messages.length;
+      if (!slice.length) return;
+      const r = this.topicMemory.autoHarvest(slice);
+      if (r && r.written > 0) {
+        this.emit('notice', { text: `🧠 已自动沉淀 ${r.written} 条长期记忆（可在记忆面板查看或编辑）` });
+      }
+    } catch (_) {}
+  }
+
+  /** 附加给每个子代理的项目级约定（工作区路径等） */
+  _subagentExtraSystem() {
+    const root = this._workspaceRoot();
+    const lines = [];
+    if (root) lines.push(`当前工作区根目录：${root}。文件路径一律用相对工作区的路径。`);
+    lines.push('禁止改动 node_modules、.git、dist、out 等目录。');
+    return lines.join('\n');
+  }
+
+  /** 子代理的模型调用：复用主会话后端与凭据，但不向 UI 推流、不写主上下文 */
+  async _subagentCallModel({ messages, tools: toolDefs, spec }) {
+    if (this.cancelled) throw new Cancelled();
+    const cfg = this.cfg;
+    const b = selectBackend(cfg);
+    const options = {
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey,
+      model: cfg.model,
+      messages,
+      temperature: cfg.temperature,
+      // 子代理产出的是结论摘要，不需要主代理那么大的输出预算
+      maxTokens: Math.min(cfg.maxTokens || 2048, 2048),
+      timeout: cfg.timeout,
+      insecureHttpParser: cfg.insecureHttpParser,
+      streamFormat: cfg.streamFormat,
+      signal: this._abortCtrl ? this._abortCtrl.signal : undefined
+    };
+    if (toolDefs && toolDefs.length) options.tools = tools.toOpenAIToolsFrom(toolDefs);
+    const res = await llmLimiter.run(() => b.nonStream(options));
+    const raw = (res && res.toolCalls) || [];
+    return {
+      content: (res && res.content) || '',
+      toolCalls: raw.map((tc) => ({
+        id: tc.id,
+        name: tc.name || (tc.function && tc.function.name),
+        rawArgs: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {})
+      })).filter((tc) => tc.name)
+    };
+  }
+
+  /** 子代理的工具执行：走与主代理相同的 execute（含超时熔断），但结果不进主上下文 */
+  async _subagentExecute(name, args, meta) {
+    if (this.cancelled) throw new Cancelled();
+    const c0 = config.conf();
+    const kind = tools.kindOf(name);
+    // 写/执行类仍要过策略引擎与钩子，子代理不是法外之地
+    const hook = await this.fireHook('preToolUse', {
+      tool: name, kind, args, cwd: this._workspaceRoot(),
+      subagent: (meta && meta.spec && meta.spec.name) || ''
+    });
+    if (hook.decision === 'deny') {
+      throw new Error('被生命周期钩子拦截：' + (hook.reason || '不允许该操作'));
+    }
+    if (this.policy && (kind === 'edit' || kind === 'write' || kind === 'delete' || kind === 'exec')) {
+      const op = kind === 'exec' ? harness.OP.EXEC : harness.OP.WRITE;
+      const popts = kind === 'exec' ? { command: args && args.command } : { path: args && args.path };
+      let verdict = null;
+      try { verdict = this.policy.evaluate(op, popts); } catch (_) { verdict = null; }
+      if (verdict && verdict.decision === 'deny') {
+        throw new Error('被安全策略拒绝：' + (verdict.reason || '高危操作'));
+      }
+      // 子代理没有 UI 交互通道，需要人工确认的操作一律退回主代理执行，
+      // 绝不静默放行——否则「派个子代理」就成了绕过审批的后门。
+      if (verdict && verdict.decision === 'ask' && !c0.get('subagents.autoApproveWrites', false)) {
+        throw new Error('该操作需要用户确认，子代理无法执行。请把这一步的具体改动写进结论，交回主代理执行。');
+      }
+    }
+    // Checkpoint：子代理写文件同样先存档，保证一键回滚覆盖它的改动
+    if (this.checkpoints && (name === 'edit_file' || name === 'write_file' || name === 'delete_file') && args && args.path) {
+      try {
+        let before = null;
+        try { before = await ws.readText(ws.resolveUri(args.path, { allowOutside: true })); } catch (_) { before = null; }
+        await this.checkpoints.snapshot(args.path, before, {
+          tool: name,
+          title: '子代理 ' + ((meta && meta.spec && meta.spec.name) || '') + '：' + tools.titleOf(name, args),
+          step: this.stepCount
+        });
+      } catch (_) {}
+    }
+    return tools.execute(name, args, {
+      maxToolOutput: 4000,
+      sessionId: this.sessionId,
+      subagent: (meta && meta.spec && meta.spec.name) || '',
+      skipConfirm: true
+    });
+  }
+
+  /** 子代理事件 → UI 进度提示（尽量少刷屏：只报开始与结束） */
+  _onSubagentEvent(batchId, e) {
+    if (!e) return;
+    if (e.type === 'subagentStart') {
+      this.emit('notice', { text: `　${e.emoji || '•'} ${e.name}（${e.roleTitle}）开始：${String(e.task || '').slice(0, 60)}` });
+    } else if (e.type === 'subagentEnd') {
+      const s = (e.durationMs / 1000).toFixed(1);
+      this.emit('notice', {
+        text: `　${e.ok ? '✅' : '❌'} ${e.name} 结束（${e.steps} 轮 / ${s}s${e.stopReason && e.stopReason !== 'done' ? ' / ' + e.stopReason : ''}）`
+      });
+    } else if (e.type === 'teamStage') {
+      this.emit('notice', { text: `　▸ 第 ${e.index}/${e.total} 批：${(e.members || []).join('、')}` });
+    }
+  }
+
+  /**
+   * 触发生命周期钩子；钩子系统本身异常绝不打断主流程。
+   * @returns {Promise<{decision:string, reason:string, injects:string[], ran:number}>}
+   */
+  async fireHook(event, payload) {
+    const fallback = { decision: 'allow', reason: '', injects: [], ran: 0, results: [] };
+    if (!this.hooks) return fallback;
+    try {
+      return await this.hooks.fire(event, payload || {});
+    } catch (e) {
+      try {
+        require('./log').appendLog('hooks', '[fire-error] event=' + event + ' ' + (e && e.message));
+      } catch (_) {}
+      return fallback;
+    }
+  }
+
+  /** 当前工作区根目录（无工作区时返回空串） */
+  _workspaceRoot() {
+    try {
+      const folders = vscode.workspace.workspaceFolders;
+      return folders && folders.length ? folders[0].uri.fsPath : '';
+    } catch (_) {
+      return '';
+    }
   }
 
   /* ---------- 控制 ---------- */
@@ -508,6 +998,25 @@ class AgentSession {
       // 深度思考开关同理：聊天窗口顶部的芯片一点即生效，不用重开会话
       if (live && live.deepThinking) this.cfg.deepThinking = live.deepThinking;
     } catch (_) {}
+
+    // ---- Agent 模式（code / architect / ask / debug）----
+    // 每轮直读设置，切模式立刻生效、不用重建会话；模式定义是模块级常量，不占额外内存。
+    this.mode = null;
+    try {
+      const modes = require('./modes');
+      const c0 = config.conf();
+      const modeId = c0.get('modes.current', modes.DEFAULT_MODE);
+      if (modeId && modeId !== modes.DEFAULT_MODE) {
+        this.mode = modes.resolveMode(modeId, c0.get('modes.overrides', null));
+        // 每模式独立模型：架构用强模型、问答用便宜模型，只覆盖 model 字段
+        const mm = modes.modelFor(modeId, c0.get('modes.models', null));
+        if (mm && mm !== this.cfg.model) {
+          this._modeModelFrom = this.cfg.model;
+          this.cfg.model = mm;
+          this.emit('notice', { text: `${this.mode.emoji} ${this.mode.label}模式：本轮改用模型「${mm}」` });
+        }
+      }
+    } catch (_) { this.mode = null; }
     const cfg = this.cfg;
     const { appendLog } = require('./log');
     const exp = [];
@@ -608,9 +1117,18 @@ class AgentSession {
     }
 
     // 长期记忆：把用户偏好/约定/教训注入系统提示词
+    // 结构化主题记忆走「按需加载」：只挑与本次提问最相关的 2~3 个主题，受字符预算约束，
+    // 避免记忆越攒越多后把上下文吃光（旧的扁平记忆是全量注入，这是它最大的问题）。
     let memoryText = '';
     try {
-      memoryText = this.memory.renderForPrompt();
+      if (this.topicMemory) {
+        const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
+        if (rel && rel.text) memoryText = rel.text;
+      }
+    } catch (_) {}
+    try {
+      const flat = this.memory.renderForPrompt();
+      if (flat) memoryText = memoryText ? memoryText + '\n\n' + flat : flat;
     } catch (_) {}
     if (memoryText) system += '\n\n【长期记忆】\n' + memoryText;
 
@@ -627,6 +1145,31 @@ class AgentSession {
       planTaskText = this.planTasks.renderForPrompt();
     } catch (_) {}
     if (planTaskText) system += '\n\n【项目任务清单】\n' + planTaskText;
+
+    // Agent 模式人格：非默认模式才注入后缀（code 模式一个字都不加，不浪费 token）
+    if (this.mode) {
+      try {
+        const suffix = require('./modes').renderForPrompt(this.mode);
+        if (suffix) system += '\n\n' + suffix;
+      } catch (_) {}
+    }
+
+    // 项目根规则（CLAUDE.md / AGENTS.md / .cursorrules …）：与 Claude Code、Roo Code 生态互通。
+    // 懒加载 + mtime 缓存：模块只在开关打开时 require，内部靠 stat 签名判断是否要重读，
+    // 文件没改就直接复用上次渲染好的字符串，不重复读盘、不常驻 watcher。
+    try {
+      if (config.conf().get('projectRules.enabled', true)) {
+        const rulesRoot = this._workspaceRoot();
+        if (rulesRoot) {
+          const projectRules = require('./projectRules');
+          const rulesText = projectRules.renderForPrompt({
+            root: rulesRoot,
+            budget: config.conf().get('projectRules.budget', 6000)
+          });
+          if (rulesText) system += '\n\n' + rulesText;
+        }
+      }
+    } catch (_) {}
 
     // 项目结构：自动扫描工作区并注入概览，让 agent 始终知道文件布局；
     // 多语言项目会明确提示「按语言拆分、每个职责一个文件」地写入。
@@ -818,6 +1361,8 @@ class AgentSession {
           }
           // 任务结束前尝试一次上下文压缩（防止戛然而止导致压缩永远不触发）
           try { await this._maybeAutoCompress(queryText, envBrief); } catch (_) {}
+          // 结构化记忆自动沉淀：规则式抽取用户的纠正 / 约定 / 偏好，零模型调用、不额外花钱
+          this._harvestMemories();
           this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
           return { finished: true, text: visibleText };
         }
@@ -969,6 +1514,32 @@ class AgentSession {
       streamFormat: cfg.streamFormat,
       signal: this._abortCtrl ? this._abortCtrl.signal : undefined
     }));
+  }
+
+  /**
+   * 调用“任意候选模型”（Best-of-N 多模型对比用）。与 _silentCall 不同，这里走候选自己的
+   * provider/model/baseUrl/apiKey，而不是当前会话的主模型。复用 selectBackend + llmLimiter，
+   * 确保并发受全局 LLM 信号量约束，不堆内存。返回 { ok, text, error }。
+   */
+  async callCandidate(c, req) {
+    if (this.cancelled) throw new Cancelled();
+    const transport = (c && c.transport) || 'openai';
+    const messages = [];
+    if (req && req.system) messages.push({ role: 'system', content: req.system });
+    messages.push({ role: 'user', content: (req && req.prompt) ? req.prompt : '' });
+    const baseUrl = c.baseUrl || this.cfg.baseUrl;
+    const apiKey = c.apiKey || this.cfg.apiKey;
+    const model = c.model || this.cfg.model;
+    const temperature = (req && typeof req.temperature === 'number') ? req.temperature
+      : (c.temperature != null ? c.temperature : this.cfg.temperature);
+    const maxTokens = Math.min(this.cfg.maxTokens || 4096, 4096);
+    const timeout = Math.min(this.cfg.timeout || 120000, 120000);
+    const doCall = transport === 'anthropic'
+      ? () => anthropic.chatNonStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, timeout, insecureHttpParser: this.cfg.insecureHttpParser })
+      : () => chatNonStream({ baseUrl, apiKey, model, messages, temperature, maxTokens, timeout, insecureHttpParser: this.cfg.insecureHttpParser });
+    const r = await llmLimiter.run(doCall);
+    const text = (r && (r.content != null ? r.content : r.text)) || '';
+    return { ok: !!(r && !r.error) && !!text, text, error: (r && r.error) ? r.error : '' };
   }
 
   /** 自动代码审查：本轮有代码写操作后触发一次只读审查子代理（后台异步，不阻塞主代理回复） */
@@ -1549,8 +2120,68 @@ class AgentSession {
     this.emit('toolStart', { id: uiId, name, kind, title, args, preview });
     this.state = 'tool';
 
+    // ---- Agent 模式门控（架构 / 问答模式的文件与工具限制）----
+    // 这是最外层的硬约束：模式说不行就是不行，压过 autoApprove 与策略引擎。
+    // 默认 code 模式下 this.mode 为 null，这段直接跳过，零开销。
+    if (this.mode) {
+      let mv = { allowed: true };
+      try {
+        mv = require('./modes').isToolAllowed(this.mode, { name, kind, path: args && args.path });
+      } catch (_) { mv = { allowed: true }; }
+      if (!mv.allowed) {
+        this.emit('toolEnd', { id: uiId, ok: false, output: mv.reason, rejected: true });
+        this.pushToolResult(callId, name, mv.reason, true, {
+          reason: '当前 Agent 模式不允许该操作',
+          suggest: '不要重试同一操作。按当前模式的职责继续（架构模式只出方案与文档，问答模式只解释不改动），或提示用户切换模式。'
+        });
+        if (this.task) {
+          try { await this.taskManager.appendStep(this.task.id, { kind: 'tool', name, decision: 'mode-deny', reason: mv.reason }); } catch (_) {}
+        }
+        return;
+      }
+    }
+
     // ---- Harness：策略引擎拦截危险写/执行 ----
     let skipApprove = false;
+
+    // ---- Auto Mode：LLM 分类门控（allow / deny / ask），默认关 ----
+    // 仅对“需要审批的动作”（写/改/删/执行）生效；读/查类工具已由 autoApprove 处理，零开销跳过。
+    // 规则快路径命中即返回；LLM 兜底分类按 tool+参数 指纹缓存，不重复烧模型。
+    // 此处只置 skipApprove 或拦截返回；策略引擎(policy)与 preToolUse 钩子的硬约束仍在其后执行，
+    // 因此“人工规约(hook ask) > 策略引擎 > Auto Mode 自动放行”的优先级天然成立。
+    if (config.conf().get('autoMode.enabled', false)) {
+      const AM_KINDS = { edit: 1, write: 1, delete: 1, exec: 1 };
+      if (AM_KINDS[kind]) {
+        try {
+          const autoMode = require('./autoMode');
+          const amRes = await autoMode.classify(name, kind, args, {
+            config: config.conf().get('autoMode', {}) || {},
+            llm: async (prompt) => {
+              const r = await this._silentCall([{ role: 'user', content: prompt }]);
+              return typeof r === 'string' ? r : (r && r.text ? r.text : (r && r.content ? r.content : ''));
+            }
+          });
+          if (amRes.decision === 'deny') {
+            const amMsg = amRes.reason ? ('Auto Mode 判定拒绝：' + amRes.reason) : 'Auto Mode 判定该操作不安全而拒绝';
+            this.emit('toolEnd', { id: uiId, ok: false, output: amMsg, rejected: true });
+            this.pushToolResult(callId, name, amMsg, true, {
+              reason: 'Auto Mode（LLM 分类门控）判定该操作不安全',
+              suggest: '不要重复尝试同一操作；若确需执行，请在设置关闭 Auto Mode 或将其加入 autoMode.allow 名单，并先与用户确认。'
+            });
+            if (this.task) {
+              try { await this.taskManager.appendStep(this.task.id, { kind: 'tool', name, decision: 'auto-mode-deny', reason: amMsg }); } catch (_) {}
+            }
+            return;
+          }
+          if (amRes.decision === 'allow') {
+            skipApprove = true;
+            if (amRes.reason) this.emit('notice', { text: '🤖 Auto Mode：自动放行（' + amRes.reason + '）' });
+          }
+          // ask → 不置 skipApprove，走下方正常审批流
+        } catch (_) { /* Auto Mode 异常不影响主流程，按默认审批 */ }
+      }
+    }
+
     if (this.policy) {
       let op = null;
       const popts = { label: title };
@@ -1613,8 +2244,35 @@ class AgentSession {
       }
     }
 
+    // ---- 生命周期钩子 preToolUse：用户自定义的确定性安全门 ----
+    // deny → 直接阻断；ask → 强制人工确认（可覆盖 autoApprove / 策略引擎的 auto）；allow → 显式放行。
+    const preHook = await this.fireHook('preToolUse', {
+      tool: name,
+      kind,
+      args,
+      cwd: this._workspaceRoot ? this._workspaceRoot() : undefined
+    });
+    if (preHook.decision === 'deny') {
+      const hookMsg = preHook.reason || '被生命周期钩子阻止';
+      this.emit('toolEnd', { id: uiId, ok: false, output: hookMsg, rejected: true });
+      this.pushToolResult(callId, name, hookMsg, true, {
+        reason: '用户配置的 preToolUse 钩子阻止了该操作',
+        suggest: '这是项目的硬性规约，不要重复尝试同一操作；改换方案或询问用户。'
+      });
+      if (this.task) {
+        try { await this.taskManager.appendStep(this.task.id, { kind: 'tool', name, decision: 'hook-deny', reason: hookMsg }); } catch (_) {}
+      }
+      return;
+    }
+    if (preHook.decision === 'ask') {
+      skipApprove = false; // 钩子要求人工确认，压过一切自动放行
+      if (preHook.reason) this.emit('notice', { text: '🪝 ' + preHook.reason });
+    }
+    if (preHook.decision === 'allow' && preHook.ran > 0) skipApprove = true;
+
     // use_skill 始终先询问用户（用前询问），不被 autoApprove 跳过
     if (name === 'use_skill') skipApprove = false;
+    if (preHook.decision === 'ask') skipApprove = false;
 
     const decision = skipApprove || name === 'save_memory' || name === 'get_memory'
       || name === 'present_plan' || name === 'revise_plan'
@@ -1669,14 +2327,23 @@ class AgentSession {
       blockedCommands: this.cfg.blockedCommands,
       recordUndo: (e) => undo.record(e),
       memory: this.memory,
+      topicMemory: this.topicMemory,
       skills: this.skills,
       planTasks: this.planTasks,
       context: this.context,
+      // 子代理派生入口：spawn_subagent 工具通过它拿到主会话的模型凭据与工具执行链路
+      spawnSubagents: (req) => this.spawnSubagents(req),
+      // 后台任务入口：提交后立刻返回，不阻塞当前对话
+      runBackgroundAgent: (req) => this.runBackgroundAgent(req),
+      backgroundJobs: (req) => this.backgroundJobs(req),
       onStream: (chunk) => this.emit('toolStream', { id: uiId, text: chunk }),
       // 生图工具用它把生成的图片直接渲染到聊天 UI（复用 0.8.42 的 image 渲染链路）
       emitImage: (img) => this.emit('image', img || {}),
       outsideConfirmed,
       skipConfirm: extSkipConfirm,
+      // Best-of-N 多模型对比：把“调用任意候选模型”与“评委 LLM（复用 _silentCall）”能力暴露给工具层
+      callModel: (c, req) => this.callCandidate(c, req),
+      llm: (m, o) => this._silentCall(m, o),
       sessionId: this.sessionId
     };
 
@@ -1688,13 +2355,64 @@ class AgentSession {
       let _reviewBefore = null;
       if (name === 'edit_file' || name === 'write_file' || name === 'delete_file') {
         try { _reviewBefore = await ws.readText(ws.resolveUri(args.path, { allowOutside: true })); } catch (_) { _reviewBefore = null; }
+        // Checkpoint：写入前把文件真实内容存档，供「一键回滚」还原
+        if (this.checkpoints) {
+          try {
+            await this.checkpoints.snapshot(args.path, _reviewBefore, {
+              tool: name,
+              title,
+              step: this.stepCount
+            });
+          } catch (_) {}
+        }
       }
+      // ---- 冲突感知：写前比对，若文件自读取后被外部修改则暂停等人工裁决 ----
+      if (config.conf().get('conflictWatch.enabled', true) && (name === 'edit_file' || name === 'write_file')) {
+        try {
+          const cw = require('./conflictWatch');
+          const cUri = ws.resolveUri(args.path, { allowOutside: true });
+          let cStat = null;
+          try { cStat = await vscode.workspace.fs.stat(cUri); } catch (_) { cStat = null; }
+          if (cStat) {
+            const verdict = cw.check(args.path, cStat.mtime, cStat.size);
+            if (verdict.conflict) {
+              const msg = '⚠️ 冲突感知：文件「' + args.path + '」自你上次读取后已被外部（很可能是你本人）修改'
+                + '（上次 mtime=' + new Date(verdict.snapshot.mtime).toISOString() + '，当前 mtime=' + new Date(verdict.current.mtime).toISOString() + '）。'
+                + '为避免覆盖你的改动，本次 ' + name + ' 已暂停。请先 read_file 读取最新内容，再决定如何合并，不要盲目覆盖。';
+              this.emit('toolEnd', { id: uiId, ok: false, output: msg, rejected: true });
+              this.pushToolResult(callId, name, msg, true, {
+                reason: '冲突感知：文件在读取后被外部修改，已暂停写操作等待人工裁决',
+                suggest: '先 read_file 最新内容，再决定如何合并；不要盲目覆盖。'
+              });
+              if (this.task) { try { await this.taskManager.appendStep(this.task.id, { kind: 'tool', name, decision: 'conflict-pause', reason: msg }); } catch (_) {} }
+              return;
+            }
+          }
+        } catch (_) { /* 冲突感知异常不阻断正常写入 */ }
+      }
+
       const output = await tools.execute(name, args, execCtx);
       this.emit('toolEnd', { id: uiId, ok: true, output });
+      // ---- 冲突感知：read_file 成功后记录快照，供后续写前比对 ----
+      if (name === 'read_file' && args && args.path && config.conf().get('conflictWatch.enabled', true)) {
+        try {
+          const cw = require('./conflictWatch');
+          const rUri = ws.resolveUri(args.path, { allowOutside: true });
+          let rStat = null;
+          try { rStat = await vscode.workspace.fs.stat(rUri); } catch (_) { rStat = null; }
+          if (rStat) cw.recordRead(args.path, rStat.mtime, rStat.size);
+        } catch (_) { /* 快照记录失败不影响读结果 */ }
+      }
       // ---- Harness：自动验证层 ----
       let finalOutput = output;
       const verifyNote = await this._autoVerify(name, args, output);
       if (verifyNote) finalOutput = output + '\n\n[自动验证] ' + verifyNote;
+      // ---- 生命周期钩子 postToolUse：自动 lint / 格式化 / 追加观察 ----
+      const postHook = await this.fireHook('postToolUse', { tool: name, kind, args, output: String(output || '') });
+      if (postHook.injects.length) finalOutput = finalOutput + '\n\n' + postHook.injects.join('\n');
+      if (postHook.decision === 'deny' && postHook.reason) {
+        finalOutput = finalOutput + '\n\n[钩子告警] ' + postHook.reason;
+      }
       const okMeta = {};
       if (name === 'run_command') {
         const cm = String(output).match(/退出码\s*(\-?\d+)/);
@@ -1706,6 +2424,15 @@ class AgentSession {
         let after = null;
         if (name !== 'delete_file') {
           try { after = await ws.readText(ws.resolveUri(args.path, { allowOutside: true })); } catch (_) { after = null; }
+          // 冲突感知：写入成功后刷新该文件快照，避免把 agent 自己的写入当成“外部修改”
+          if (config.conf().get('conflictWatch.enabled', true)) {
+            try {
+              const cw = require('./conflictWatch');
+              const aUri = ws.resolveUri(args.path, { allowOutside: true });
+              let aStat = null; try { aStat = await vscode.workspace.fs.stat(aUri); } catch (_) { aStat = null; }
+              if (aStat) cw.noteWrite(args.path, aStat.mtime, aStat.size);
+            } catch (_) {}
+          }
         }
         const summary = this._reviewSummary(name, args, _reviewBefore, after);
         const existing = this._pendingReview.find((c) => c.path === args.path);
@@ -1932,6 +2659,9 @@ class AgentSession {
         }
       });
     });
+    // 审批决策已出，立即恢复运行状态，避免状态栏长时间卡在“等待你确认操作…”
+    this.state = 'running';
+    this.emit('state', { state: 'running' });
     if (decision === 'always') {
       this.alwaysAllow.add(req.name);
       return 'approve';

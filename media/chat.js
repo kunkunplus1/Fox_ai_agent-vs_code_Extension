@@ -30,6 +30,7 @@
   const btnPlanTasks = $('btnPlanTasks');
   const planPanel = $('planPanel');
   const planList = $('planList');
+  const btnPlanClearDone = $('btnPlanClearDone');
   const btnContextUsage = $('btnContextUsage');
   const contextPanel = $('contextPanel');
   const contextBody = $('contextBody');
@@ -395,7 +396,10 @@
             m.reasonEl.querySelector('.reasoning-head').addEventListener('click', () => {
               m.reasonEl.classList.toggle('open');
             });
-            m.bubble.parentElement.insertBefore(m.reasonEl, m.bubble);
+            const wrap = m.bubble.parentElement;
+            // 插入到消息容器最前（角色标签「狐狸 AI」之上），使思考链成为独立、全宽的一行，
+            // 避免被插在角色标签与气泡之间造成视觉错位；父节点缺失（已结束的消息）时跳过。
+            if (wrap) wrap.insertBefore(m.reasonEl, wrap.firstChild || m.bubble);
           }
           const body = m.reasonEl.querySelector('.reasoning-body');
           body.innerHTML = renderReasoning(m.reasoning);
@@ -783,6 +787,13 @@
   btnPlanTasks.addEventListener('click', () => planPanel.classList.toggle('hidden'));
   $('btnPlanClose').addEventListener('click', () => planPanel.classList.add('hidden'));
   $('btnPlanOpenFile').addEventListener('click', () => vscode.postMessage({ type: 'openPlanTasks' }));
+  if (btnPlanClearDone) {
+    btnPlanClearDone.addEventListener('click', () => {
+      btnPlanClearDone.disabled = true;
+      btnPlanClearDone.textContent = t('清理中…');
+      vscode.postMessage({ type: 'planTaskClearCompleted' });
+    });
+  }
   planList.addEventListener('click', (e) => {
     const delBtn = e.target.closest('.plan-del');
     if (delBtn) {
@@ -1127,7 +1138,22 @@
         case 'reasoning': {
           const m = live[msg.id];
           if (!m) break;
-          m.reasoning += msg.text;
+          const t = msg.text || '';
+          // 兼容「增量」「全量重发」「完全相同片段循环重发」三种后端行为，避免思考链文字重复错位：
+          // 1) 全量重发（t 是 m 的扩展前缀）→ 替换为最新全量；
+          // 2) 相同片段已存在于 m（循环重复重发）→ 跳过；
+          // 3) 其余 → 正常追加。
+          if (m.reasoning) {
+            if (t.length > m.reasoning.length && t.startsWith(m.reasoning)) {
+              m.reasoning = t;
+            } else if (t.length > 0 && m.reasoning.includes(t)) {
+              // 完全相同片段已存在，跳过，避免重复拼接
+            } else {
+              m.reasoning += t;
+            }
+          } else {
+            m.reasoning = t;
+          }
           m.dirty = true;
           scheduleRender();
           break;
@@ -1215,6 +1241,10 @@
           break;
         case 'planTasks':
           renderPlanTasks(msg.items);
+          if (btnPlanClearDone) {
+            btnPlanClearDone.disabled = false;
+            btnPlanClearDone.textContent = t('清理已完成');
+          }
           break;
         case 'planPending':
           addPlanPending(msg);

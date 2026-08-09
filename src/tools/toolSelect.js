@@ -34,7 +34,19 @@ const CORE_ALWAYS = new Set([
   // 生图通道：generate_image 的工具名与中文 query「画/生成图片」几乎不可能语义命中，
   // 且不是时效/文件/执行类工具；一旦开启 dynamicSubset 就会被子集排除，模型“看不到”也就调不到，
   // 导致用户说“画个女孩”时模型退回用 SVG/代码代替。必须常驻。
-  'generate_image'
+  'generate_image',
+  // 子代理派生：用户中文说的是「并行 / 同时查 / 分头行动」，与英文工具名匹配不上；
+  // 一旦被子集排除，模型只会自己串行硬啃，并行能力形同虚设。必须常驻。
+  'spawn_subagent',
+  // 全仓库语义检索：用户问「登录逻辑在哪」时，query 里根本不会出现 codebase/search 这类词，
+  // 语义打分必然落空；一旦被排除，模型就退回 grep 式盲找。必须常驻。
+  'search_codebase',
+  // 后台任务：用户说「后台帮我做」「跑完了吗」，中文 query 与 background 匹配不上；
+  // 且 background_jobs 是唯一取回后台结论的通道，被排除等于结果永远拿不回来。必须常驻。
+  'run_background_agent', 'background_jobs',
+  // 自定义命令模板：用户嘴里说的是「按项目里的审查流程来」，与 slash/command 这些英文词毫无交集，
+  // 被子集排除后 agent 就永远发现不了项目已有的标准流程模板。必须常驻。
+  'run_slash_command'
 ]);
 
 function tokenize(text) {
