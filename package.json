@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "0.8.85",
+  "version": "0.8.90",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "engines": {
@@ -28,7 +28,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -1518,42 +1518,115 @@
           "foxAi.inlineCompletion.enabled": {
             "type": "boolean",
             "default": true,
+            "order": 0,
             "description": "%foxai.n249%"
           },
-          "foxAi.inlineCompletion.debounce": {
-            "type": "number",
-            "default": 350,
-            "description": "%foxai.n250%"
+          "foxAi.inlineCompletion.provider": {
+            "type": "string",
+            "default": "",
+            "order": 1,
+            "enum": [
+              "",
+              "llamacpp",
+              "ollama",
+              "lmstudio",
+              "deepseek",
+              "zhipu",
+              "dashscope",
+              "moonshot",
+              "siliconflow",
+              "openrouter",
+              "custom"
+            ],
+            "enumDescriptions": [
+              "跟随主对话模型（默认）",
+              "本地 llama.cpp server（默认 http://127.0.0.1:8080/v1）",
+              "本地 Ollama（默认 http://127.0.0.1:11434/v1）",
+              "本地 LM Studio（默认 http://127.0.0.1:1234/v1）",
+              "DeepSeek 深度求索",
+              "智谱 GLM（BigModel 开放平台）",
+              "阿里云百炼 / 通义千问（兼容模式）",
+              "月之暗面 Kimi",
+              "硅基流动 SiliconFlow",
+              "OpenRouter",
+              "自定义 OpenAI 兼容服务"
+            ],
+            "description": "%foxai.n265%"
+          },
+          "foxAi.inlineCompletion.baseUrl": {
+            "type": "string",
+            "default": "",
+            "order": 2,
+            "description": "%foxai.n266%"
+          },
+          "foxAi.inlineCompletion.apiKey": {
+            "type": "string",
+            "default": "",
+            "order": 3,
+            "markdownDescription": "%foxai.n267%"
+          },
+          "foxAi.inlineCompletion.model": {
+            "type": "string",
+            "default": "",
+            "order": 4,
+            "description": "%foxai.n268%"
           },
           "foxAi.inlineCompletion.maxTokens": {
             "type": "number",
             "default": 256,
+            "order": 5,
             "description": "%foxai.n251%"
           },
           "foxAi.inlineCompletion.contextLines": {
             "type": "number",
             "default": 60,
+            "order": 6,
             "description": "%foxai.n252%"
+          },
+          "foxAi.inlineCompletion.suffixLines": {
+            "type": "number",
+            "default": 30,
+            "order": 6,
+            "description": "%foxai.n269%"
+          },
+          "foxAi.inlineCompletion.fimStrategy": {
+            "type": "string",
+            "default": "auto",
+            "order": 6,
+            "enum": ["auto", "diffusion", "codellama", "deepseek", "starcoder", "none"],
+            "enumDescriptions": [
+              "自动：根据模型名选择 FIM 格式（推荐）",
+              "通用 <fim_prefix>/<fim_suffix>/<fim_middle>",
+              "CodeLlama <PRE>/<SUF>/<MID>",
+              "DeepSeek Coder <｜fim▁begin｜>/<｜fim▁hole｜>/<｜fim▁end｜>",
+              "StarCoder / QwenCoder <fim_prefix>/<fim_suffix>/<fim_middle>",
+              "不用 FIM，但保留后文描述"
+            ],
+            "description": "%foxai.n270%"
           },
           "foxAi.inlineCompletion.useProjectContext": {
             "type": "boolean",
             "default": true,
+            "order": 7,
             "description": "%foxai.n253%"
           },
           "foxAi.inlineCompletion.projectContextChars": {
             "type": "number",
             "default": 1000,
+            "order": 8,
             "description": "%foxai.n254%"
-          },
-          "foxAi.inlineCompletion.model": {
-            "type": "string",
-            "default": "",
-            "description": "专用补全模型 ID。留空则复用主对话模型；建议填一个轻量、低延迟的模型专门做行内补全（对标 Copilot 的专用补全引擎，避免拖慢/烧主模型）。"
           },
           "foxAi.inlineCompletion.maxFileLines": {
             "type": "number",
             "default": 8000,
+            "order": 9,
             "description": "超过此行数的大文件将跳过行内补全（Copilot 也会对超大文件限流），避免无意义的高频请求与 token 消耗。"
+          },
+          "foxAi.inlineCompletion.debounce": {
+            "type": "number",
+            "default": 350,
+            "order": 10,
+            "description": "%foxai.n250%"
           }
         }
       },

@@ -601,7 +601,7 @@ class AgentSession {
 
   let baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol, queryText);
     const beforeKb = baseSystem;
-    let system = kb.augmentSystemPrompt(baseSystem, queryText);
+    let system = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId);
     let knowledgeText = '';
     if (system.length > beforeKb.length) {
       knowledgeText = system.slice(beforeKb.length).replace(/^\n+/, '');
@@ -696,7 +696,7 @@ class AgentSession {
             this._forceText = true;
             this.protocol = 'text';
             baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol);
-            system = kb.augmentSystemPrompt(baseSystem, queryText);
+            system = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId);
             knowledgeText = system.length > baseSystem.length ? system.slice(baseSystem.length).replace(/^\n+/, '') : '';
             if (memoryText) system += '\n\n【长期记忆】\n' + memoryText;
             if (skillText) system += '\n\n【用户技能】\n' + skillText;
@@ -1676,7 +1676,8 @@ class AgentSession {
       // 生图工具用它把生成的图片直接渲染到聊天 UI（复用 0.8.42 的 image 渲染链路）
       emitImage: (img) => this.emit('image', img || {}),
       outsideConfirmed,
-      skipConfirm: extSkipConfirm
+      skipConfirm: extSkipConfirm,
+      sessionId: this.sessionId
     };
 
     try {
@@ -2004,27 +2005,40 @@ class AgentSession {
     const threshold = as.threshold > 0 ? as.threshold : 0.75;
     let should = false;
     let reason = '';
-    let used = 0;
-    let fixedTokens = 0;
+    let dataBefore = null;
     if (cw) {
       const baseSys = buildSystemPrompt(this.cfg, envBrief || '', this.protocol);
       const toolsText = this.protocol === 'native'
         ? JSON.stringify(tools.toOpenAITools())
         : tools.toTextManual();
-      fixedTokens = contextUsage.estimateTokens(baseSys) + contextUsage.estimateTokens(toolsText) + 800;
-      used = contextUsage.estimateMessages(msgs) + fixedTokens;
-      if (used / cw >= threshold) { should = true; reason = 'usage'; }
+      // 与面板 _emitContextUsage 统一口径：包含系统提示词、工具定义、历史、预留输出槽
+      dataBefore = contextUsage.measureContext({
+        baseSystem: baseSys,
+        toolsText,
+        history: msgs,
+        maxTokens: this.cfg.maxTokens || 0,
+        contextWindow: cw
+      });
+      if (dataBefore.percentage / 100 >= threshold) { should = true; reason = 'usage'; }
     } else if (compressible >= 6) {
       should = true;
       reason = 'turn-based';
     }
     if (!should) return;
-    if (compressible < 1) return; // 没有可压缩消息，无法释放空间
+    if (compressible < 1) {
+      // 已超阈值但没有可压缩的对话消息：占用主要来自固定开销（系统提示词、工具定义、知识库等）
+      const fixedPct = dataBefore ? Math.round(((dataBefore.totalMeasured - dataBefore.historyTokens) / dataBefore.contextWindow) * 100) : 0;
+      appendLog('autoSummarize', '[skip] no compressible messages; fixed cost dominates ~' + fixedPct + '%');
+      this.emit('notice', {
+        text: `上下文已用约 ${usedPct}%，但可压缩的对话消息不足。当前占用主要由系统提示词、工具定义、知识库/任务/记忆等固定开销构成，无法通过压缩释放。如需减少占用，可关闭不用的 MCP/工具或缩小知识库范围。`
+      });
+      return;
+    }
 
     // 取较早消息去压缩，保留最近 keep 条
     const { clampMessage } = require('./messageSanitize');
     const toCompress = msgs.slice(0, compressible).map((m) => clampMessage(m, 8000));
-    const usedPct = cw > 0 ? Math.round((used / cw) * 100) : 0;
+    const usedPct = dataBefore ? Math.round(dataBefore.percentage) : 0;
     appendLog('autoSummarize', '[compress] used%=' + usedPct + ' threshold%=' + Math.round(threshold * 100) + ' compressible=' + toCompress.length + ' reason=' + reason);
     this.emit('notice', {
       text: `上下文已用约 ${usedPct}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`
@@ -2032,13 +2046,30 @@ class AgentSession {
 
     try {
       const out = await kbOrg.summarizeConversation(this.context, toCompress, {
-        onLog: (t) => { try { this.emit('notice', { text: '[知识库-2] ' + t }); } catch (_) {} }
+        onLog: (t) => { try { this.emit('notice', { text: '[知识库-2] ' + t }); } catch (_) {} },
+        sessionId: this.sessionId
       });
       if (out) {
         kb.invalidate(); // 重新索引，把新摘要纳入 RAG
         msgs.splice(0, compressible); // 就地裁剪，保持数组引用一致（chatView 同步看到）
         try { this.emit('autoSummary', { file: out, count: toCompress.length }); } catch (_) {}
         appendLog('autoSummarize', '[ok] compressed=' + toCompress.length + ' file=' + out);
+
+        // 压缩完成后立即刷新上下文用量面板：用统一口径重新计算，让用户看到「对话消息」部分已释放
+        if (dataBefore) {
+          try {
+            const dataAfter = contextUsage.measureContext({
+              baseSystem: dataBefore.raw.baseSystem,
+              toolsText: dataBefore.raw.toolsText,
+              history: msgs,
+              maxTokens: this.cfg.maxTokens || 0,
+              contextWindow: cw
+            });
+            dataAfter.compressMeta = this._buildCompressMeta();
+            this.emit('contextUsage', dataAfter);
+          } catch (_) {}
+        }
+
         this.emit('notice', {
           text: `已把较早 ${toCompress.length} 条对话压缩进知识库-2，上下文已释放；后续回答会结合检索到的摘要继续。`
         });
@@ -2067,8 +2098,17 @@ class AgentSession {
         maxTokens: parts.maxTokens,
         contextWindow: parts.contextWindow
       });
+      data.compressMeta = this._buildCompressMeta();
       this.emit('contextUsage', data);
     } catch (_) {}
+  }
+
+  _buildCompressMeta() {
+    try {
+      return contextUsage.buildCompressMeta(this.cfg && this.cfg.autoSummarize, (this.messages || []).length);
+    } catch (_) {
+      return null;
+    }
   }
 
   /** 基于本轮输出长度增量，实时估算+重推上下文用量 */
@@ -2094,6 +2134,7 @@ class AgentSession {
         contextWindow: parts.contextWindow
       });
       data.estOutputChars = extraChars;
+      data.compressMeta = this._buildCompressMeta();
       this.emit('contextUsage', data);
     } catch (_) {}
   }

@@ -117,11 +117,13 @@ function makeMessages(n, contentLen) {
       maxMessageBytes: 1024 * 1024,
       systemPrompt: ''
     };
-    const agent = new AgentSession({ context, cfg, messages, ui: {} });
+    let usageAfter = null;
+    const agent = new AgentSession({ context, cfg, messages, ui: { contextUsage: (d) => { usageAfter = d; } } });
     await agent._maybeAutoCompress('test', '');
     check('usage 超阈值时，即使可压缩消息少于 4 条也触发压缩', () => assert.ok(summarized !== null && summarized.length === 2));
     check('压缩后 invalidate 知识库缓存', () => assert.strictEqual(invalidated, true));
     check('messages 被就地裁剪为 6 条', () => assert.strictEqual(messages.length, 6));
+    check('压缩后 emit contextUsage 刷新面板', () => assert.ok(usageAfter && usageAfter.raw && usageAfter.raw.historyLength === 6));
   }
 
   // 2) 未超阈值时不触发压缩

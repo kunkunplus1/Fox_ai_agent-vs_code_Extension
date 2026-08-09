@@ -47,6 +47,17 @@ async function clearApiKey(context, id) {
   await context.secrets.delete(SECRET_PREFIX + (id || currentProviderId()));
 }
 
+/** 行内补全专用 API Key：优先独立 secret，再 plain text，最后回落到主对话模型（兼容旧行为）。 */
+async function getInlineApiKey(context, id) {
+  const pid = id || currentProviderId();
+  if (providerMeta(pid).local) return '';
+  const secret = await context.secrets.get(SECRET_PREFIX + 'inlineCompletion.' + pid);
+  if (secret) return secret;
+  const plain = (conf().get('inlineCompletion.apiKey') || '').trim();
+  if (plain) return plain;
+  return getApiKey(context, pid);
+}
+
 // 整理 AI 专用：独立 secret 键，绝不写入主控 agent 的 apiKey 槽，避免互相覆盖。
 // 键格式：foxAi.apiKey.organize.<providerId>（如 foxAi.apiKey.organize.deepseek）
 async function getOrganizeApiKey(context, id) {
@@ -65,6 +76,21 @@ async function setOrganizeApiKey(context, id, value) {
 async function resolve(context) {
   const id = currentProviderId();
   const c = conf();
+
+  // 行内补全可独立配置端点；未设置时整体继承主对话模型。
+  const inlineProvider = (c.get('inlineCompletion.provider') || '').trim();
+  const inlinePid = inlineProvider || id;
+  const inlineMeta = providerMeta(inlinePid);
+  const inlineBaseUrl = (c.get('inlineCompletion.baseUrl') || '').trim().replace(/\/+$/, '')
+    || (inlineProvider ? inlineMeta.baseUrl : baseUrlFor(id))
+    || '';
+  const inlineModel = (c.get('inlineCompletion.model') || '').trim()
+    || (inlineProvider ? inlineMeta.model : modelName(id))
+    || '';
+  const inlineApiKey = inlineProvider
+    ? (inlineMeta.local ? '' : await getInlineApiKey(context, inlinePid))
+    : await getApiKey(context, id);
+
   return {
     providerId: id,
     provider: id, // 兼容仍使用 cfg.provider 的代码（如 agent.js 的 DeepSeek 判断）
@@ -89,6 +115,24 @@ async function resolve(context) {
       effort: c.get('deepThinking.effort', 'medium'),
       budgetTokens: c.get('deepThinking.budgetTokens', 0),
       promptFallback: c.get('deepThinking.promptFallback', true)
+    },
+    inlineCompletion: {
+      enabled: c.get('inlineCompletion.enabled', true),
+      provider: inlineProvider,
+      baseUrl: inlineBaseUrl,
+      apiKey: inlineApiKey,
+      model: inlineModel,
+      meta: inlineMeta,
+      transport: 'openai',
+      apiMode: 'chat',
+      maxTokens: c.get('inlineCompletion.maxTokens', 256),
+      contextLines: c.get('inlineCompletion.contextLines', 60),
+      suffixLines: c.get('inlineCompletion.suffixLines', 30),
+      fimStrategy: c.get('inlineCompletion.fimStrategy', 'auto'),
+      useProjectContext: c.get('inlineCompletion.useProjectContext', true),
+      projectContextChars: c.get('inlineCompletion.projectContextChars', 1000),
+      maxFileLines: c.get('inlineCompletion.maxFileLines', 8000),
+      debounce: c.get('inlineCompletion.debounce', 350)
     },
     visionMode: c.get('visionMode', 'auto'),
     visionModels: c.get('visionModels', []),
@@ -211,6 +255,7 @@ module.exports = {
   getApiKey,
   setApiKey,
   clearApiKey,
+  getInlineApiKey,
   getOrganizeApiKey,
   setOrganizeApiKey,
   resolve,

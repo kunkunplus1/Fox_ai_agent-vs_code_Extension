@@ -253,7 +253,56 @@
       );
     }).join('');
 
-    contextBody.innerHTML = head + '<div class="context-list">' + rows + '</div>';
+    // 「距离自动压缩」状态区：避免只显示总占用量误导用户
+    let compressHtml = '';
+    const cm = data.compressMeta;
+    if (cm && cm.enabled && limit > 0) {
+      const thrPct = Math.round(cm.threshold * 1000) / 10;
+      const fillPct = thrPct > 0 ? Math.min(100, (pct / thrPct) * 100) : 0;
+      if (pct >= thrPct) {
+        if (cm.compressible >= 1) {
+          compressHtml =
+            '<div class="context-compress ready">' +
+              '<div class="cc-title">🗜️ 自动压缩 · 阈值 ' + thrPct + '%</div>' +
+              '<div class="context-compress-bar"><div class="context-compress-fill" style="width:100%"></div></div>' +
+              '<div class="cc-status warn">已达阈值，下次对话后将自动压缩</div>' +
+            '</div>';
+        } else {
+          compressHtml =
+            '<div class="context-compress no-content">' +
+              '<div class="cc-title">🗜️ 自动压缩 · 阈值 ' + thrPct + '%</div>' +
+              '<div class="context-compress-bar"><div class="context-compress-fill" style="width:100%"></div></div>' +
+              '<div class="cc-status muted">已达阈值，但可压缩对话不足（占用多为固定开销），暂不压缩</div>' +
+            '</div>';
+        }
+      } else {
+        const gapPct = Math.max(0, Math.round((thrPct - pct) * 10) / 10);
+        const gapTokens = Math.max(0, Math.round((thrPct / 100) * limit - total));
+        compressHtml =
+          '<div class="context-compress">' +
+            '<div class="cc-title">🗜️ 自动压缩 · 阈值 ' + thrPct + '%</div>' +
+            '<div class="context-compress-bar"><div class="context-compress-fill" style="width:' + fillPct + '%"></div></div>' +
+            '<div class="cc-status ok">距离自动压缩还需约 ' + gapPct + '%（约 +' + formatTokens(gapTokens) + ' tokens）</div>' +
+          '</div>';
+      }
+    } else if (cm && cm.enabled && limit <= 0) {
+      const toGo = Math.max(0, 6 - cm.compressible);
+      compressHtml =
+        '<div class="context-compress">' +
+          '<div class="cc-title">🗜️ 自动压缩（按对话轮数）</div>' +
+          (cm.compressible >= 6
+            ? '<div class="cc-status warn">已达到轮数阈值，下次对话后压缩</div>'
+            : '<div class="cc-status ok">还差约 ' + toGo + ' 条对话消息触发</div>') +
+        '</div>';
+    } else if (cm && !cm.enabled) {
+      compressHtml =
+        '<div class="context-compress off">' +
+          '<div class="cc-title">🗜️ 自动压缩</div>' +
+          '<div class="cc-status off">未开启（设置 foxAi.knowledgeBase.autoSummarize.enabled）</div>' +
+        '</div>';
+    }
+
+    contextBody.innerHTML = head + compressHtml + '<div class="context-list">' + rows + '</div>';
   }
 
   function renderPlanTasks(items) {

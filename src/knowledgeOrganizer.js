@@ -262,19 +262,25 @@ async function organizeFile(context, file, root, outputDir, organizer, { onLog, 
   return { file, status: 'ok', out: outRel };
 }
 
+function sessionSummaryPath(dir, sessionId) {
+  const safeId = String(sessionId || 'global').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(dir, `${safeId}-summary.md`);
+}
+
 /**
  * 把一段对话历史压缩成结构化摘要，写入「知识库-2」（自动压缩目录）。
  * 复用整理 AI 的连接参数（provider/baseUrl/model/apiKey），默认本地、数据不出本机。
+ * 同一 session 的摘要将追加到同一个文件，避免一次压缩一个文件；不同 session 文件隔离。
  * @param {Array} messages 要压缩的对话消息数组（角色 + 内容）
  * @returns {Promise<string|null>} 写入的文件路径；无需压缩或失败时返回 null
  */
-async function summarizeConversation(context, messages, { onLog, signal } = {}) {
+async function summarizeConversation(context, messages, { onLog, signal, sessionId, dir } = {}) {
   if (!Array.isArray(messages) || messages.length < 2) return null;
 
   const cfg = config.conf().get('knowledgeBase.autoSummarize', {}) || {};
   const organizer = await resolveOrganizer(context);
-  const dir = defaultAutoSummaryDir(cfg.dir);
-  fs.mkdirSync(dir, { recursive: true });
+  const summaryDir = dir || defaultAutoSummaryDir(cfg.dir);
+  fs.mkdirSync(summaryDir, { recursive: true });
 
   // 组装对话文本（超长内容截断，避免单次请求过大）
   const text = messages
@@ -326,12 +332,22 @@ async function summarizeConversation(context, messages, { onLog, signal } = {}) 
   }
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const outPath = path.join(dir, `${ts}-summary.md`);
-  const header =
-    `# 对话压缩摘要\n> 生成时间：${new Date().toISOString()}\n> 来源：上下文超限自动压缩\n` +
-    `> 涵盖消息数：${messages.length}\n> 压缩模型：${organizer.label} / ${organizer.model}\n\n`;
-  fs.writeFileSync(outPath, header + content, 'utf8');
-  auditLog(context, 'summary.ok', { out: path.basename(outPath), count: messages.length });
+  const safeId = String(sessionId || 'global').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const outPath = sessionSummaryPath(summaryDir, sessionId);
+
+  // 同一 session 已存在摘要时追加，保持「一个会话一个文件」
+  let existing = '';
+  try {
+    if (fs.existsSync(outPath)) existing = fs.readFileSync(outPath, 'utf8');
+  } catch (_) {}
+
+  const blockHeader =
+    `# 对话压缩摘要（批次 ${ts}）\n> 生成时间：${new Date().toISOString()}\n> 来源：上下文超限自动压缩\n` +
+    `> 会话 ID：${safeId}\n> 涵盖消息数：${messages.length}\n> 压缩模型：${organizer.label} / ${organizer.model}\n\n`;
+  const block = blockHeader + content;
+  const final = existing ? `${existing.trim()}\n\n---\n\n${block}` : block;
+  fs.writeFileSync(outPath, final, 'utf8');
+  auditLog(context, 'summary.ok', { out: path.basename(outPath), count: messages.length, sessionId: safeId });
   if (onLog) onLog(`✅ 已压缩 ${messages.length} 条早期对话 → 知识库-2（${path.basename(outPath)}）`);
   return outPath;
 }

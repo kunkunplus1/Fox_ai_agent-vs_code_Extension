@@ -168,4 +168,30 @@ function estimateMessages(list) {
   return total;
 }
 
-module.exports = { estimateTokens, measureContext, isCjk, estimateMessages, messageText };
+/**
+ * 计算「距离自动压缩」所需的元数据，供 UI 展示压缩触发进度。
+ * 触发逻辑与 agent._maybeAutoCompress 保持一致：
+ *   - 阈值默认 0.75（未配置时），实际取配置 knowledgeBase.autoSummarize.threshold。
+ *   - 可压缩消息数 = 总消息数 - keepRecent；<=0 表示无可压缩对话。
+ * @param {object} as 配置项（this.cfg.autoSummarize）
+ * @param {number} messageCount 当前消息条数
+ * @returns {object|null}
+ */
+function buildCompressMeta(as, messageCount) {
+  try {
+    const a = as || {};
+    const keep = Math.max(2, a.keepRecent || 6);
+    const count = typeof messageCount === 'number' ? messageCount : 0;
+    return {
+      enabled: !!a.enabled,
+      threshold: a.threshold > 0 ? a.threshold : 0.75,
+      keepRecent: keep,
+      compressible: count - keep,
+      messageCount: count
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+module.exports = { estimateTokens, measureContext, isCjk, estimateMessages, messageText, buildCompressMeta };

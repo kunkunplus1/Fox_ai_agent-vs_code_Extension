@@ -8,6 +8,9 @@ const org = require('./knowledgeOrganizer');
 
 const SUPPORTED_EXTS = new Set(['.md', '.txt', '.jsonl']);
 
+// 用户显式授权可读取的其他会话摘要（跨会话隔离白名单）
+const allowedOtherSessions = new Set();
+
 function config() {
   return vscode.workspace.getConfiguration('foxAi').get('knowledgeBase') || {};
 }
@@ -169,8 +172,11 @@ function fileSignature(filePath) {
   }
 }
 
-function listFiles(paths) {
+function listFiles(paths, sessionId) {
   const files = [];
+  const cfg = config();
+  const as = cfg.autoSummarize || {};
+  const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
   for (const p of paths) {
     let stat;
     try {
@@ -180,6 +186,10 @@ function listFiles(paths) {
     }
     if (stat.isDirectory()) {
       for (const file of walkDir(p)) {
+        // 知识库-2 目录按 session 隔离：只保留当前 session 与已授权的其他 session
+        if (kb2Dir && file.startsWith(kb2Dir + path.sep)) {
+          if (!isAllowedSummaryFile(file, sessionId)) continue;
+        }
         files.push({ file, root: p });
         if (files.length >= MAX_FILES) return files;
       }
@@ -188,6 +198,20 @@ function listFiles(paths) {
     }
   }
   return files;
+}
+
+function summarySessionId(filePath) {
+  const base = path.basename(filePath);
+  const m = base.match(/^([a-zA-Z0-9_-]+)-summary\.md$/);
+  return m ? m[1] : null;
+}
+
+function isAllowedSummaryFile(filePath, currentSessionId) {
+  const sid = summarySessionId(filePath);
+  if (!sid) return false; // 非 session 摘要文件不扫描
+  if (currentSessionId && sid === String(currentSessionId).replace(/[^a-zA-Z0-9_-]/g, '_')) return true;
+  if (allowedOtherSessions.has(sid)) return true;
+  return false;
 }
 
 function getCacheDir() {
@@ -237,8 +261,9 @@ function saveDiskCache() {
 /**
  * 真增量索引：只重新 chunk 新增或修改的文件，删除已移除文件。
  * 返回当前所有 chunk 的扁平数组（不保留 lower 冗余字段）。
+ * @param {string} [sessionId] 当前会话 ID；知识库-2 的自动摘要将按此 ID 隔离。
  */
-function collectChunks() {
+function collectChunks(sessionId) {
   const cfg = config();
   const organize = cfg.organize || {};
   let paths = [];
@@ -257,7 +282,9 @@ function collectChunks() {
 
   const chunkSize = Math.max(200, cfg.chunkSize || 800);
   const overlap = Math.min(chunkSize - 1, Math.floor(chunkSize * 0.1));
-  const key = JSON.stringify(paths) + '|' + chunkSize + '|' + overlap;
+  const safeSid = String(sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const allowed = Array.from(allowedOtherSessions).sort().join(',');
+  const key = JSON.stringify(paths) + '|' + chunkSize + '|' + overlap + '|' + safeSid + '|' + allowed;
 
   if (cacheKey !== key) {
     fileIndex.clear();
@@ -266,7 +293,7 @@ function collectChunks() {
   }
 
   const started = Date.now();
-  const entries = listFiles(paths);
+  const entries = listFiles(paths, sessionId);
   const wanted = new Set(entries.map((e) => e.file));
 
   // 短时缓存命中：文件列表与签名均未变化，直接返回上次结果
@@ -355,13 +382,77 @@ function invalidate() {
   } catch (_) {}
 }
 
+/**
+ * 列出知识库-2 中存在的其他会话摘要文件（不含当前 session）。
+ * @param {string} [currentSessionId]
+ * @returns {{sessionId:string, file:string, title:string}[]}
+ */
+function listOtherSessionSummaries(currentSessionId) {
+  const cfg = config();
+  const as = cfg.autoSummarize || {};
+  if (!as.enabled) return [];
+  const dir = org.defaultAutoSummaryDir(as.dir);
+  if (!fs.existsSync(dir)) return [];
+  const currentSafe = String(currentSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const out = [];
+  for (const f of walkDir(dir)) {
+    const sid = summarySessionId(f);
+    if (!sid || sid === currentSafe) continue;
+    const text = readTextFile(f).trim();
+    const firstLine = text.split('\n')[0] || '';
+    const title = firstLine.replace(/^#+\s*/, '').slice(0, 80) || sid;
+    out.push({ sessionId: sid, file: f, title });
+  }
+  return out;
+}
+
+/**
+ * 请求读取指定会话的摘要。用户确认后加入白名单并清空索引缓存。
+ * @param {string} sessionId 目标会话 ID（来自 listOtherSessionSummaries）
+ * @param {string} [currentSessionId] 当前会话 ID
+ * @returns {Promise<{allowed:boolean, sessionId:string}>}
+ */
+async function requestSessionAccess(sessionId, currentSessionId) {
+  const safeId = String(sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!safeId) return { allowed: false, sessionId: '' };
+  const currentSafe = String(currentSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (safeId === currentSafe) return { allowed: true, sessionId: safeId };
+  if (allowedOtherSessions.has(safeId)) return { allowed: true, sessionId: safeId };
+
+  const cfg = config();
+  const as = cfg.autoSummarize || {};
+  const dir = org.defaultAutoSummaryDir(as.dir);
+  const file = path.join(dir, `${safeId}-summary.md`);
+  if (!fs.existsSync(file)) {
+    return { allowed: false, sessionId: safeId, reason: '未找到该会话的压缩摘要文件' };
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `是否允许当前会话读取「${safeId}」会话的压缩上下文摘要？`,
+    { modal: true, detail: '不同会话的上下文默认互相隔离，仅在你明确要求跨会话回忆时才可访问。' },
+    '允许',
+    '拒绝'
+  );
+  if (choice === '允许') {
+    allowedOtherSessions.add(safeId);
+    invalidate();
+    return { allowed: true, sessionId: safeId };
+  }
+  return { allowed: false, sessionId: safeId };
+}
+
+function clearSessionAccess() {
+  allowedOtherSessions.clear();
+  invalidate();
+}
+
 function stats() {
   let chunks = 0;
   for (const e of fileIndex.values()) chunks += e.chunks.length;
   return { files: cacheFileCount, chunks, builtAt: cacheBuiltAt };
 }
 
-function listKnowledgeFiles() {
+function listKnowledgeFiles(sessionId) {
   const cfg = config();
   const organize = cfg.organize || {};
   const as = cfg.autoSummarize || {};
@@ -384,7 +475,10 @@ function listKnowledgeFiles() {
   if (as.enabled) {
     const dir = org.defaultAutoSummaryDir(as.dir);
     if (fs.existsSync(dir)) {
-      for (const f of walkDir(dir)) files.push({ file: f, source: path.basename(f), kb2: true });
+      for (const f of walkDir(dir)) {
+        if (!isAllowedSummaryFile(f, sessionId)) continue;
+        files.push({ file: f, source: path.basename(f), kb2: true });
+      }
     }
   }
   return files;
@@ -393,11 +487,12 @@ function listKnowledgeFiles() {
 /**
  * 检索相关片段。
  * 整理模式下优先全量注入整理后目录；非整理模式用 BM25 打分取 Top-K。
+ * @param {string} [sessionId] 当前会话 ID；自动摘要按会话隔离。
  */
-function retrieve(query, maxChars) {
+function retrieve(query, maxChars, sessionId) {
   const cfg = config();
   const organize = cfg.organize || {};
-  const chunks = collectChunks();
+  const chunks = collectChunks(sessionId);
   if (!chunks.length) return '';
 
   const limit = Math.max(0, maxChars || 8000);
@@ -487,11 +582,11 @@ function scoreLegacy(chunk, keywords) {
   return score;
 }
 
-function augmentSystemPrompt(basePrompt, query) {
+function augmentSystemPrompt(basePrompt, query, sessionId) {
   if (!isEnabled()) return basePrompt;
   const cfg = config();
-  const context = retrieve(query, cfg.maxChars || 8000);
-  const files = listKnowledgeFiles();
+  const context = retrieve(query, cfg.maxChars || 8000, sessionId);
+  const files = listKnowledgeFiles(sessionId);
   if (!context.trim() && !files.length) return basePrompt;
 
   const fileList = files.map((f) => (f.kb2 ? `${f.source}(知识库-2)` : f.source)).join('、');
@@ -502,4 +597,7 @@ function augmentSystemPrompt(basePrompt, query) {
   return injected;
 }
 
-module.exports = { isEnabled, retrieve, augmentSystemPrompt, invalidate, stats, listKnowledgeFiles };
+module.exports = {
+  isEnabled, retrieve, augmentSystemPrompt, invalidate, stats, listKnowledgeFiles,
+  listOtherSessionSummaries, requestSessionAccess, clearSessionAccess
+};

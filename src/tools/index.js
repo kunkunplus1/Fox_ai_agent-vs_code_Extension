@@ -12,6 +12,7 @@ const securityAudit = require('./securityAudit'); // 只读代码安全自检（
 const referee = require('./referee'); // 只读第三方裁判 Agent（双盲交叉验证）
 const imageGen = require('./imageGen'); // 生图通道（独立第二模型，服务总控 agent，类似 vision 识图但反向）
 const bridge = require('../extensionBridge'); // 跨扩展命令调用桥
+const kb = require('../knowledgeBase'); // 会话隔离与跨会话授权
 
 /**
  * kind: read = 只读（可自动批准）; edit = 改动文件; exec = 执行命令
@@ -666,6 +667,45 @@ const TOOLS = [
       required: ['prompt']
     },
     run: (a, c) => imageGen.run(a, c)
+  },
+  {
+    name: 'allow_session_access',
+    kind: 'read',
+    title: (a) => `授权读取会话「${a.session_id || ''}」的压缩上下文`,
+    description:
+      '不同会话的自动压缩上下文默认互相隔离。当用户明确要求「回忆/参考/结合其他会话」时，' +
+      '调用本工具请求用户授权读取指定会话的压缩摘要。授权后该会话摘要会进入当前对话的 RAG 检索范围，' +
+      '直到本会话结束（或用户下次拒绝）。session_id 可从上下文或 list_other_sessions 获得。',
+    parameters: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: '目标会话 ID（知识库-2 摘要文件名前缀，如 abc123）' }
+      },
+      required: ['session_id']
+    },
+    run: async (a, c) => {
+      const res = await kb.requestSessionAccess(a.session_id, c && c.sessionId);
+      return res.allowed
+        ? `已授权读取会话「${res.sessionId}」的压缩摘要，当前对话现在可以检索其内容。`
+        : `未授权读取会话「${res.sessionId}」：${res.reason || '用户拒绝'}`;
+    }
+  },
+  {
+    name: 'list_other_sessions',
+    kind: 'read',
+    title: () => '列出其他会话的压缩摘要',
+    description:
+      '列出知识库-2 中存在的其他会话压缩摘要（不含当前会话）。用户要求跨会话回忆但没说具体会话时，' +
+      '先调用本工具列出可选会话，再让用户选择或用 allow_session_access 授权。',
+    parameters: {
+      type: 'object',
+      properties: {}
+    },
+    run: async (a, c) => {
+      const list = kb.listOtherSessionSummaries(c && c.sessionId);
+      if (!list.length) return '当前没有其他会话的压缩摘要文件。';
+      return list.map((s) => `• ${s.sessionId}：${s.title}`).join('\n');
+    }
   }
 ];
 

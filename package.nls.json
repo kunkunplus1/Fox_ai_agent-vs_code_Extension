@@ -261,5 +261,11 @@
   "foxai.n261": "**主控模型深度思考模式**。开启后会向模型下发思考参数（OpenAI/兼容站 `reasoning_effort`、通义 `enable_thinking`、Claude `thinking` 块、Responses API `reasoning.effort`），让模型先推理再作答。也可在聊天窗口顶部的「深度思考」芯片一键开关。注意：思考会显著增加耗时与 token 消耗。",
   "foxai.n262": "深度思考强度。low = 少思考、快；medium = 均衡（默认）；high = 充分推理、慢且贵。Claude 未单独设置预算时按此强度换算思考预算。",
   "foxai.n263": "Claude（Anthropic）思考预算 token 数。0 = 按上面的强度自动换算（low≈2048 / medium≈4096 / high≈8192）。",
-  "foxai.n264": "对没有原生思考开关的模型（如 deepseek-chat、常规 GPT），是否用系统提示词兜底要求它先分步推理再作答。"
+  "foxai.n264": "对没有原生思考开关的模型（如 deepseek-chat、常规 GPT），是否用系统提示词兜底要求它先分步推理再作答。",
+  "foxai.n265": "行内补全专用模型供应商。留空则跟随主对话模型；选择本地供应商时无需填 API Key。",
+  "foxai.n266": "行内补全 API 基础地址。留空则使用所选供应商默认地址，或继承主对话模型。",
+  "foxai.n267": "行内补全 API Key。留空则继承主对话模型的 Key；本地供应商无需填写。",
+  "foxai.n268": "行内补全专用模型 ID。留空则使用供应商默认模型或继承主对话模型。",
+  "foxai.n269": "光标后取多少行作为补全后缀（suffix）。代码段中间书写时，后缀能帮模型知道后文结构，减少补全与后文冲突。",
+  "foxai.n270": "Fill-in-the-Middle 格式。auto 会根据模型名自动选；none 不用 FIM 但保留后缀描述；其余为各模型族专用 token 格式。"
 }

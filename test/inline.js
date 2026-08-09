@@ -46,7 +46,37 @@ check('trimOverlap 去除开头重复的光标前文本', () => eq(inline.trimOv
 check('trimOverlap 去除结尾重复的光标后文本', () => eq(inline.trimOverlap('void;}', 'int jka()', 'void;'), '}'));
 check('pickCompletionModel 无专用时回落主模型', () => eq(inline.pickCompletionModel({ get: () => '' }, { model: 'main-1' }), 'main-1'));
 check('pickCompletionModel 优先专用模型', () => eq(inline.pickCompletionModel({ get: (k) => k === 'inlineCompletion.model' ? 'fast' : '' }, { model: 'main-1' }), 'fast'));
+check('pickCompletionModel 无配置时回落 inlineCompletion.model', () => eq(inline.pickCompletionModel({ get: () => '' }, { model: 'main-1', inlineCompletion: { model: 'inline-fast' } }), 'inline-fast'));
+check('pickCompletionModel 同时存在时优先 cfg 自定义模型', () => eq(inline.pickCompletionModel({ get: (k) => k === 'inlineCompletion.model' ? 'cfg-fast' : '' }, { model: 'main-1', inlineCompletion: { model: 'inline-fast' } }), 'cfg-fast'));
 check('pickCompletionModel 都无则返回空串', () => eq(inline.pickCompletionModel({ get: () => '' }, null), ''));
+
+check('detectFimStrategy auto 识别 codellama', () => eq(inline.detectFimStrategy('auto', 'codellama-7b'), 'codellama'));
+check('detectFimStrategy auto 识别 deepseek', () => eq(inline.detectFimStrategy('auto', 'deepseek-chat'), 'deepseek'));
+check('detectFimStrategy auto 识别 starcoder', () => eq(inline.detectFimStrategy('auto', 'starcoder2-15b'), 'starcoder'));
+check('detectFimStrategy auto 识别 qwen coder', () => eq(inline.detectFimStrategy('auto', 'qwen2.5-coder-32b'), 'starcoder'));
+check('detectFimStrategy auto 默认 diffusion', () => eq(inline.detectFimStrategy('auto', 'gpt-4o'), 'diffusion'));
+check('detectFimStrategy 显式策略优先', () => eq(inline.detectFimStrategy('none', 'codellama-7b'), 'none'));
+
+check('buildFimPrompt diffusion 格式', () => eq(
+  inline.buildFimPrompt('prefix', 'suffix', 'diffusion'),
+  '<fim_prefix>prefix<fim_suffix>suffix<fim_middle>'
+));
+check('buildFimPrompt codellama 格式', () => eq(
+  inline.buildFimPrompt('prefix', 'suffix', 'codellama'),
+  '<PRE>prefix<SUF>suffix<MID>'
+));
+check('buildFimPrompt deepseek 格式', () => eq(
+  inline.buildFimPrompt('prefix', 'suffix', 'deepseek'),
+  '<｜fim▁begin｜>prefix<｜fim▁hole｜>suffix<｜fim▁end｜>'
+));
+check('cleanup 去除 FIM token', () => eq(
+  inline.cleanup('<fim_prefix>foo<fim_middle>'),
+  'foo'
+));
+check('trimOverlap 去除结尾回显的光标后文本', () => eq(
+  inline.trimOverlap('hello world', 'foo(', 'world'),
+  'hello '
+));
 
 Module._load = origLoad;
 console.log('\n结果：通过 ' + pass + ' / 失败 ' + fail);

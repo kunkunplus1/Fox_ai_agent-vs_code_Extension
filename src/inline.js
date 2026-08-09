@@ -33,9 +33,39 @@ const SYSTEM = `你是代码补全引擎。任务：根据上下文，只输出�
 当前行光标前为 "int jka()" 时，不要输出 "int jka()"，因为会重复。
 正确示例：若光标在 "int jka()" 之后且需要函数体，应输出 " {\\n    return 0;\\n}" 这样的增量文本。`;
 
+const SYSTEM_FIM = `你是代码补全引擎。任务：只输出光标所在缺口（hole）应该填入的代码。
+
+格式规则：
+- 只输出中间缺口的代码，绝对不要重复缺口前或缺口后的已有文本。
+- 不要解释、不要 markdown 代码围栏、不要输出文件名或语言名。
+- 如果光标处已经完整，无需补全，必须输出空字符串。`;
+
+const FIM_TEMPLATES = {
+  diffusion: { prefix: '<fim_prefix>', suffix: '<fim_suffix>', middle: '<fim_middle>' },
+  starcoder: { prefix: '<fim_prefix>', suffix: '<fim_suffix>', middle: '<fim_middle>' },
+  codellama: { prefix: '<PRE>', suffix: '<SUF>', middle: '<MID>' },
+  deepseek:  { prefix: '<｜fim▁begin｜>', suffix: '<｜fim▁hole｜>', middle: '<｜fim▁end｜>' }
+};
+
+function detectFimStrategy(strategy, model) {
+  if (strategy && strategy !== 'auto') return strategy;
+  const m = String(model || '').toLowerCase();
+  if (/codellama|code-llama/.test(m)) return 'codellama';
+  if (/deepseek-coder|deepseek-v3|deepseek-v4|deepseek-chat/.test(m)) return 'deepseek';
+  if (/starcoder|qwen.*coder|qwen2\.5-coder/.test(m)) return 'starcoder';
+  return 'diffusion';
+}
+
+function buildFimPrompt(prefix, suffix, strategy) {
+  const tpl = FIM_TEMPLATES[strategy] || FIM_TEMPLATES.diffusion;
+  return `${tpl.prefix}${prefix}${tpl.suffix}${suffix}${tpl.middle}`;
+}
+
 function cleanup(text) {
   let t = String(text || '');
   t = t.replace(/^```[a-zA-Z0-9]*\s*\n?/, '').replace(/```\s*$/, '');
+  // 去掉可能被模型回显的 FIM 特殊 token
+  t = t.replace(/<fim_prefix>|<fim_suffix>|<fim_middle>|<PRE>|<SUF>|<MID>|<｜fim▁begin｜>|<｜fim▁hole｜>|<｜fim▁end｜>/g, '');
   t = t.replace(/^<\|[^|]*\|>/g, '');
   return t;
 }
@@ -47,11 +77,15 @@ function cleanup(text) {
 function pickCompletionModel(cfg, resolved) {
   const m = (cfg.get('inlineCompletion.model', '') || '').trim();
   if (m) return m;
+  if (resolved && resolved.inlineCompletion && resolved.inlineCompletion.model) {
+    return resolved.inlineCompletion.model;
+  }
   return (resolved && resolved.model) || '';
 }
 
 /**
  * 去掉补全文本中与光标前后已有文本重复的重叠部分，避免插入后出现 "int jka()int jka()" 这种事。
+ * FIM 模式下模型偶尔会回显 suffix，也要剥掉。
  */
 function trimOverlap(text, lineBefore, lineAfter) {
   let t = text;
@@ -74,6 +108,14 @@ function trimOverlap(text, lineBefore, lineAfter) {
   // 4. 如果建议以当前行光标后文本开头，去掉
   if (after && t.startsWith(after)) {
     t = t.slice(after.length);
+  }
+  // 5. 如果建议以当前行光标后文本结尾（或后文+可选空白结尾），去掉，避免 FIM 回显 suffix
+  if (after) {
+    const escaped = after.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(escaped + '\\s*$');
+    if (re.test(t)) {
+      t = t.replace(re, '');
+    }
   }
 
   return t;
@@ -125,18 +167,20 @@ function createInlineProvider(context) {
       }
 
       const resolved = await config.resolve(context);
-      if (!resolved.baseUrl) {
+      const ic = resolved.inlineCompletion || {};
+      if (!ic.baseUrl) {
         log('跳过：未配置 baseUrl');
         return null;
       }
-      if (!resolved.meta.local && !resolved.apiKey) {
+      if (!(ic.meta && ic.meta.local) && !ic.apiKey) {
         log('跳过：云端模型未设置 API Key');
         return null;
       }
 
       const span = Math.max(10, cfg.get('inlineCompletion.contextLines', 60));
+      const suffixSpan = Math.max(0, cfg.get('inlineCompletion.suffixLines', 30));
       const startLine = Math.max(0, position.line - span);
-      const endLine = Math.min(document.lineCount - 1, position.line + Math.floor(span / 3));
+      const suffixEndLine = Math.min(document.lineCount - 1, position.line + suffixSpan);
 
       // 把当前行和前后文明确拆开，避免模型重复输出当前行已有文本
       const currentLine = document.lineAt(position.line).text;
@@ -144,7 +188,7 @@ function createInlineProvider(context) {
       const lineAfter = currentLine.slice(position.character);
       const before = document.getText(new vscode.Range(startLine, 0, position.line, 0));
       const after = document.getText(
-        new vscode.Range(position.line + 1, 0, endLine, Number.MAX_SAFE_INTEGER)
+        new vscode.Range(position.line + 1, 0, suffixEndLine, Number.MAX_SAFE_INTEGER)
       );
       if (!before.trim() && !after.trim() && !lineBefore.trim() && !lineAfter.trim()) {
         log('跳过：上下文为空');
@@ -175,25 +219,40 @@ function createInlineProvider(context) {
         }
       }
 
-      const promptParts = [];
-      if (projectContext) promptParts.push('【项目上下文】\n' + projectContext);
-      promptParts.push(
-        `文件：${document.fileName}\n语言：${document.languageId}\n\n` +
-        `当前行光标前：${lineBefore}\n` +
-        `当前行光标后：${lineAfter}\n\n` +
-        `前文多行：\n${before}\n\n` +
-        `后文多行：\n${after}\n\n` +
-        `只输出光标位置需要插入的代码。绝对不要重复「当前行光标前」或「当前行光标后」的已有文本。`
-      );
-      const prompt = promptParts.join('\n\n');
-      log('请求', document.fileName, 'model=', pickCompletionModel(cfg, resolved));
+      const fimStrategy = detectFimStrategy(ic.fimStrategy, completionModel);
+      const useFim = fimStrategy !== 'none';
+
+      let prompt;
+      let systemPrompt = SYSTEM;
+      if (useFim) {
+        // Fill-in-the-Middle：把 prefix + suffix 用专用 token 包裹，让模型知道自己在填空
+        const prefix = before + lineBefore;
+        const suffix = lineAfter + after;
+        prompt = buildFimPrompt(prefix, suffix, fimStrategy);
+        systemPrompt = SYSTEM_FIM;
+        log('使用 FIM 策略', fimStrategy, 'prefixLen=', prefix.length, 'suffixLen=', suffix.length);
+      } else {
+        const promptParts = [];
+        if (projectContext) promptParts.push('【项目上下文】\n' + projectContext);
+        promptParts.push(
+          `文件：${document.fileName}\n语言：${document.languageId}\n\n` +
+          `当前行光标前：${lineBefore}\n` +
+          `当前行光标后：${lineAfter}\n\n` +
+          `前文多行：\n${before}\n\n` +
+          `后文多行：\n${after}\n\n` +
+          `只输出光标位置需要插入的代码。绝对不要重复「当前行光标前」或「当前行光标后」的已有文本。`
+        );
+        prompt = promptParts.join('\n\n');
+      }
+      const completionModel = pickCompletionModel(cfg, resolved);
+      log('请求', document.fileName, 'model=', completionModel, 'provider=', ic.provider || '(main)');
 
       const { promise, handle } = chatOnce({
-        baseUrl: resolved.baseUrl,
-        apiKey: resolved.apiKey,
-        model: pickCompletionModel(cfg, resolved),
+        baseUrl: ic.baseUrl,
+        apiKey: ic.apiKey,
+        model: completionModel,
         messages: [
-          { role: 'system', content: SYSTEM },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: prompt }
         ],
         temperature: 0.1,
@@ -236,4 +295,11 @@ function createInlineProvider(context) {
   };
 }
 
-module.exports = { createInlineProvider, cleanup, trimOverlap, pickCompletionModel };
+module.exports = {
+  createInlineProvider,
+  cleanup,
+  trimOverlap,
+  pickCompletionModel,
+  detectFimStrategy,
+  buildFimPrompt
+};

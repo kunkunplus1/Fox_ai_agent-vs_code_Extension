@@ -124,6 +124,18 @@ body {
   margin-top: 4px;
 }
 .context-item-fill { height: 100%; transition: width .25s ease; }
+.context-compress { padding: 6px; margin-bottom: 6px; border-radius: 5px; background: var(--vscode-editorWidget-background, rgba(128,128,128,.08)); }
+.context-compress.ready { border: 1px solid var(--vscode-charts-orange, #d18616); }
+.cc-title { font-size: 11px; font-weight: 600; opacity: .85; margin-bottom: 4px; }
+.context-compress-bar { height: 6px; border-radius: 3px; overflow: hidden; background: var(--vscode-progressBar-background, rgba(128,128,128,.2)); margin-bottom: 4px; }
+.context-compress-fill { height: 100%; background: var(--vscode-charts-green, #3fb950); transition: width .25s ease; }
+.context-compress.ready .context-compress-fill { background: var(--vscode-charts-orange, #d18616); }
+.context-compress.no-content .context-compress-fill { background: var(--vscode-charts-foreground, #999); }
+.cc-status { font-size: 11px; line-height: 1.45; }
+.cc-status.ok { color: var(--vscode-charts-green, #3fb950); }
+.cc-status.warn { color: var(--vscode-charts-orange, #d18616); }
+.cc-status.muted { opacity: .62; }
+.cc-status.off { opacity: .6; }
 
 .plan-head {
   display: flex; align-items: center; justify-content: space-between;
