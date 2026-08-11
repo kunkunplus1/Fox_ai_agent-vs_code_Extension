@@ -31,6 +31,7 @@
     if (tabName === 'tasks') post({ type: 'loadTasks' });
     if (tabName === 'project') post({ type: 'loadProject' });
     if (tabName === 'mcp') post({ type: 'loadMcp' });
+    if (tabName === 'sandbox') post({ type: 'loadSandbox' });
   }
 
   function renderExtList() {
@@ -257,6 +258,44 @@
       const ver = verInput ? verInput.value.trim() : '';
       b.disabled = true; if (status) status.textContent = '准备中…';
       post({ type: 'install', id, version: ver });
+    });
+
+    /* ---- 沙盒管理 ---- */
+    onClick('sb-open-dir', () => post({ type: 'openSandboxDir' }));
+    onClick('sb-reload', () => post({ type: 'reloadSandbox' }));
+    const SB_TPL = {
+      cpp: { language: 'cpp', ext: '.cpp', command: 'g++ -std=c++17 -O2 "{{file}}" -o "{{workdir}}/out" && "{{workdir}}/out"' },
+      ruby: { language: 'ruby', ext: '.rb', command: 'ruby "{{file}}"' },
+      php: { language: 'php', ext: '.php', command: 'php "{{file}}"' },
+      bash: { language: 'bash', ext: '.sh', command: 'bash "{{file}}"' },
+      typescript: { language: 'typescript', ext: '.ts', command: 'npx --yes ts-node "{{file}}"' },
+      csharp: { language: 'csharp', ext: '.csx', command: 'dotnet script "{{file}}"' },
+      lua: { language: 'lua', ext: '.lua', command: 'lua "{{file}}"' },
+      perl: { language: 'perl', ext: '.pl', command: 'perl "{{file}}"' }
+    };
+    onClick('sb-template-fill', () => {
+      const sel = document.getElementById('sb-template');
+      const tpl = sel ? sel.value : '';
+      if (tpl && SB_TPL[tpl]) {
+        const g = SB_TPL[tpl];
+        document.getElementById('sb-language').value = g.language;
+        document.getElementById('sb-ext').value = g.ext;
+        document.getElementById('sb-command').value = g.command;
+      }
+    });
+    onClick('sb-save', () => {
+      const name = (document.getElementById('sb-name').value || '').trim();
+      const msgEl = document.getElementById('sb-msg');
+      if (!name) { if (msgEl) { msgEl.textContent = '⚠️ 请填写名称'; msgEl.className = 'hint danger'; } return; }
+      const cmdRaw = (document.getElementById('sb-command').value || '').trim();
+      let command;
+      try { command = cmdRaw.startsWith('[') ? JSON.parse(cmdRaw) : cmdRaw; } catch (_) { command = cmdRaw; }
+      const spec = { name, language: (document.getElementById('sb-language').value || '').trim(), ext: (document.getElementById('sb-ext').value || '').trim() };
+      if (cmdRaw) spec.run = { command };
+      const canary = (document.getElementById('sb-canary').value || '').trim();
+      spec.canary = canary ? { code: canary } : null;
+      if (msgEl) { msgEl.textContent = '保存中…'; msgEl.className = 'hint'; }
+      post({ type: 'saveSandbox', spec });
     });
   }
 
@@ -661,6 +700,55 @@
     }
   }
 
+  function renderSandbox(data) {
+    window.__sbData = data;
+    if (!data) return;
+    const dirEl = document.getElementById('sb-dir');
+    if (dirEl && data.dir) dirEl.textContent = data.dir;
+
+    const tpl = document.getElementById('sb-template');
+    if (tpl) {
+      const sel = tpl.value || '';
+      tpl.innerHTML = '<option value="">— 空白 —</option>' + (data.templates || []).map((t) => '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('');
+      if ((data.templates || []).includes(sel)) tpl.value = sel;
+    }
+
+    const box = document.getElementById('sb-list');
+    if (!box) return;
+    const builtins = (data.builtins || []).map((s) => {
+      const st = s.status === 'ready' ? '✅ 可用' : (s.status === 'invalid' ? '❌ 不可用' : '❓');
+      return '<div class="card" data-name="' + esc(s.name) + '">'
+        + '<div class="rt-head"><b>' + esc(s.name) + '</b> <span class="ver">[' + esc(s.language) + ']</span> <span class="ver" style="color:var(--vscode-charts-green,#3fb950)">[内置·锁定]</span></div>'
+        + '<div class="hint">状态：' + st + (s.error ? ' — ' + esc(s.error) : '') + '</div>'
+        + '<div class="rt-actions" style="margin-top:6px"><span class="hint">内置沙盒不可删除</span></div>'
+        + '</div>';
+    });
+    const users = (data.user || []).map((s) => {
+      const st = s.status === 'ready' ? '✅ 可用' : (s.status === 'invalid' ? '❌ 不可用' : '❓ 未校验');
+      return '<div class="card" data-name="' + esc(s.name) + '">'
+        + '<div class="rt-head"><b>' + esc(s.name) + '</b> <span class="ver">[' + esc(s.language) + ']</span> <span class="ver" style="color:var(--vscode-charts-orange,#d29922)">[用户]</span></div>'
+        + '<div class="hint">状态：' + st + (s.error ? ' — ' + esc(s.error) : '') + '</div>'
+        + '<div class="rt-actions" style="margin-top:6px">'
+        + '<button class="sb-test" data-name="' + esc(s.name) + '">重测</button> '
+        + '<button class="sb-del" data-name="' + esc(s.name) + '">删除</button>'
+        + '</div></div>';
+    });
+    if (!builtins.length && !users.length) {
+      box.innerHTML = '<span class="hint">（暂无沙盒）</span>';
+    } else {
+      box.innerHTML = (builtins.length ? '<h3 style="margin:8px 0 4px">🔒 内置沙盒</h3>' + builtins.join('') : '')
+        + (users.length ? '<h3 style="margin:10px 0 4px">🧩 用户沙盒</h3>' + users.join('') : '<h3 style="margin:10px 0 4px">🧩 用户沙盒</h3><p class="hint">（暂无。点上方「套用模板」新建，或把带 manifest.json 的文件夹丢进沙盒目录即可出现在这里。）</p>');
+    }
+    box.querySelectorAll('.sb-test').forEach((b) => (b.onclick = () => {
+      b.disabled = true; b.textContent = '重测中…';
+      post({ type: 'testSandbox', name: b.dataset.name });
+    }));
+    box.querySelectorAll('.sb-del').forEach((b) => (b.onclick = () => {
+      if (typeof confirm === 'function' && !confirm('确定删除用户沙盒「' + b.dataset.name + '」吗？此操作不可恢复。')) return;
+      post({ type: 'deleteSandbox', name: b.dataset.name });
+    }));
+  }
+
   window.addEventListener('message', (ev) => {
     try {
     const m = ev.data;
@@ -742,6 +830,26 @@
       } else if (m.type === 'switchTab') {
         // 扩展端指定的初始标签页需要同时触发数据加载（否则目录/列表会永远停在「加载中…」）
         switchTab(m.tab, true);
+      } else if (m.type === 'sandboxList') {
+        renderSandbox(m);
+      } else if (m.type === 'sandboxSaved') {
+        const el = document.getElementById('sb-msg');
+        if (el) { el.textContent = m.ok ? '✅ 已保存' : ('❌ ' + (m.error || '保存失败')); el.className = 'hint ' + (m.ok ? '' : 'danger'); }
+      } else if (m.type === 'sandboxDeleted') {
+        if (!m.ok) { const el = document.getElementById('sb-msg'); if (el) { el.textContent = '❌ ' + (m.error || '删除失败'); el.className = 'hint danger'; } }
+      } else if (m.type === 'sandboxTestResult') {
+        const box = document.getElementById('sb-list');
+        if (box) {
+          const note = document.createElement('div');
+          note.className = 'hint ' + (m.ok ? '' : 'danger');
+          note.style.marginBottom = '6px';
+          let txt = (m.ok ? '✓ ' : '✗ ') + '重测「' + (m.name || '') + '」';
+          if (m.builtin) txt += '：' + (m.note || '内置默认可用');
+          else { txt += ' exit=' + m.exit; if (m.error) txt += ' 错误=' + m.error; if (m.stdout) txt += ' 输出=' + String(m.stdout).slice(0, 200); }
+          note.textContent = txt;
+          box.parentNode.insertBefore(note, box);
+          setTimeout(() => { if (note.parentNode) note.parentNode.removeChild(note); }, 8000);
+        }
       }
     } catch (err) {
       console.error('[fox-ai env] message handler error', err);

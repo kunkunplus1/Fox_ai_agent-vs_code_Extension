@@ -37,6 +37,26 @@ function log(...args) {
   }
 }
 
+// 会话 transcript 压缩：按「轮次」保留，保证每轮都有一个 user 锚点，
+// 避免长会话里一条超长回答的 delta 把开头的 user/assistantStart 挤出窗口，
+// 导致重载 / 删除其他会话后 restore 重放时 delta 找不到气泡而被静默丢弃（对话栏变空）。
+const TRANSCRIPT_HARD_LIMIT = 800; // 总条数硬上限，防止无限增长
+const TRANSCRIPT_TURN_LIMIT = 50; // 至少保留最近 N 轮（每轮以一个 user 消息起头）
+function compactTranscript(list) {
+  if (!Array.isArray(list) || list.length === 0) return list;
+  let out = list;
+  if (out.length > TRANSCRIPT_HARD_LIMIT) {
+    out = out.slice(out.length - TRANSCRIPT_HARD_LIMIT);
+  }
+  // user 消息是每轮对话的锚点，按它定位轮起点
+  const starts = [];
+  out.forEach((m, i) => { if (m && m.type === 'user') starts.push(i); });
+  if (starts.length > TRANSCRIPT_TURN_LIMIT) {
+    out = out.slice(starts[starts.length - TRANSCRIPT_TURN_LIMIT]);
+  }
+  return out;
+}
+
 function nonceStr() {
   let text = '';
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -160,10 +180,30 @@ class ChatViewProvider {
     this.post({ type: 'planTasks', items: this.planTasks.list() });
   }
 
-  /** 确保有当前会话；没有就新建一个（不抢焦点） */
+  /**
+   * 确保有当前会话；没有就新建一个（不抢焦点）。
+   *
+   * 关键修复：`_restoreCurrentSession()` 只在 `resolveWebviewView` 里被调用，
+   * 也就是**只有侧边栏视图被展开过**才会把存档读进内存。如果用户习惯用编辑器区域的
+   * 可移动面板对话，reload 之后侧边栏没展开 → 存档从未载入 → `this.transcript` 是空数组
+   * → `_syncTo()` / `ready` 分支的 `if (this.transcript.length)` 全部落空 → 面板一片空白，
+   * 表现就是「重载窗口不显示之前的对话内容」。这里补上内存态的兜底载入。
+   */
   _ensureSession() {
     if (!this.sessionManager.currentId()) {
       this.newChat(false);
+      return;
+    }
+    // 已有当前会话但内存里还是空的（面板模式 / 侧边栏没展开过）→ 从存档补载
+    if (!this.transcript.length && !this.messages.length) {
+      try {
+        const current = this.sessionManager.current();
+        if (current && ((current.transcript && current.transcript.length) || (current.messages && current.messages.length))) {
+          this._applySession(current);
+        }
+      } catch (e) {
+        log('ensureSession restore failed:', (e && e.message) || String(e));
+      }
     }
   }
 
@@ -222,7 +262,16 @@ class ChatViewProvider {
         }
       })
       .filter((a) => a.base64);
-    this.seq = 0;
+    // 恢复时不要把 seq 归零，否则新消息 ID（u1/a1...）会和 transcript 里重放的历史消息 ID 重复，
+    // 前端 live[] 可能指向错误的泡泡，导致「本次内容写进上次回答」。
+    let maxSeq = 0;
+    for (const t of (session.transcript || [])) {
+      if (t && t.id) {
+        const m = String(t.id).match(/^[a-z]+(\d+)$/);
+        if (m) maxSeq = Math.max(maxSeq, Number(m[1]));
+      }
+    }
+    this.seq = maxSeq;
     this.bubbleId = null;
     this.previews.clear();
     this.alwaysAllow.clear();
@@ -297,6 +346,17 @@ class ChatViewProvider {
       case 'insertCode':
         await insertIntoEditor(msg.code);
         break;
+      case 'openExternal': {
+        // 引用角标 / 正文外链：只放行 http(s)，用系统默认浏览器打开
+        const raw = String(msg.url || '').trim();
+        if (!/^https?:\/\//i.test(raw)) break;
+        try {
+          await vscode.env.openExternal(vscode.Uri.parse(raw));
+        } catch (e) {
+          vscode.window.showWarningMessage(i18n.tw('打不开链接：{0}', e && e.message ? e.message : String(e)));
+        }
+        break;
+      }
       case 'copy':
         await vscode.env.clipboard.writeText(msg.code || '');
         vscode.window.setStatusBarMessage(i18n.tw('$(check) 已复制'), 1500);
@@ -564,11 +624,8 @@ class ChatViewProvider {
     }
     if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'step', 'notice', 'error'].includes(msg.type)) {
       this.transcript.push(msg);
-      // 限制气泡历史数量，避免长会话内存线性增长
-      const TRANSCRIPT_LIMIT = 200;
-      if (this.transcript.length > TRANSCRIPT_LIMIT) {
-        this.transcript.splice(0, this.transcript.length - TRANSCRIPT_LIMIT);
-      }
+      // 按轮次压缩，保留每轮锚点（详见 compactTranscript），避免长会话丢锚点导致恢复后对话栏为空
+      this.transcript = compactTranscript(this.transcript);
     }
   }
 
@@ -680,6 +737,10 @@ class ChatViewProvider {
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'chat.css'));
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'chat.js'));
     const i18nUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'i18n.js'));
+    // 富文本增强依赖的第三方库（代码高亮 + 数学公式），以 nonce 注入，遵循 CSP script-src
+    const hljsUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'highlight.min.js'));
+    const katexCssUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'katex', 'katex.min.css'));
+    const katexUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'katex', 'katex.min.js'));
     // 跟随系统语言：仅非中文环境注入「中文 -> 英文」映射；中文环境不注入，直接展示原文（零回退风险）
     const locale = i18n.currentLocale();
     const isZh = locale.toLowerCase().indexOf('zh') === 0;
@@ -694,8 +755,13 @@ class ChatViewProvider {
     const i18nScript =
       '<script nonce="' + nonce + '">window.__FOX_LOCALE__=' + JSON.stringify(locale) +
       ';window.__FOX_I18N__=' + JSON.stringify(i18nMap) + ';</script>';
+    // 第三方库：KaTeX 样式（link）+ highlight.js / katex 脚本（nonce 注入，置于 head 末尾，先于 chat.js 执行）
+    const vendorHead =
+      '<link rel="stylesheet" href="' + katexCssUri.toString() + '" />' +
+      '<script nonce="' + nonce + '" src="' + hljsUri.toString() + '"></script>' +
+      '<script nonce="' + nonce + '" src="' + katexUri.toString() + '"></script>';
     return html
-      .replace('</head>', i18nScript + '</head>')
+      .replace('</head>', i18nScript + vendorHead + '</head>')
       .replace(/\$\{i18nUri\}/g, i18nUri.toString())
       .replace(/\$\{cspSource\}/g, webview.cspSource)
       .replace(/\$\{nonce\}/g, nonce)
@@ -1566,6 +1632,16 @@ class ChatViewProvider {
         this.ensureBubble();
         this.post({ type: 'image', id: this.bubbleId, src, alt });
       },
+      // 运行中检查点：agent 每完成一步 emit 一次，chatView debounce 落盘，
+      // 保证长任务中途重载窗口也能恢复最近进度（Bug④ 兜底）
+      checkpoint: () => {
+        if (!self._autosaveTimer) {
+          self._autosaveTimer = setTimeout(() => {
+            self._autosaveTimer = null;
+            try { self._saveCurrentSession(); } catch (_) {}
+          }, 4000);
+        }
+      },
       toolPending: () => {
         // 模型开始吐工具调用，先收尾当前文本气泡
         this.endBubble();
@@ -1640,6 +1716,9 @@ class ChatViewProvider {
         }
       },
       notice: ({ text }) => this.post({ type: 'notice', text }),
+      // 原生联网（DeepSeek/OpenAI Responses 的 web_search_call）的搜索结果 URL，
+      // 透传给前端 harvest，补全引用角标成可点击链接。
+      searchSources: ({ text }) => { if (text) this.post({ type: 'searchSources', text }); },
       contextUsage: (data) => {
         this.lastContextUsage = data;
         try { this.context.globalState.update('lastContextUsage', data); } catch (_) {}

@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.5
+> **版本**：1.1.7
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -35,10 +35,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-1.1.5.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.7.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-1.1.5.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-1.1.7.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏使用狐狸图标（`media/fox.svg`），扩展详情页使用新头像图标（`media/fox-icon.png`）。
@@ -405,6 +405,51 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 ---
 
+### 6.35 对话栏富文本渲染
+
+对话气泡支持完整 Markdown 富文本，便于阅读代码与公式：
+
+- **代码语法高亮**：代码块按语言（`language-xxx`）着色，语言识别失败自动降级为纯文本。
+- **LaTeX 公式**：支持块级 `$$…$$` 与行内 `$…$`，由 KaTeX 渲染；含空格且无数学符号的货币片段（如 `$10 to $20`）不会被误判为公式。
+- **外链图片缩略图**：`![alt](url)`、裸图链、base64 均渲染为缩略图；`javascript:` 等危险协议不生成链接，杜绝注入。
+- **GFM 表格**：`| 表头 |---| … |` 渲染为带边框、隔行底色的表格，支持 `:--` / `:-:` / `--:` 对齐与单元格内联格式。
+
+高亮与公式依赖本地 `media/vendor/`（highlight.js / KaTeX），**运行时无需联网**。
+
+### 6.36 搜索引用角标与来源跳转
+
+模型回答里引用的资料会以可点击角标呈现，点击用系统浏览器打开来源：
+
+- **角标识别**：兼容中文来源标签（`（来源：xxx）`）、markdown 脚注 `[^n]`（含 OpenAI 双尖 `[^n^]`）与 `[n]`（仅当会话已有搜索编号索引时）；无对应来源时退化为不可点击的「来源 n」提示，不误导点击。
+- **正文链接全部可点**：裸 `https://…` 自动变为可点击链接；外链统一走 `data-url` + 委托点击，校验 `http(s)` 后用系统默认浏览器打开（不在 webview 内导航，避免「点了没反应」）。
+- **原生联网搜索也能拿到来源**：DeepSeek 等模型的官方联网搜索在 **Chat Completions**（`delta.annotations` / `delta.citations`）与 **Responses API**（`web_search_call.results`）两条路径都会被抽取真实网址并透传到角标，无需依赖本地 `web_search` 工具。
+- **无链接角标用默认光标**，不再显示小问号。
+
+### 6.37 沙盒代码自测
+
+环境面板「🧪 沙盒」标签页可管理隔离运行环境，让智能体把生成的代码跑起来自测：
+
+- **内置沙盒**（🔒 锁定，不可删）：Node.js / Python / Go / Rust / Java，开箱即用。
+- **用户沙盒**（🧩 可增删）：把带 `manifest.json` 的文件夹丢进 `~/.fox-ai/sandboxes/`（或套用模板 C++ / Ruby / PHP / Bash / TS / C# / Lua / Perl）即可新增语言；新沙盒首次发现时先用 `canary` 示例实跑验证，通过才注册。
+- **隔离语义**：默认进程级隔离（独立临时目录，不碰工作区）；需真隔离用 docker runner（`foxAi.sandbox.allowDocker`）。
+- **工具 `run_in_sandbox`**：`action` 支持 `run`（跑代码）/ `list`（列出沙盒与状态）/ `reload`（重扫并重校验）；`sandbox` 用名称或语言模糊匹配。超时由 `foxAi.sandbox.timeout`（默认 30s）控制。
+- **目录热感知**：面板打开时监听沙盒目录，手动增删文件夹自动刷新；内置沙盒受「防误删」保护，越权路径拒绝。
+
+### 6.38 失败自动切换备用模型（Failover）
+
+主模型挂掉 / 超时 / 限流时，可自动切到备用模型兜底：
+
+- 设置 `foxAi.failover`：`enabled`（默认 false，关闭时零回归）、`triggers`（默认 `['timeout','connection','serverError']`，可选 `rateLimit` / `emptyResponse`）、`maxRetries`（默认 1）、`targets`（备用模型数组，每条可填本地或云端，`local: true` 表示本地不发送 API Key）。
+- 行为：命中 triggers 才切换，参数错（400）不切；切换时去掉 grammar 约束避免卡死；全部失败才抛出。
+
+### 6.39 本地 / 弱模型适配
+
+- **协议自动选择**：`foxAi.agent.toolProtocol` 默认 `auto`，按厂商 / 模型名智能选原生 function calling 或 text 协议；本地 / 小模型走 text 协议并加固非严格 JSON 解析（单引号、未加引号键、尾部逗号等）。
+- **弱模型辅助模式**：`foxAi.agent.localWeakModelMode`（`auto` / `on` / `off`）对小模型自动开启——约束解码（GBNF）、工具检索 Top-N 精简、闭环校验自我修正、上下文锚点，从根源减少格式错与选择困难。
+- **grammar 探测**：`foxAi.agent.localConstrainedDecoding` 默认 `'auto'`，先探测服务端是否支持约束解码，支持才注入，不支持 / 挂起则跳过，绝不卡死。
+- **本地无响应兜底**：本地模型返回空时自动以纯对话模式重试一次，保证出字。
+
+---
 ## 七、设置项参考
 
 以下为本扩展可调设置项（分组列出，便于查找）：
@@ -428,6 +473,9 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 项目扫描 | `foxAi.projectScan.cacheEnabled`（结果缓存，默认 true） |
 | 行内补全 | `foxAi.inlineCompletion.enabled`（默认 true） / `.provider`（供应商，默认空=主模型） / `.baseUrl` / `.apiKey` / `.model`（专用模型，默认空=主模型） / `.maxTokens`（默认 256） / `.maxFileLines`（默认 8000） / `.suffixLines`（后缀行数，默认 30） / `.fimStrategy`（FIM 格式，默认 auto） / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
 | 智能体（续） | `foxAi.agent.maxMessageBytes`（历史总字节硬上限，默认 1048576） / `.structuredOutput` / `.projectSkeleton`（L1 代码骨架，默认 true） |
+| 失败切换 | `foxAi.failover.enabled` / `.triggers` / `.maxRetries` / `.targets` |
+| 沙盒 | `foxAi.sandbox.enabled` / `.dir` / `.timeout` / `.allowDocker` |
+| 本地/弱模型 | `foxAi.agent.toolProtocol`（auto·native·text） / `foxAi.agent.localWeakModelMode`（auto·on·off） / `foxAi.agent.localConstrainedDecoding`（auto·on·off） |
 | 子代理与并行 | `foxAi.subagents.enabled` / `.concurrency`（并行度，默认 2） / `.maxSteps` / `.maxToolCalls` / `.timeoutMs` / `.autoApproveWrites` |
 | 后台任务 | `foxAi.background.enabled` / `.maxConcurrent`（默认 2，硬上限 4） / `.timeoutMs`（默认 900000） / `.maxSteps` / `.maxToolCalls` / `.allowMainWorkspaceWrites` / `.keepWorktree` / `.maxHistory`（默认 60） / `.storagePath` |
 | 检查点与回滚 | `foxAi.checkpoints.enabled` / `.maxSnapshots` |

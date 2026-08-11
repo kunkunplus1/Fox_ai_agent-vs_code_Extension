@@ -344,7 +344,21 @@ function streamChat(options) {
   const onToolCallStart = guard(options.onToolCallStart, 'onToolCallStart');
   const onDone = guard(options.onDone, 'onDone');
   const onError = guard(options.onError, 'onError');
-
+  const onSearchResults = guard(options.onSearchResults, 'onSearchResults');
+  const collectedSources = [];
+  const collectSources = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    const push = (title, url) => {
+      const u = String(url || '').trim();
+      if (u.startsWith('http://') || u.startsWith('https://')) collectedSources.push({ title: String(title || '').trim(), url: u });
+    };
+    if (Array.isArray(obj.annotations)) {
+      for (const a of obj.annotations) { const uc = a && (a.url_citation || a); push(uc && uc.title, uc && uc.url); }
+    }
+    if (Array.isArray(obj.citations)) {
+      for (const ci of obj.citations) { if (typeof ci === 'string') push('', ci); else if (ci && ci.url) push(ci.title, ci.url); }
+    }
+  };
   const handle = { aborted: false, abort() {} };
 
   let url;
@@ -401,6 +415,18 @@ function streamChat(options) {
         aborted: handle.aborted,
         empty: !content && !reasoning && !imagesAcc.length && !toolAcc.filter(Boolean).length && !handle.aborted
       });
+    if (collectedSources.length && onSearchResults) {
+      const seen = new Set();
+      const dedup = [];
+      for (const s of collectedSources) { if (s.url && !seen.has(s.url)) { seen.add(s.url); dedup.push(s); } }
+      const txt = dedup.map((r, i) => {
+        const url = String(r.url || '').trim();
+        const title = String(r.title || '').trim();
+        const body = String(r.content || r.snippet || '').trim();
+        return '[' + (i + 1) + '] ' + title + '\nURL: ' + url + (body ? '\n' + body : '');
+      }).join('\n\n');
+      onSearchResults(txt);
+    }
   };
 
   function doStreamRequest(targetUrl, redirectsLeft) {
@@ -491,6 +517,7 @@ function streamChat(options) {
           onReasoning && onReasoning(rc);
         }
         if (Array.isArray(delta.tool_calls)) absorbToolCalls(delta.tool_calls);
+        collectSources(delta);
 
         let deltaText = '';
         if (typeof delta.content === 'string' && delta.content.length) {
@@ -533,6 +560,7 @@ function streamChat(options) {
         }
         const choice = (json.choices && json.choices[0]) || {};
         if (choice.finish_reason) finishReason = choice.finish_reason;
+        collectSources(choice.message);
         return applyDelta(choice.delta || choice.message || {});
       };
 
@@ -867,6 +895,23 @@ function streamResponses(options) {
   const onToolCallStart = guard(options.onToolCallStart, 'onToolCallStart');
   const onDone = guard(options.onDone, 'onDone');
   const onError = guard(options.onError, 'onError');
+  // 原生联网（DeepSeek/OpenAI Responses 的 web_search_call）的结果里含真实 URL，
+  // 透传给上层，供前端把引用角标补全成可点击链接。
+  const onSearchResults = guard(options.onSearchResults, 'onSearchResults');
+  // 把搜索结果数组拼成 harvest 期望的「[n] 标题 / URL: …」文本
+  const buildSourcesText = (results) => {
+    if (!Array.isArray(results) || !results.length) return '';
+    return results
+      .map((r, i) => {
+        const url = String(r && r.url || '').trim();
+        if (!/^https?:\/\//i.test(url)) return '';
+        const title = String(r && r.title || '').trim();
+        const body = String(r && (r.content || r.snippet) || '').trim();
+        return '[' + (i + 1) + '] ' + title + '\nURL: ' + url + (body ? '\n' + body : '');
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  };
 
   const handle = { aborted: false, abort() {} };
 
@@ -1037,7 +1082,11 @@ function streamResponses(options) {
         } else if (type === 'response.web_search_call.searching' || type === 'response.web_search_call.in_progress') {
           console.log('[fox-ai] responses web_search_call in progress');
         } else if (type === 'response.web_search_call.completed') {
-          console.log('[fox-ai] responses web_search_call completed');
+          // 原生联网搜索完成：把 results（标题/URL）透传给前端 harvest，补全引用角标链接
+          const item = json.item || json;
+          const results = (item && item.results) || json.results;
+          const txt = buildSourcesText(results);
+          if (txt && onSearchResults) onSearchResults(txt);
         } else if (type === 'response.output_item.done') {
           const it = json.item || {};
           const iid = json.item_id;
@@ -1047,6 +1096,10 @@ function streamResponses(options) {
             // 仅当 done 事件带有非空 arguments 时才覆盖增量累加结果，
             // 避免部分服务端 done 事件 arguments 为空导致参数被清空。
             if (typeof it.arguments === 'string' && it.arguments.length) fcAcc[iid].args = it.arguments;
+          } else if (it.type === 'web_search_call' && Array.isArray(it.results) && it.results.length) {
+            // 兜底：部分服务商在 output_item.done 的 web_search_call 项里给 results
+            const txt = buildSourcesText(it.results);
+            if (txt && onSearchResults) onSearchResults(txt);
           }
         } else if (type === 'response.completed') {
           finishReason = 'stop';

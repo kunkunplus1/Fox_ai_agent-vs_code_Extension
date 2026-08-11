@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.5",
+  "version": "1.1.7",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -33,7 +33,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/approvalState.js && node test/planTasksClear.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -788,6 +788,70 @@
             "default": true,
             "markdownDescription": "%foxai.n264%",
             "order": 23
+          },
+          "foxAi.failover": {
+            "type": "object",
+            "markdownDescription": "失败降级 / 自动 failover（1.1.20）：主模型调用失败（超时/连接/服务端错误/限流/空响应）时，自动按顺序切换到下方备用模型。备用模型可是本地或云端，UI 自由配置。默认关闭，开启后仅当错误类型命中 triggers 才切换。",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "markdownDescription": "是否启用失败降级。关闭时保持旧行为（主模型失败直接报错，不切换）。"
+              },
+              "triggers": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": ["timeout", "connection", "serverError", "rateLimit", "emptyResponse"]
+                },
+                "default": ["timeout", "connection", "serverError"],
+                "markdownDescription": "触发切换的错误类型：timeout=超时；connection=连接失败/拒绝/DNS；serverError=服务端 5xx；rateLimit=限流 429；emptyResponse=主模型返回空。"
+              },
+              "maxRetries": {
+                "type": "number",
+                "default": 1,
+                "markdownDescription": "最多切到几个备用模型（即 targets 列表最多生效前 N 个）。"
+              },
+              "targets": {
+                "type": "array",
+                "markdownDescription": "备用模型列表（按顺序尝试）。每条可填本地或云端兼容接口（OpenAI-compatible）。",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string", "default": "", "markdownDescription": "备用模型别名（仅用于日志/提示，可留空）。" },
+                    "baseUrl": { "type": "string", "default": "", "markdownDescription": "备用端点，如 http://127.0.0.1:8080/v1（本地）或 https://api.xxx/v1（云端）。" },
+                    "apiKey": { "type": "string", "default": "", "markdownDescription": "云端备用模型 API Key；本地模型留空。" },
+                    "model": { "type": "string", "default": "", "markdownDescription": "备用模型名（如 qwen2.5:7b / gpt-4o）。" },
+                    "local": { "type": "boolean", "default": false, "markdownDescription": "true=本地模型（不发送 apiKey）；false=云端（需 apiKey）。" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "title": "狐狸 AI · 沙盒代码测试 (Sandbox)",
+        "properties": {
+          "foxAi.sandbox.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "沙盒代码自测（1.1.22）：允许主控 agent 用 run_in_sandbox 工具在隔离沙盒里运行代码自测。环境面板「🧪 沙盒」标签页可可视化增删用户沙盒、查看状态、热感知目录变化；内置沙盒不可删。关闭后该工具返回未启用提示。"
+          },
+          "foxAi.sandbox.dir": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "沙盒环境目录。留空则用默认 ~/.fox-ai/sandboxes。把带 manifest.json 的文件夹丢进这里即可新增语言沙盒（用户自备）。"
+          },
+          "foxAi.sandbox.timeout": {
+            "type": "number",
+            "default": 30000,
+            "markdownDescription": "单个沙盒运行超时（毫秒）。超时后强制终止。"
+          },
+          "foxAi.sandbox.allowDocker": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "是否允许 runner:\"docker\" 的沙盒（真正容器隔离）。需本机装有 docker，且沙盒 manifest 提供 docker.image。默认关闭（仅进程级隔离可用）。"
           }
         }
       },

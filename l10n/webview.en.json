@@ -113,6 +113,7 @@
   "还没配置接口地址，请在设置里填 foxAi.baseUrl": "API endpoint not configured. Set foxAi.baseUrl in Settings.",
   "{0} 需要 API Key。命令面板运行「狐狸 AI: 设置 API Key」即可。": "{0} requires an API Key. Run \"Fox AI: Set API Key\" from the Command Palette.",
   "打不开文件：{0}": "Cannot open file: {0}",
+  "打不开链接：{0}": "Cannot open link: {0}",
   "$(check) 已复制": "$(check) Copied",
   "确定删除任务「{0}」吗？": "Delete task \"{0}\"?",
   "已删除任务：{0}": "Deleted task: {0}",

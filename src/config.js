@@ -76,6 +76,15 @@ async function setOrganizeApiKey(context, id, value) {
 async function resolve(context) {
   const id = currentProviderId();
   const c = conf();
+  const meta = providerMeta(id); // 提前取出，供本地模型默认值判断
+
+  // —— 本地弱模型辅助模式（1.1.17）——
+  // auto：本地模型（Ollama/LM Studio/llama.cpp 等）默认开启；on：强制开；off：关。
+  // 开启后逐项生效：约束解码、工具检索精简、闭环校验、上下文锚点。
+  const weakModeSetting = c.get('agent.localWeakModelMode', 'auto');
+  const localWeak =
+    weakModeSetting === 'on' ||
+    (weakModeSetting === 'auto' && !!meta.local);
 
   // 行内补全可独立配置端点；未设置时整体继承主对话模型。
   const inlineProvider = (c.get('inlineCompletion.provider') || '').trim();
@@ -94,12 +103,12 @@ async function resolve(context) {
   return {
     providerId: id,
     provider: id, // 兼容仍使用 cfg.provider 的代码（如 agent.js 的 DeepSeek 判断）
-    meta: providerMeta(id),
+    meta,
     baseUrl: baseUrlFor(id),
     model: modelName(id),
     apiKey: await getApiKey(context, id),
     temperature: c.get('temperature', 0.3),
-    maxTokens: c.get('maxTokens', 2048),
+    maxTokens: c.get('maxTokens', meta.local ? 1536 : 2048),
     timeout: c.get('timeout', 30000),
     maxHistory: c.get('maxHistory', 20),
     systemPrompt: c.get('systemPrompt', ''),
@@ -175,8 +184,12 @@ async function resolve(context) {
     },
     tools: {
       dynamicSubset: {
-        enabled: c.get('tools.dynamicSubset.enabled', false),
-        topK: c.get('tools.dynamicSubset.topK', 12),
+        // 本地弱模型模式：强制开启工具检索，把「百选一」降为「三选一」，显著降低选择负担
+        enabled: localWeak ? true : c.get('tools.dynamicSubset.enabled', false),
+        // 弱模型模式下进一步收紧 topK（≤5），只给最相关的少量工具
+        topK: localWeak
+          ? Math.min(Number(c.get('tools.dynamicSubset.topK', 12)) || 12, 5)
+          : c.get('tools.dynamicSubset.topK', 12),
         alwaysInclude: c.get('tools.dynamicSubset.alwaysInclude', '')
       }
     },
@@ -197,12 +210,50 @@ async function resolve(context) {
       tools: c.get('selfConsistency.tools', []),
       sampleTemp: c.get('selfConsistency.sampleTemp', 0.8)
     },
-    maxSteps: c.get('agent.maxSteps', 12),
+    maxSteps: c.get('agent.maxSteps', meta.local ? 8 : 12),
     maxContinues: c.get('agent.maxContinues', 3),
     toolProtocol: c.get('agent.toolProtocol', 'auto'),
+    // —— 本地弱模型辅助模式设置（1.1.17 / 1.1.19）——
+    localWeakModelMode: weakModeSetting,
+    localWeak: localWeak, // 便捷布尔，agent 直接读它判断是否进入弱模型适配逻辑
+    // 约束解码开关，三态（1.1.19 起）：
+    //   false / 'off' → 关闭，永不注入 grammar（最保守，对应 1.1.18 的默认行为）
+    //   true  / 'on'  → 强制开启，不探测直接注入（靠 retryWithoutGrammar 兜底拒绝）
+    //   'auto'（默认） → 调用前先探测服务端是否支持 grammar，支持才注入，不支持/挂起则跳过，
+    //                    既不卡死又能自动享受约束解码带来的格式稳定收益。
+    // 探测机制：发一个极短超时 + max_tokens=1 的极小 GBNF 试探请求，健康服务端秒回→支持，
+    // 挂起型服务端超时失败→不支持，绝不再注入（详见 src/grammarProbe.js）。
+    localConstrainedDecoding: c.get('agent.localConstrainedDecoding', 'auto'),
+    weakHistoryRounds: c.get('agent.weakHistoryRounds', 2),
     autoApprove: c.get('agent.autoApprove', 'read'),
     blockedCommands: c.get('agent.blockedCommands', []),
     policy: c.get('policy', {}),
+    // —— 失败降级 / 自动 failover（1.1.20）——
+    // 主模型调用失败时，按配置的错误类型自动切换到备用模型（UI 自由配置，支持本地与云端）。
+    // enabled 默认 false（保持旧行为）；triggers 默认超时/连接/服务端错误；targets 为备用模型列表，
+    // 数量受 maxRetries 截断。每个 target 含 name/baseUrl/apiKey/model/local（本地不发送 apiKey）。
+    failover: (() => {
+      const fo = c.get('failover', {}) || {};
+      const enabled = !!fo.enabled;
+      const triggers = new Set(
+        Array.isArray(fo.triggers) && fo.triggers.length
+          ? fo.triggers
+          : ['timeout', 'connection', 'serverError']
+      );
+      const maxRetries = Math.max(0, Number(fo.maxRetries) || 1);
+      const rawTargets = Array.isArray(fo.targets) ? fo.targets : [];
+      const targets = rawTargets
+        .filter((t) => t && (t.baseUrl || t.model))
+        .slice(0, maxRetries)
+        .map((t, i) => ({
+          name: (t.name || '').trim() || ('备用' + (i + 1)),
+          baseUrl: (t.baseUrl || '').trim().replace(/\/+$/, ''),
+          apiKey: (t.apiKey || '').trim(),
+          model: (t.model || '').trim() || 'local-model',
+          local: !!t.local
+        }));
+      return { enabled, triggers, maxRetries, targets };
+    })(),
     maxToolOutput: c.get('agent.maxToolOutput', 8000),
     maxMessageBytes: c.get('agent.maxMessageBytes', 1024 * 1024),
     structuredOutput: c.get('agent.structuredOutput', false),
@@ -226,6 +277,12 @@ async function resolve(context) {
       provider: c.get('verify.provider', ''),
       baseUrl: c.get('verify.baseUrl', ''),
       model: c.get('verify.model', '')
+    },
+    sandbox: {
+      enabled: c.get('sandbox.enabled', true),
+      dir: c.get('sandbox.dir', '') || '',
+      timeout: Math.max(1000, Number(c.get('sandbox.timeout', 30000)) || 30000),
+      allowDocker: c.get('sandbox.allowDocker', false)
     },
     autoSummarize: {
       enabled: c.get('knowledgeBase.autoSummarize.enabled', false),

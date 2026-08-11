@@ -10,6 +10,7 @@ const mcpAuthor = require('./mcpAuthor'); // 自写 MCP 服务器（生成 / 登
 const reviewChanges = require('./reviewChanges'); // 原始版 vs 修改版对比 + 深度思考
 const securityAudit = require('./securityAudit'); // 只读代码安全自检（自检 Agent）
 const referee = require('./referee'); // 只读第三方裁判 Agent（双盲交叉验证）
+const sandboxTest = require('./sandboxTest'); // 沙盒代码自测（隔离运行 + canary 校验）
 const imageGen = require('./imageGen'); // 生图通道（独立第二模型，服务总控 agent，类似 vision 识图但反向）
 const subagents = require('../subagents'); // 子代理 / 并行 agent / agent teams
 const codebaseIndex = require('./codebaseIndex'); // 全仓库语义索引（RAG）
@@ -689,6 +690,22 @@ const TOOLS = [
     run: (a, ctx) => referee.run(a, ctx)
   },
   {
+    name: 'run_in_sandbox',
+    kind: 'exec',
+    title: (a) => `沙盒运行 ${a.sandbox || ''}`,
+    description: '隔离沙盒运行代码让 agent 自测（不碰工作区）。沙盒目录默认 ~/.fox-ai/sandboxes，每个子文件夹一语言含 manifest.json；内置 Node/Python/Go/Rust/Java 直接可用，用户丢文件夹即可增语言，新沙盒首次 canary 校验。action: run(默认,跑 code)/list/reload；sandbox 用名或语言(如 node/python/go)，大小写不敏感。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['run', 'list', 'reload'], description: '动作：run=运行代码(默认) / list=列出沙盒 / reload=重扫并校验' },
+        sandbox: { type: 'string', description: '沙盒名或语言（run 时必填），如 node / python / go / rust / java / 或用户自定义名' },
+        code: { type: 'string', description: '要运行的源码（run 时必填）' },
+        stdin: { type: 'string', description: '可选，作为标准输入传给程序' }
+      }
+    },
+    run: (a, ctx) => sandboxTest.run(a, ctx)
+  },
+  {
     name: 'search_codebase',
     kind: 'read',
     title: (a) => `语义检索「${String((a && a.query) || '').slice(0, 24)}」`,
@@ -1289,6 +1306,32 @@ function toOpenAIToolsFrom(list) {
 /** 文本协议用的说明书（给不支持 tools 的模型）。可选 query/cfg 用于动态子集精简 */
 function toTextManual(query, cfg) {
   const list = filterForPrompt(query, cfg) || allTools();
+  // 本地小模型：完整 schema 会压垮上下文且模型常抄不对结构。
+  // 精简为「名称 + 描述 + 必填参数名」即可，让模型用极简 JSON 调用。
+  // 弱模型模式（1.1.17）进一步：必填参数 + 有穷选项(Enum)参数都标注取值限制，直接缩小模型选择空间。
+  if (cfg && cfg.meta && cfg.meta.local) {
+    return list.map((t) => {
+      const props = (t.parameters && t.parameters.properties) || {};
+      const req = (t.parameters && t.parameters.required) || [];
+      const reqSet = new Set(req);
+      // 必填参数 + 带 Enum 的可选参数（限制模型选择面，弱模型尤其受益）
+      const show = req.slice();
+      for (const k of Object.keys(props)) {
+        if (!reqSet.has(k) && Array.isArray(props[k].enum) && props[k].enum.length) show.push(k);
+      }
+      const args = show.length
+        ? '\n  参数：' + show.map((k) => {
+            const p = props[k];
+            const enumHint = p && Array.isArray(p.enum) && p.enum.length
+              ? ` 取值限：${p.enum.join(' / ')}`
+              : '';
+            const reqMark = reqSet.has(k) ? '（必填）' : '';
+            return `"${k}"${reqMark}${enumHint}`;
+          }).join('，')
+        : '\n  参数：无（可空对象 {}）';
+      return `● ${t.name}：${t.description}${args}`;
+    }).join('\n\n');
+  }
   return list.map((t) => {
     const props = (t.parameters && t.parameters.properties) || {};
     const req = (t.parameters && t.parameters.required) || [];

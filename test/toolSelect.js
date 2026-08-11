@@ -37,7 +37,8 @@ const TOOLS = [
   { name: 'spawn_subagent', description: '派生隔离上下文的子代理，可并行执行也可按依赖组队', parameters: {} },
   { name: 'search_codebase', description: '全仓库语义检索代码片段', parameters: {} },
   { name: 'run_background_agent', description: '把耗时任务丢到后台异步执行', parameters: {} },
-  { name: 'background_jobs', description: '查看取消清理后台任务', parameters: {} }
+  { name: 'background_jobs', description: '查看取消清理后台任务', parameters: {} },
+  { name: 'run_slash_command', description: '按项目里的标准命令模板执行流程', parameters: {} }
 ];
 const ALL_NAMES = new Set(TOOLS.map((t) => t.name));
 

@@ -274,7 +274,7 @@ function sessionSummaryPath(dir, sessionId) {
  * @param {Array} messages 要压缩的对话消息数组（角色 + 内容）
  * @returns {Promise<string|null>} 写入的文件路径；无需压缩或失败时返回 null
  */
-async function summarizeConversation(context, messages, { onLog, signal, sessionId, dir } = {}) {
+async function summarizeConversation(context, messages, { onLog, signal, sessionId, dir, protocol } = {}) {
   if (!Array.isArray(messages) || messages.length < 2) return null;
 
   const cfg = config.conf().get('knowledgeBase.autoSummarize', {}) || {};
@@ -282,15 +282,34 @@ async function summarizeConversation(context, messages, { onLog, signal, session
   const summaryDir = dir || defaultAutoSummaryDir(cfg.dir);
   fs.mkdirSync(summaryDir, { recursive: true });
 
-  // 组装对话文本（超长内容截断，避免单次请求过大）
-  const text = messages
-    .map((m) => {
-      const role = m && m.role ? m.role : 'user';
-      const c = (m && m.content) || '';
-      const body = typeof c === 'string' ? c : JSON.stringify(c);
-      return `【${role}】\n${body.slice(0, 4000)}`;
-    })
-    .join('\n\n');
+  // 组装对话文本：优先走「类型感知专用预处理」（本地、零模型开销、最大化压缩冗余），
+  // 失败则回退到原来的通用拼接，保证语义压缩层永不中断。
+  const { typeAwarePrepare } = require('./compress');
+  let prepareResult = null;
+  try {
+    prepareResult = typeAwarePrepare(messages, { protocol: protocol || 'native', maxBytes: 8000 });
+  } catch (_) {
+    prepareResult = null;
+  }
+  const text = prepareResult
+    ? prepareResult.prepared
+    : messages
+        .map((m) => {
+          const role = m && m.role ? m.role : 'user';
+          const c = (m && m.content) || '';
+          const body = typeof c === 'string' ? c : JSON.stringify(c);
+          return `【${role}】\n${body.slice(0, 4000)}`;
+        })
+        .join('\n\n');
+  if (prepareResult && onLog) {
+    const s = prepareResult.stats;
+    const ratioPct = Math.abs(s.ratio * 100).toFixed(0);
+    const direction = s.ratio > 0 ? '压缩' : (s.ratio < 0 ? '膨胀' : '持平');
+    const fallbackTag = s.fallback ? '（已回退）' : '';
+    onLog(
+      `🔧 类型感知预处理：原始 ${s.rawChars} 字 → 精简 ${s.preparedChars} 字（${direction} ${ratioPct}%${fallbackTag}）；工具结果 ${s.tool} 段、用户 ${s.user} 段、助手 ${s.assistant} 段、深度思考 ${s.reasoning} 段`
+    );
+  }
 
   const prompt = [
     '你是一个对话压缩助手。请把下面这段对话压缩成结构化摘要（简体中文），便于后续检索与衔接。',
@@ -306,6 +325,7 @@ async function summarizeConversation(context, messages, { onLog, signal, session
     '## 用户偏好 / 约定',
     '',
     '对话内容：',
+    '注：下方带【工具·X】标签的段落已由本地算法做行级压缩，请重点保留「改动了哪些文件/符号、命令退出状态、关键错误行」，而不要复述原始输出；带【思考结论】标签的段落只保留结论要点。',
     '---',
     text,
     '---'

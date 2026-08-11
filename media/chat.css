@@ -157,9 +157,11 @@ body {
   margin-bottom: 6px;
 }
 .context-bar-fill {
-  height: 100%; border-radius: 999px;
+  height: 100%; width: 100%; border-radius: 999px;
   background: linear-gradient(90deg, var(--vscode-charts-blue, #3794ff), var(--vscode-charts-green, #3fb950));
-  transition: width .3s var(--fox-ease);
+  /* 进度动画走合成层 scaleX，避免 width 过渡触发布局重排 */
+  transform: scaleX(var(--p, 0)); transform-origin: left center;
+  transition: transform .3s var(--fox-ease);
 }
 .context-limit { font-size: 11px; opacity: .8; }
 .context-hint { font-size: 10.5px; opacity: .58; margin-top: 4px; }
@@ -175,12 +177,12 @@ body {
   background: var(--vscode-progressBar-background, rgba(128, 128, 128, .15));
   margin-top: 5px;
 }
-.context-item-fill { height: 100%; border-radius: 999px; transition: width .3s var(--fox-ease); }
+.context-item-fill { height: 100%; width: 100%; border-radius: 999px; transform: scaleX(var(--p, 0)); transform-origin: left center; transition: transform .3s var(--fox-ease); }
 .context-compress { padding: 9px 11px; margin-bottom: 8px; border-radius: var(--fox-rad-sm); background: var(--fox-glass); }
 .context-compress.ready { border: 1px solid var(--vscode-charts-orange, #d18616); }
 .cc-title { font-size: 11px; font-weight: 600; opacity: .88; margin-bottom: 5px; }
 .context-compress-bar { height: 7px; border-radius: 999px; overflow: hidden; background: var(--vscode-progressBar-background, rgba(128, 128, 128, .2)); margin-bottom: 5px; }
-.context-compress-fill { height: 100%; border-radius: 999px; background: var(--vscode-charts-green, #3fb950); transition: width .3s var(--fox-ease); }
+.context-compress-fill { height: 100%; width: 100%; border-radius: 999px; background: var(--vscode-charts-green, #3fb950); transform: scaleX(var(--p, 0)); transform-origin: left center; transition: transform .3s var(--fox-ease); }
 .context-compress.ready .context-compress-fill { background: var(--vscode-charts-orange, #d18616); }
 .context-compress.no-content .context-compress-fill { background: var(--vscode-charts-foreground, #999); }
 .cc-status { font-size: 11px; line-height: 1.45; }
@@ -263,7 +265,7 @@ body {
 }
 .quick-btn:active { transform: translateY(0); }
 
-.msg { margin-bottom: 16px; animation: rise var(--fox-rise) both; }
+.msg { margin-bottom: 16px; animation: rise var(--fox-rise) both; contain: layout style paint; /* 长会话下视口外的消息跳过渲染与布局，滚动/展开大幅流畅 */ content-visibility: auto; contain-intrinsic-size: auto 220px; }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 .msg .role {
   font-size: 10px; letter-spacing: .6px; text-transform: uppercase;
@@ -296,6 +298,19 @@ body {
   padding: 1.5px 5px; border-radius: var(--fox-rad-sm);
   font-family: var(--vscode-editor-font-family, monospace); font-size: .9em;
 }
+.bubble table {
+  border-collapse: collapse; width: 100%; max-width: 100%; margin: 10px 0 12px;
+  font-size: .92em; display: block; overflow-x: auto; /* 宽表横向滚动，避免撑破气泡 */
+}
+.bubble th, .bubble td {
+  border: 1px solid var(--fox-line, rgba(128, 128, 128, .35));
+  padding: 6px 10px; text-align: left; vertical-align: top; white-space: nowrap;
+}
+.bubble thead th {
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, .12));
+  font-weight: 650;
+}
+.bubble tbody tr:nth-child(even) { background: rgba(128, 128, 128, .05); }
 .generated-image { position: relative; display: inline-block; max-width: 100%; margin: 8px 0 4px; }
 .generated-image img { max-width: 100%; border-radius: var(--fox-rad); display: block; box-shadow: var(--fox-shadow-sm); }
 .gen-image-save {
@@ -352,6 +367,8 @@ body {
   background: var(--vscode-editorWidget-background, rgba(128, 128, 128, .04));
   box-shadow: var(--fox-shadow-sm);
   transition: border-color var(--fox-t), transform var(--fox-t), box-shadow var(--fox-t);
+  /* 展开/收回工具体时，重排只发生在卡片内部，不波及长会话整页 */
+  contain: layout paint style;
 }
 .tool-card:hover { transform: translateY(-1px); box-shadow: var(--fox-shadow); }
 .tool-card.kind-read { border-left-color: var(--vscode-charts-blue, #4a9eff); }
@@ -576,6 +593,8 @@ body {
   background: linear-gradient(180deg, var(--fox-glass), transparent);
   overflow: hidden;
   box-shadow: var(--fox-shadow-sm);
+  /* 把展开/收回的布局重排隔离在气泡内部，长会话不波及整页 */
+  contain: layout paint style;
 }
 .reasoning-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -594,9 +613,18 @@ body {
   max-height: 0; overflow: hidden; opacity: 0;
   padding: 0 10px;
   border-top: 1px solid transparent;
-  transition: max-height .3s var(--fox-ease), opacity .22s var(--fox-ease), padding .3s var(--fox-ease);
+  /* 仅用 transform/opacity 做动画（合成层，不触发布局重排），避免长会话下整页重排掉帧 */
+  transform: translateY(-6px) scaleY(.985);
+  transform-origin: top center;
+  transition: transform .26s var(--fox-ease), opacity .2s var(--fox-ease);
 }
-.reasoning.open .reasoning-body { max-height: 280px; opacity: 1; padding: 7px 10px 9px; overflow: auto; border-top-color: var(--fox-line); }
+.reasoning.open .reasoning-body {
+  max-height: 280px; opacity: 1;
+  padding: 7px 10px 9px;
+  transform: none;
+  overflow: auto; border-top-color: var(--fox-line);
+  will-change: transform, opacity;
+}
 .reasoning-item {
   display: flex; align-items: flex-start; gap: 7px;
   padding: 3px 0; line-height: 1.5;
@@ -768,3 +796,96 @@ body {
 
 .user-attachments { margin-top: 7px; }
 .user-attachments .att-chip { font-size: 10.5px; padding: 2px 8px; }
+
+/* ================= 富文本增强 ================= */
+
+/* 外链图片缩略图 */
+.bubble img.ext-img {
+  max-width: min(360px, 100%);
+  width: auto; height: auto;
+  border-radius: var(--fox-rad);
+  box-shadow: var(--fox-shadow-sm);
+  margin: 8px 0 4px;
+  display: block;
+  background: var(--fox-glass);
+}
+
+/* 代码语法高亮（highlight.js，跟随亮/暗主题） */
+.code-block pre code.hljs { background: transparent; padding: 0; }
+.bubble .hljs { color: #24292e; background: transparent; }
+.bubble .hljs-keyword, .bubble .hljs-literal, .bubble .hljs-built_in,
+.bubble .hljs-type, .bubble .hljs-class .hljs-title, .bubble .hljs-title.function_ { color: #d73a49; }
+.bubble .hljs-string, .bubble .hljs-meta .hljs-string, .bubble .hljs-regexp, .bubble .hljs-addition { color: #032f62; }
+.bubble .hljs-number, .bubble .hljs-symbol, .bubble .hljs-bullet, .bubble .hljs-link { color: #005cc5; }
+.bubble .hljs-comment, .bubble .hljs-quote { color: #6a737d; font-style: italic; }
+.bubble .hljs-title, .bubble .hljs-section, .bubble .hljs-name, .bubble .hljs-selector-id, .bubble .hljs-selector-class { color: #6f42c1; }
+.bubble .hljs-attr, .bubble .hljs-attribute, .bubble .hljs-variable, .bubble .hljs-template-variable, .bubble .hljs-property { color: #e36209; }
+.bubble .hljs-tag { color: #22863a; }
+.bubble .hljs-deletion { color: #b31d28; }
+.bubble .hljs-emphasis { font-style: italic; }
+.bubble .hljs-strong { font-weight: 600; }
+.bubble .hljs-meta { color: #6a737d; }
+@media (prefers-color-scheme: dark) {
+  .bubble .hljs { color: #d4d4d4; }
+  .bubble .hljs-keyword, .bubble .hljs-literal, .bubble .hljs-built_in,
+  .bubble .hljs-type, .bubble .hljs-class .hljs-title, .bubble .hljs-title.function_ { color: #569cd6; }
+  .bubble .hljs-string, .bubble .hljs-meta .hljs-string, .bubble .hljs-regexp, .bubble .hljs-addition { color: #ce9178; }
+  .bubble .hljs-number, .bubble .hljs-symbol, .bubble .hljs-bullet, .bubble .hljs-link { color: #b5cea8; }
+  .bubble .hljs-comment, .bubble .hljs-quote { color: #6a9955; font-style: italic; }
+  .bubble .hljs-title, .bubble .hljs-section, .bubble .hljs-name, .bubble .hljs-selector-id, .bubble .hljs-selector-class { color: #dcdcaa; }
+  .bubble .hljs-attr, .bubble .hljs-attribute, .bubble .hljs-variable, .bubble .hljs-template-variable, .bubble .hljs-property { color: #9cdcfe; }
+  .bubble .hljs-tag { color: #4ec9b0; }
+  .bubble .hljs-deletion { color: #f14c4c; }
+}
+
+/* 数学公式（KaTeX） */
+.bubble .katex { font-size: 1.05em; }
+.bubble .katex-display { margin: 10px 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.bubble .katex-display > .katex { white-space: nowrap; }
+.bubble .math-fallback {
+  font-family: var(--vscode-editor-font-family, monospace);
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, .08));
+  border: 1px solid var(--fox-line); border-radius: var(--fox-rad-sm);
+  padding: 6px 10px; margin: 8px 0; white-space: pre-wrap; font-size: .92em;
+}
+
+/* 搜索引用角标 */
+.bubble sup.cite {
+  color: var(--vscode-textLink-foreground);
+  font-weight: 600; cursor: default; margin: 0 1px; font-size: .78em;
+}
+.bubble .cites {
+  margin-top: 9px; padding-top: 7px;
+  border-top: 1px dashed var(--fox-line);
+  font-size: .82em; opacity: .9; line-height: 1.6;
+}
+.bubble .cites .cites-label { opacity: .7; margin-right: 6px; }
+.bubble .cites .cite-item { display: block; }
+.bubble .cites .cite-idx { color: var(--vscode-textLink-foreground); font-weight: 600; margin-right: 4px; }
+
+/* 可点击的引用（角标 + 来源条目）与正文外链 */
+.bubble sup.cite.link {
+  cursor: pointer;
+  border-bottom: 1px dotted currentColor;
+  transition: color .12s ease, opacity .12s ease;
+}
+.bubble sup.cite.link:hover,
+.bubble sup.cite.link:focus-visible {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+  opacity: 1; outline: none;
+}
+.bubble .cites .cite-link,
+.bubble a.ext-link {
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer; text-decoration: none;
+  border-bottom: 1px solid transparent;
+  word-break: break-all;
+}
+.bubble .cites .cite-link:hover,
+.bubble .cites .cite-link:focus-visible,
+.bubble a.ext-link:hover,
+.bubble a.ext-link:focus-visible {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+  border-bottom-color: currentColor; outline: none;
+}
+

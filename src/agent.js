@@ -6,6 +6,8 @@ const { chatOnce, chatNonStream, streamResponses, chatNonStreamResponses } = req
 const anthropic = require('./anthropic');
 const config = require('./config');
 const tools = require('./tools');
+const weakModel = require('./weakModel');
+const grammarProbe = require('./grammarProbe');
 const ws = require('./tools/workspace');
 const ctxTools = require('./tools/context');
 const undo = require('./undo');
@@ -39,9 +41,9 @@ const llmLimiter = createLimiter(MAX_CONCURRENT_LLM);
 // 工具名捕获组必须覆盖真实 MCP 命名空间里的连字符/点/斜杠/大写，
 // 例如 mcp__fetch__fetch-url、mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page。
 // 早期版本用 [a-z_]+ 导致带特殊字符的工具名匹配失败、工具从不执行（表现为「返回空」）。
-// 兼容模型输出 <fox:tool>（规范写法）和 <foxtool>（部分模型会吞掉冒号）两种标签。
-const TOOL_OPEN = /<fox:?tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
-const TOOL_BLOCK = /<fox:?tool\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/fox:?tool>/gi;
+// 兼容模型输出 <fox:tool>（规范写法）、<foxtool>（吞冒号）、<tool> / <fox-tool> 等变体。
+const TOOL_OPEN = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
+const TOOL_BLOCK = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/(fox:?tool|fox-tool|tool)>/gi;
 const TOOL_END = '</fox:tool>';
 
 /** 写一条调试日志到 ~/.fox-ai/logs/agent-<name>.log，失败静默忽略 */
@@ -83,6 +85,39 @@ function selectBackend(cfg) {
     once: useResp ? null : chatOnce,
     responses: useResp
   };
+}
+
+/**
+ * 判断模型是否「开箱即用原生 function calling」。用于 toolProtocol='auto' 时在不撞 400 的前提下
+ * 直接选对协议，提升对各类厂商/本地模型的适配性（增强③）。
+ * 返回 true → 走 native（function calling）；false → 走 text（让模型以 <fox:tool> 输出，本地解析）。
+ * 注意：anthropic 传输层自带 tool_use，统一按 native 处理；这里只针对 openai 兼容系。
+ */
+function modelSupportsNativeTools(cfg) {
+  if (cfg.transport === 'anthropic') return true;
+  const model = String(cfg.model || '').toLowerCase();
+  const provider = String(cfg.provider || '').toLowerCase();
+  // 本地服务默认不走 native：llama.cpp / Ollama / LM Studio 等多数部署需要 --jinja 等
+  // 额外配置才支持 function calling，默认走 text 协议更稳；需要原生 tools 可手动设置
+  // foxAi.agent.toolProtocol='native'。
+  if (cfg.meta && cfg.meta.local) return false;
+  // 兜底： provider / model 名称里的本地标识
+  const textOnlyProviders = ['ollama', 'lmstudio', 'localai', 'text-generation-webui', 'kobold', 'llama.cpp', 'llamacpp', 'tabbyapi'];
+  if (textOnlyProviders.includes(provider)) return false;
+  if (provider === 'local' || model.includes('.gguf') || model.endsWith('.gguf')) return false;
+  // 显式声明不支持 function calling 的模型系列（只放常见小/旧模型，避免误伤带 provider 前缀的厂商模型）
+  const textOnlyModels = [
+    'qwen2:', 'qwen2.5:', 'qwen3:', 'qwen3.6', 'phi-', 'gemma-2b', 'gemma-4b',
+    'codellama', 'vicuna', 'openchat', 'stablelm', 'dolly', 'starcoder',
+    'wizardcoder', 'phind', 'deepseek-r1', 'deepseek-reasoner'
+  ];
+  for (const h of textOnlyModels) {
+    if (model.includes(h)) return false;
+  }
+  // 某些推理模型（o1/o3 系列旧版）在 chat 接口不支持 tools；命中走 text 更稳
+  if (/^o[13]-/.test(model)) return false;
+  // 主流云厂商（OpenAI、DeepSeek、SiliconFlow、OpenRouter、Gemini、Anthropic、GLM、ERNIE、Qwen-Turbo 等）默认 native
+  return true;
 }
 
 class Cancelled extends Error {
@@ -133,27 +168,103 @@ function makeToken() {
   };
 }
 
+/**
+ * 跨厂商兼容的参数解析：各厂商模型（尤其本地 / 小模型）产出的「工具参数」常常不是严格 JSON，
+ * 这里做多层容错修复，让同一套本地工具对所有模型都可用（增强③核心之一）。
+ * 修复层级：标准 JSON → 去 markdown 包裹 → 修尾部逗号/单引号/未加引号键 → 行式 key:value 兜底。
+ */
 function safeParseArgs(raw) {
   if (raw == null || raw === '') return {};
   if (typeof raw === 'object') return raw;
-  const text = String(raw).trim();
-  try {
-    return JSON.parse(text);
-  } catch (_) {}
-  // 容错：去掉 markdown 包裹、修剪尾部逗号
-  const fenced = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-  try {
-    return JSON.parse(fenced);
-  } catch (_) {}
+  let text = String(raw).replace(/^﻿/, '').trim();
+  const tryJson = (s) => {
+    try { return JSON.parse(s); } catch (_) { return undefined; }
+  };
+  let v = tryJson(text);
+  if (v && typeof v === 'object') return v;
+
+  // 1) 去掉 ```json 包裹
+  const fenced = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  v = tryJson(fenced);
+  if (v && typeof v === 'object') return v;
+
+  // 2) 抽取第一个 { ... } 块，做「宽松 JSON 修复」：单引号→双引号、未加引号键加引号、尾部逗号
   const start = fenced.indexOf('{');
   const end = fenced.lastIndexOf('}');
   if (start !== -1 && end > start) {
-    const slice = fenced.slice(start, end + 1).replace(/,\s*([}\]])/g, '$1');
-    try {
-      return JSON.parse(slice);
-    } catch (_) {}
+    let body = fenced.slice(start, end + 1);
+    body = body
+      .replace(/\/\/.*$/gm, '')               // 行注释
+      .replace(/,\s*([}\]])/g, '$1')          // 尾部逗号
+      .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)\s*:/g, '$1"$2":')  // 未加引号键
+      .replace(/:\s*'([^']*)'/g, ': "$1"')    // 单引号值→双引号
+      .replace(/'([^']*)'\s*:/g, '"$1":')     // 单引号键→双引号
+      .replace(/:\s*'([^']*)'/g, ': "$1"');   // 再次兜底单引号值
+    v = tryJson(body);
+    if (v && typeof v === 'object') return v;
   }
+
+  // 3) 行式 key: value 兜底（模型用 YAML 风格输出参数时）
+  if (text.includes(':') && !text.includes('{')) {
+    const obj = {};
+    let ok = false;
+    for (const line of text.split(/\n+/)) {
+      const m = line.match(/^\s*([A-Za-z_$][\w$-]*)\s*[:=]\s*(.*)$/);
+      if (m) { obj[m[1]] = m[2].trim().replace(/^["']|["']$/g, ''); ok = true; }
+    }
+    if (ok) return obj;
+  }
+
   throw new Error('参数不是合法 JSON：' + text.slice(0, 200));
+}
+
+/**
+ * 从文本 start 位置起，找到与首个 { 匹配的闭合 }（正确处理字符串内的括号与转义）。
+ * 用于从模型的自由文本里截出一个完整的 JSON 对象块。
+ */
+function extractBalanced(s, start) {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return s.slice(start, i + 1); }
+  }
+  return '';
+}
+
+/** 从模型输出里抽取疑似工具调用的 JSON 块（含 ```json 围栏 与 裸对象 {name/tool/action:...}） */
+function collectJsonToolCandidates(text) {
+  const out = [];
+  const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let m;
+  while ((m = fence.exec(text)) !== null) out.push(m[1]);
+  const objRe = /\{[^{}]*"name"\s*:|\{[^{}]*"tool"\s*:|\{[^{}]*"action"\s*:/g;
+  while ((m = objRe.exec(text)) !== null) {
+    const slice = extractBalanced(text, m.index);
+    if (slice) out.push(slice);
+  }
+  return out;
+}
+
+/**
+ * read_file 去重用的「区间签名」：把 路径 + 行范围 + 字符范围 归一化成一个字符串。
+ * 只有当「完全相同区间」被反复读取时才算重复；模型用不同 start_line/end_line 分区间读
+ * （例如 1-300、547、530-168）属于不同的签名，不应被判为重复——否则刷新窗口/重载扩展后
+ * 会话上下文丢失、模型需要重新取回文件内容时，会被误判「已读够」而卡死。
+ * 注意：read_file 工具参数名是 start_line / end_line / start_char / end_char，不是 startLine/maxLength。
+ */
+function readFileSig(p, a) {
+  const path = String(p || '').replace(/\\/g, '/');
+  const num = (v) => (v === undefined || v === null || v === '') ? 0 : (parseInt(v, 10) || 0);
+  const sl = num(a && a.start_line);
+  const el = num(a && a.end_line);
+  const sc = num(a && a.start_char);
+  const ec = num(a && a.end_char);
+  return path + '#' + sl + '#' + el + '#' + sc + '#' + ec;
 }
 
 function buildExtensionCommandsSection() {
@@ -182,6 +293,9 @@ ${lines.join('\n')}
 function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
   const base = cfg.systemPrompt || '你是一位资深工程师，回答简洁准确。';
   const extSection = buildExtensionCommandsSection();
+  // 本地小模型（Ollama / LM Studio / llama.cpp 等）上下文窄、指令跟随弱：
+  // 用精简版系统提示，避免 21 条工作准则 + 12 条编码铁律 + 全工具 schema + MCP 自写指南把它压垮。
+  const isLocal = !!(cfg.meta && cfg.meta.local);
 
   // 深度思考：模型没有原生思考开关时（deepseek-chat、常规 GPT 等），用提示词兜底
   const rp = reasoning.buildReasoningParams(cfg, { stream: !cfg.forceNonStream });
@@ -226,6 +340,23 @@ ${envBrief}
 - 生图（重要）：当用户要求画图、生成/创作图片、做海报/图标/logo/示意图/概念图/配图，或出现「画一个/画只/画张/生图/生成图片/配张图」等意图时，你必须调用 generate_image 工具。该工具使用在「狐狸 AI · 多模态生图（实验）」设置里单独配置的生图模型，与主控聊天模型完全隔离——即使你（主控模型）本身不能直接出图，也要通过它把图片生成并显示在对话里。除非用户明确要求「矢量图 / SVG / HTML 动画」，否则不要用 SVG、Python、HTML/CSS 等方式替代生图。
 - 识图：用户发送的图片会自动经「多模态识图中转」转成文字描述后再交给你推理，你无需调用任何工具即可理解图片内容；若看到“图片已忽略”的提示，说明未开启识图中转或当前模型不支持读图，此时直接向用户说明需要开启 foxAi.vision 或换用支持读图的模型即可。`;
 
+  // 12 条编码铁律（用户要求注入，尽量省 token：极简中文 + 单行，不重复工作准则已有内容）。
+  // 作为系统提示词的固定一小段，让所有厂商模型在编码时都遵循同一套方法论。
+  const codingRules = `
+【编码铁律（必须遵守，越界时优先于“尽快完成”）】
+1. 先想后写：不臆测，先暴露取舍与风险。
+2. 极简优先：最小代码，不写猜测性/防御性冗余。
+3. 手术式改动：只动必须动的地方。
+4. 目标驱动：先定义“完成”标准，循环直到可验证通过。
+5. 模型只做判断：确定性/体力活交给工具与脚本。
+6. Token 预算是硬约束，不是建议：优先省 token，必要时再展开。
+7. 暴露冲突，不要折中平均：方案相悖就明说，别各取一半。
+8. 写之前先读：改文件前必须看过真实内容。
+9. 测试验证意图而非行为：测“为什么对”，不是“能不能跑”。
+10. 每步留检查点：完成一步就落实（保存/校验/记录），可随时恢复。
+11. 顺应既有约定：即便不认同也先遵循项目风格与规范。
+12. 失败要响亮：出错就明确报错并停下，别静默吞掉或假装成功。`;
+
   const common = `${base}
 
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
@@ -252,29 +383,57 @@ ${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 去读真实内容，不要反问“你的意思是…？”、不要凭记忆猜测、不要编造文件内容。读完后再基于原文回答或继续操作。\n17. 自动代码审查：你每完成一轮代码写操作（edit_file / write_file / delete_file），系统会用只读的审查子代理对改动做一次检查，并把审查意见作为后续观察发回给你。若审查意见指出明显问题（尤其 🔴 严重项），请在本轮结束前据以修正，不要带着低级错误直接收尾；若审查认为无问题，正常继续即可。\\n18. 自我验证：输出结论或声称“完成”前，先自检——事实是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题。剔除不准确或冗余信息。\n19. 安全自检双盲校验：调用 security_audit 做代码安全自检时，其结果仅供参考，**禁止作为修复的唯一依据**。当你据自检结论做了修复后，必须再调用只读的 referee_review（裁判 Agent）对比「修复前 HEAD 原版 vs 修复后工作区」的语义差异；若裁判判定「修复前后逻辑等价」（即自检疑似误报），必须**强制挂起转人工**，不得自行放行或忽略。
 20. 子代理编排：遇到「多条互不相干的支线可以同时查」或「某个子任务要翻十几个文件、会产生大量中间过程」时，用 spawn_subagent 把它们派出去——子代理有独立上下文，它的探索过程不会占用你的上下文，你只收到最终结论，这能显著省 token 也更快。角色按权限选（explorer 只读探索 / coder 可改代码 / reviewer 只读挑错 / tester 可跑命令 / researcher 可联网 / planner 只做拆解）。每个 task 必须具体自包含，需要的背景写进 context（子代理看不到你和用户的对话）。有先后依赖就用 depends_on 组队，会自动分批并把前置结论传给后置。**但别滥用**：一两次工具调用能搞定的事自己做，简单任务派代理反而更慢。
 
-21. 后台任务：只有当用户**明确表达异步意图**（「你先在后台帮我做 X，我干点别的」「顺手把测试补了，不用等」）或任务明显极耗时（全项目补测试、大范围重构）时，才用 run_background_agent 丢后台。丢完立刻回复「已在后台开始处理」并继续处理用户的其它需求，**不要**原地反复查询等它跑完。用户此刻在等结果的活儿，一律当场做。后台任务在 git 仓库里会自动开独立分支与副本，不会碰用户正在编辑的文件；非 git 仓库则自动降级为只读调研。后台任务结束后结论**不会**自动出现在对话里，用户问起时用 background_jobs（action=get）把结论取回来再回答。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：面对需要多个步骤才能完成的任务（如新建或修改多个文件、跑测试、跨模块改动），先用 create_plan_task 把完整计划逐条列出（含每步目标），再调用 present_plan 把计划提交给用户确认；调用 present_plan 之后必须停止，不得执行任何写文件或执行命令的操作，耐心等待用户确认。用户确认后你再逐步执行，每完成一步用 update_plan_task 标记状态。执行过程中若需调整计划（增删步骤或改变目标），必须先调用 update_plan_task / create_plan_task 改好计划，再调用 revise_plan 并说明原因，等待用户再次确认后才继续，不得擅自偏离已确认的计划。` : '') + extSection + '\n\n' + mcpAuthor.MCP_AUTHORING_GUIDE;
+21. 后台任务：只有当用户**明确表达异步意图**（「你先在后台帮我做 X，我干点别的」「顺手把测试补了，不用等」）或任务明显极耗时（全项目补测试、大范围重构）时，才用 run_background_agent 丢后台。丢完立刻回复「已在后台开始处理」并继续处理用户的其它需求，**不要**原地反复查询等它跑完。用户此刻在等结果的活儿，一律当场做。后台任务在 git 仓库里会自动开独立分支与副本，不会碰用户正在编辑的文件；非 git 仓库则自动降级为只读调研。后台任务结束后结论**不会**自动出现在对话里，用户问起时用 background_jobs（action=get）把结论取回来再回答。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：面对需要多个步骤才能完成的任务（如新建或修改多个文件、跑测试、跨模块改动），先用 create_plan_task 把完整计划逐条列出（含每步目标），再调用 present_plan 把计划提交给用户确认；调用 present_plan 之后必须停止，不得执行任何写文件或执行命令的操作，耐心等待用户确认。用户确认后你再逐步执行，每完成一步用 update_plan_task 标记状态。执行过程中若需调整计划（增删步骤或改变目标），必须先调用 update_plan_task / create_plan_task 改好计划，再调用 revise_plan 并说明原因，等待用户再次确认后才继续，不得擅自偏离已确认的计划。` : '') + codingRules + extSection + '\n\n' + mcpAuthor.MCP_AUTHORING_GUIDE;
+
+  // 本地小模型精简版：去掉重型工作准则（多模态/技能/子代理/后台/MCP 自写）、MCP_AUTHORING_GUIDE，
+  // 只保留编码铁律 + 8 条最关乎工具正确调用的核心准则，降低指令跟随负担。
+  const commonLocal = `${base}
+
+你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
+
+【当前环境】
+${envBrief}${structured}${deepThinkingHint}
+
+【工作准则（精简版，针对本地模型）】
+1. 修改任何文件前，必须先用 read_file 看过真实内容；编辑用 edit_file 做最小必要改动，不要整文件重写。
+2. 执行命令必须是非交互式的（带上 -y / --yes 等），不要启动会一直挂起不返回的进程。
+3. 一次只做一步，根据工具返回结果决定下一步；不要假设工具已经成功，要核实结果。
+4. 任务完成后用中文简明总结改了什么、为什么改；需求不清晰或有破坏性风险时先说明并询问用户。
+5. 删除 / 覆盖 / 移动 / 重命名等不可逆操作，以及 rm -rf、git reset --hard 这类命令，务必先确认目标与后果。
+6. 声称「完成」之前，必须用工具核实结果（get_diagnostics 看报错、跑测试、读回文件），不要凭假设说成功。
+7. 当用户问当前时间、日期、天气、新闻、最新版本等时效性信息时，必须调用 current_time 或 web_search 工具后再回答，不要说"我无法获取"。
+8. 如果回复文本里没有任何工具调用块，系统会把它当作最终回答直接展示给用户。${codingRules}`;
+
+  const commonUsed = isLocal ? commonLocal : common;
 
 
 
   if (protocol === 'text') {
-    return `${common}
+    // 本地弱模型辅助模式（1.1.17）：在系统提示词头尾重复「核心任务锚点」，
+    // 防止长链工具调用时模型注意力漂移、忘了用户最初要什么。
+    const anchor = (isLocal && queryText) ? weakModel.buildAnchor(queryText) : '';
+    const anchorHead = anchor ? `【⚓ 核心任务·始终牢记】${anchor}\n\n` : '';
+    const anchorTail = anchor ? `\n\n【⚓ 再次提醒·核心任务】你刚才要完成的是：${anchor}。请围绕它作答，不要跑题。` : '';
+    return `${anchorHead}${commonUsed}
 
 【调用工具的方式】
-你没有原生函数调用，请严格用下面这种格式调用工具，一次只调用一个：
+你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看 <foxtool> 块：
 
 <foxtool name="工具名">
 {"参数名": "参数值"}
 </foxtool>
 
-工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待我把结果发给你。
-不需要调用工具时，直接用自然语言回答，绝对不要输出 <foxtool> 标签。
-收到工具返回后，必须基于返回内容整理成最终回答；如果工具返回为空、未找到数据或返回格式异常，要明确指出「工具返回为空/未找到」，不能留空。
+规则：
+1. 工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待我把结果发给你。
+2. 如果文本中没有任何 <foxtool> 块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
+3. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出 <foxtool> 块，不要额外解释。
+4. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
 
 【可用工具】
-${tools.toTextManual(queryText, cfg)}`;
+${tools.toTextManual(queryText, cfg)}${anchorTail}`;
   }
 
-  return common;
+  return commonUsed;
 }
 
 /**
@@ -910,6 +1069,59 @@ class AgentSession {
     }
   }
 
+  /**
+   * 方法论「限制思考-行动轮次」：达到硬性步数上限时的挂起处理。
+   *
+   * 旧实现直接 `return {reason:'max-steps'}`，run() 一返回 chatView 的 finally 就把
+   * `this.session = null`，于是「暂停 / 继续 / 停止」按钮的 `if (this.session)` 全部落空
+   * —— 表现就是界面卡在运行态、点什么都没反应。这里改为**就地真正挂起**：
+   * 置 paused 并在 gate 上等待，run() 不返回、session 保持存活，三个按钮都有效；
+   * 用户点「继续」即从断点接着跑，点「停止」则由 gate 抛 Cancelled 走正常取消流程。
+   *
+   * @param {string} queryText 本轮用户问题（供压缩器摘要用）
+   * @param {string} envBrief  环境摘要
+   * @param {number} used      已消耗的步数预算
+   * @returns {Promise<boolean>} true=用户点了继续（追加预算续跑）；false=无法挂起，按旧逻辑返回
+   */
+  async _hardStopPause(queryText, envBrief, used) {
+    // 先尝试压缩上下文（丢弃长链路里无用的推理痕迹），给续跑腾出空间
+    try {
+      if (this.cfg.autoSummarize && this.cfg.autoSummarize.enabled) {
+        await this._maybeAutoCompress(queryText, envBrief);
+      }
+    } catch (_) {}
+    const { appendLog } = require('./log');
+    appendLog(
+      'maxSteps',
+      '[limit] steps=' + used + ' hold; autoCompress=' + !!(this.cfg.autoSummarize && this.cfg.autoSummarize.enabled)
+    );
+    if (this.cancelled) return false;
+    this.emit('notice', {
+      text: `已连续执行 ${used} 步仍未结束，达到硬性上限，已暂停在断点。点上方「继续」即可接着做（也可停止，或调大 foxAi.agent.maxSteps）。`
+    });
+    this.emit('step', { kind: 'notice', title: `达到 ${used} 步上限，等待确认`, status: 'warn' });
+    // 真正挂起：pause() + gate() —— run() 停在这里，session 不被回收
+    this.paused = true;
+    this.emit('state', { state: 'paused' });
+    if (this.task) {
+      try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.PAUSED); } catch (_) {}
+    }
+    await new Promise((resolve) => this._resumeWaiters.push(resolve));
+    if (this.cancelled) throw new Cancelled();
+    this.paused = false;
+    this._pausedLogged = false;
+    if (this.task) {
+      try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.RUNNING).catch(() => {}); } catch (_) {}
+    }
+    this.emit('state', { state: 'running' });
+    appendLog('maxSteps', '[resume] budget+=' + (this.cfg.maxSteps || 0));
+    this.messages.push({
+      role: 'user',
+      content: '[系统] 用户已确认继续。请从上次中断处接着做，先用一句话说明当前进度，再继续推进；能收尾就尽快收尾。'
+    });
+    return true;
+  }
+
   /* ---------- 主循环 ---------- */
 
   /** 从对话历史里取一个简短任务标题 */
@@ -1081,9 +1293,25 @@ class AgentSession {
       this.protocol = 'native';
     } else if (this._forceText) {
       this.protocol = 'text';
+    } else if (!this.toolsEnabled) {
+      this.protocol = 'chat';
+    } else if (cfg.toolProtocol === 'text') {
+      this.protocol = 'text';
+    } else if (cfg.toolProtocol === 'native') {
+      this.protocol = 'native';
     } else {
-      this.protocol = !this.toolsEnabled ? 'chat' : cfg.toolProtocol === 'text' ? 'text' : 'native';
+      // auto：按模型能力智能选协议，开箱即用兼容各厂商/本地模型（增强③）
+      this.protocol = modelSupportsNativeTools(cfg) ? 'native' : 'text';
     }
+    // 本地弱模型辅助模式（1.1.17）：决定是否进入弱模型适配逻辑（约束解码/检索/闭环/锚点）。
+    // cfg.localWeak 由 config.resolve 计算（auto 下本地模型默认开）。
+    this._weakLocal = !!(cfg.localWeak);
+    this._weakArgRetries = 0;
+    this._weakArgMax = 3;
+    this._grammarStripped = false;
+    this._grammarCap = null; // 本会话的 grammar 探测结论缓存（null=尚未探测）
+    // 失败降级 / 自动 failover（1.1.20）：从配置取出，callModel 失败时按 triggers 切备用模型
+    this._failover = cfg.failover || { enabled: false, triggers: new Set(), maxRetries: 0, targets: [] };
     const envBrief = await ctxTools.environmentBrief();
 
     // 取最后一条用户消息作为知识库检索查询
@@ -1188,7 +1416,15 @@ class AgentSession {
 
     try {
       const maxSteps = this.toolsEnabled ? Math.max(1, cfg.maxSteps) : 1;
-      for (let step = 0; step < maxSteps; step++) {
+      // 步数预算可续：达到硬性上限时不直接 return（那会让 chatView 把 session 置空、
+      // 导致暂停/继续/停止按钮全部失效），而是就地真正挂起，等用户点「继续」再追加一轮预算。
+      let stepBudget = maxSteps;
+      for (let step = 0; ; step++) {
+        if (step >= stepBudget) {
+          const resumed = await this._hardStopPause(queryText, envBrief, stepBudget);
+          if (!resumed) return { finished: false, reason: 'max-steps' };
+          stepBudget += maxSteps;
+        }
         await this.gate();
         this.stepCount = step + 1;
         this.deltaSeen = false;
@@ -1268,8 +1504,30 @@ class AgentSession {
           this.protocol === 'native'
             ? (result.toolCalls || []).map((c) => ({ id: c.id, name: c.name, rawArgs: c.arguments }))
             : this.protocol === 'text'
-            ? this.parseTextCalls(textSource)
+            ? this.parseTextCalls(textSource, this._toolNameSet())
             : [];
+
+        // —— 本地弱模型辅助模式（1.1.17）：闭环校验 + 自动修复 ——
+        // 文本协议下，解析出的工具调用先做 JSON Schema 校验（类型/必填/枚举）。
+        // 失败不发错误，而是把具体报错作为「反思提示」追加进下一轮 payload 让模型自我修正，
+        // 最多重试 2~3 次；连续失败转降级模式（仅执行校验通过的调用），绝不卡死。
+        if (this.protocol === 'text' && this._weakLocal && calls.length) {
+          const checked = this._validateTextCalls(calls);
+          if (checked.invalid.length) {
+            if (this._weakArgRetries < this._weakArgMax) {
+              this._weakArgRetries++;
+              this.messages.push({
+                role: 'user',
+                content: `[系统·参数校验未通过] 你刚才的工具调用参数不符合要求，请修正后重新只输出正确的 <foxtool> 块，不要重复错误。\n${checked.report}`
+              });
+              this.emit('notice', { text: `参数校验未通过，已把错误反馈给模型自我修正（${this._weakArgRetries}/${this._weakArgMax}）…` });
+              continue; // 重新请求模型
+            }
+            // 超过重试上限：降级模式，仅执行合法调用，并提示用户
+            this.emit('notice', { text: `工具调用参数多次无法自我修正，已转入降级模式：仅执行校验通过的调用。` });
+            calls = checked.valid;
+          }
+        }
 
         const visibleText =
           this.protocol === 'text' ? this.stripToolBlocks(textSource) : result.content;
@@ -1315,7 +1573,7 @@ class AgentSession {
           if ((!visibleText || !String(visibleText).trim()) && !resultImages.length) {
             const modelHint = cfg.model ? `当前模型：${cfg.model}` : '当前模型名未配置';
             this.emit('notice', {
-              text: `模型没有返回任何内容。${modelHint}。\n常见原因：1) 模型名不存在（DeepSeek 用 deepseek-chat）；2) API Key 无效；3) 该模型不支持 tools，可在设置里把 foxAi.agent.toolProtocol 改成 text。`
+              text: `模型没有返回任何内容。${modelHint}。\n常见原因：1) 模型名不存在；2) API Key 无效；3) 该模型不支持 function calling。可尝试在设置里切换 foxAi.agent.toolProtocol（native/text/auto）。`
             });
           }
           // 非流式（或文本协议）下 onDelta 不会触发，需手动把完整文本/思考推给 UI，否则面板看不到回复
@@ -1373,6 +1631,18 @@ class AgentSession {
           await this.handleToolCall(call);
           if (this.cancelled) throw new Cancelled();
         }
+        // 运行中检查点：每批工具执行完即通知 chatView debounce 落盘（Bug④ 重载恢复兜底）
+        this.emit('checkpoint');
+
+        // 循环护栏连续命中：本批工具结果全部落盘后再补一条强提醒，
+        // 避免把 user 消息插进 tool 结果中间（Anthropic 的 tool_result 必须紧跟）。
+        if (this._loopNudge) {
+          this._loopNudge = false;
+          this.messages.push({
+            role: 'user',
+            content: '[系统] 已多次检测到重复或环状的工具调用，说明当前思路在原地打转。请立刻停止这条链路：先用一段话总结「已知什么、还差什么、卡在哪」，然后要么用一个明显不同的新方案继续，要么直接给出结论并说明未完成的部分。禁止再用相同参数重试同一工具。'
+          });
+        }
 
         // 自动代码审查：本轮有代码写操作则在后台异步触发（不阻塞主代理最终回复，与主回复并行执行）
         if (this._pendingReview.length) {
@@ -1390,23 +1660,6 @@ class AgentSession {
         }
       }
 
-      // 方法论「限制思考-行动轮次」：达到硬性上限。若开启自动压缩，先触发一次状态总结器
-      // 压缩上下文（丢弃长链路里无用的推理痕迹），再提示用户；否则直接挂起等待人工/续跑。
-      try {
-        if (this.cfg.autoSummarize && this.cfg.autoSummarize.enabled) {
-          await this._maybeAutoCompress(queryText, envBrief);
-        }
-      } catch (_) {}
-      const { appendLog } = require('./log');
-      appendLog('maxSteps', '[limit] steps=' + cfg.maxSteps + ' paused; autoCompress=' + !!(this.cfg.autoSummarize && this.cfg.autoSummarize.enabled));
-      this.emit('notice', {
-        text: `已连续执行 ${cfg.maxSteps} 步仍未结束，已达硬性上限并暂停。需要的话说“继续”，或调大 foxAi.agent.maxSteps；上下文已尝试压缩以释放空间。`
-      });
-      // 任务挂起，等待从断点续跑（任务面板可一键续跑）
-      if (this.task) {
-        try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.PAUSED); } catch (_) {}
-      }
-      return { finished: false, reason: 'max-steps' };
     } catch (err) {
       if (err instanceof Cancelled || this.cancelled) {
         this.state = 'cancelled';
@@ -1646,12 +1899,19 @@ class AgentSession {
   async prepareHistory() {
     const cfg = this.cfg;
     const history = this.trimHistory();
+    // 本地弱模型辅助模式（1.1.17）：上下文窗口一长，弱模型注意力严重分散。
+    // 只保留最近 N 轮对话（默认 2 轮），其余截断，显著降低噪声。
+    let trimmedHistory = history;
+    if (this._weakLocal && cfg.weakHistoryRounds) {
+      const keep = Math.max(2, Number(cfg.weakHistoryRounds) * 2);
+      if (history.length > keep) trimmedHistory = history.slice(-keep);
+    }
     const vision = caps.supportsVision(cfg.model, cfg.visionMode, {
       visionModels: cfg.visionModels,
       textOnlyModels: cfg.textOnlyModels
     });
     this._visionUsed = vision;
-    let messages = history;
+    let messages = trimmedHistory;
     // 主模型不支持读图，但配置了第二个多模态模型：先借它把图片转成文字描述
     if (!vision && cfg.visionConfig && cfg.visionConfig.enabled && this._hasImages(history)) {
       try {
@@ -1799,6 +2059,240 @@ class AgentSession {
     }
   }
 
+  /**
+   * 本地模型（llama.cpp / Ollama / LM Studio 等）对带 tools / stop 的请求直接返回空时，
+   * 再尝试一次不带任何工具参数的纯对话调用。很多本地 GGUF（尤其社区量化/合并版）
+   * 不支持 function calling，甚至对 stop sequence 都会沉默；在 llamaserve 里能聊是
+   * 因为那里走的是纯 chat。这里的兜底让它在狐狸 AI 里至少能文字回复。
+   */
+  async retryWithoutGrammar(err, options) {
+    if (this._grammarStripped) return null;
+    if (!options || !options.extraBody || options.extraBody.grammar === undefined) return null;
+    const msg = String((err && err.message) || '');
+    // 服务端不认 grammar / guided / response_format / json_schema，或返回 400 / Bad Request
+    if (!/grammar|guided|response_format|json_schema|400|bad request|invalid.*param/i.test(msg)) return null;
+
+    this._grammarStripped = true;
+    const eb = Object.assign({}, options.extraBody);
+    delete eb.grammar;
+    const opt2 = Object.assign({}, options);
+    if (Object.keys(eb).length) opt2.extraBody = eb; else delete opt2.extraBody;
+    this.emit('notice', { text: '当前本地模型服务端不支持 grammar 约束解码，已自动关闭该选项重试（不影响其它弱模型优化）。' });
+    console.log('[fox-ai] retryWithoutGrammar: dropped grammar, retrying', msg.slice(0, 100));
+    try {
+      const b = selectBackend(this.cfg);
+      if (this.cfg.forceNonStream || this.streamBroken) {
+        return await this.fallbackIfLocalEmpty(await b.nonStream(opt2), opt2);
+      }
+      const { promise, handle } = b.responses ? wrapStream(opt2, streamResponses) : b.once(opt2);
+      this.stream = handle;
+      return await this.fallbackIfLocalEmpty(await promise, opt2);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * 判断本次是否应向本地弱模型注入 grammar 约束解码。
+   * 三态（由 foxAi.agent.localConstrainedDecoding 控制）：
+   *   - 'off' / false：永不注入、不探测；
+   *   - 'force' / true：强制注入、不探测（靠运行时 rejection 兜底）；
+   *   - 'auto'（默认）：先探测服务端是否支持 grammar，支持才注入，否则跳过（绝不卡死）。
+   * 探测结论按 baseUrl 缓存，整个扩展进程内同端点只探一次；本会话再存到 this._grammarCap
+   * 避免重复探测。探测异常一律「保守跳过」，绝不因探测把对话卡住。
+   * @param {object} cfg
+   * @returns {Promise<boolean>}
+   */
+  async _grammarAllowed(cfg) {
+    const mode = grammarProbe.grammarMode(cfg.localConstrainedDecoding);
+    if (mode === 'off') return false;
+    if (mode === 'force') return true;
+    // auto：需要探测
+    if (this._grammarCap === null) {
+      try {
+        const cap = await grammarProbe.grammarSupported({
+          baseUrl: cfg.baseUrl,
+          apiKey: cfg.apiKey,
+          model: cfg.model,
+          timeout: grammarProbe.PROBE_TIMEOUT
+        });
+        this._grammarCap = cap;
+        if (!cap.supported) {
+          this.emit('notice', {
+            text: '本地服务端不支持 grammar 约束解码（探测：' + (cap.reason || 'unsupported') +
+              '），弱模型模式已跳过该选项（工具检索/闭环校验/锚点等优化仍生效）。'
+          });
+        }
+        console.log('[fox-ai] grammar probe:', JSON.stringify(cap));
+      } catch (e) {
+        // 探测本身异常：保守跳过，不卡对话
+        this._grammarCap = { supported: false, source: 'error', reason: String((e && e.message) || '').slice(0, 120) };
+      }
+    }
+    return !!(this._grammarCap && this._grammarCap.supported);
+  }
+
+  async fallbackIfLocalEmpty(result, options) {
+    if (!result || !result.empty) return result;
+    const cfg = this.cfg;
+    if (!cfg.meta || !cfg.meta.local) return result;
+    if (this._localEmptyFallbackDone) return result;
+    this._localEmptyFallbackDone = true;
+
+    this.emit('notice', { text: `本地模型「${cfg.model || 'unknown'}」对工具调用无响应，尝试以纯对话模式返回一次…` });
+    const opt2 = Object.assign({}, options);
+    delete opt2.tools;
+    delete opt2.toolChoice;
+    delete opt2.stop;
+    delete opt2.stopMarker;
+    // 本地模型用非流式更稳，避免流式解析再卡一轮
+    try {
+      const b = selectBackend(cfg);
+      const r = await b.nonStream(opt2);
+      if (r && !r.empty) {
+        console.log('[fox-ai] local empty fallback succeeded, contentLen=', (r.content || '').length);
+        return Object.assign({}, r, { _localFallback: true });
+      }
+    } catch (e) {
+      console.log('[fox-ai] local empty fallback also failed:', e && e.message);
+    }
+    return result;
+  }
+
+  /**
+   * 在单个端点上发起一次模型请求（含既有的「参数级降级」兜底：去 grammar / 去图 / 去思考 / 非流式）。
+   * 与旧 callModel 的两段请求逻辑等价，但端点（baseUrl/apiKey/model）由 targetCfg 决定，
+   * 从而支持 failover 切到备用模型。isPrimary=false 时去掉 grammar（不假设备用模型支持约束解码，避免卡死）。
+   * @param {object} options 已构建好的请求选项（含 messages/tools/extraBody 等）
+   * @param {object} targetCfg 端点配置：必须含 baseUrl/apiKey/model，以及 selectBackend 需要的 transport/apiMode
+   * @param {boolean} forceNonStream 是否强制非流式
+   * @param {boolean} isPrimary 是否主模型（决定是否保留已注入的 grammar）
+   */
+  async _requestEndpoint(options, targetCfg, forceNonStream, isPrimary) {
+    const opt = Object.assign({}, options, {
+      baseUrl: targetCfg.baseUrl,
+      apiKey: targetCfg.apiKey,
+      model: targetCfg.model
+    });
+    // 原生联网（Responses 的 web_search_call）结果含真实 URL：透传给前端 harvest，
+    // 让模型回复里的 [^n] 引用角标补全成可点击链接（本地 web_search 工具走 toolUpdate 已覆盖）。
+    opt.onSearchResults = (text) => this.emit('searchSources', { text });
+    // 切到非主模型时，不假设它支持 grammar 约束解码，去掉以免卡死
+    if (!isPrimary && opt.extraBody && opt.extraBody.grammar) {
+      const eb = Object.assign({}, opt.extraBody);
+      delete eb.grammar;
+      if (Object.keys(eb).length) opt.extraBody = eb;
+      else delete opt.extraBody;
+    }
+    const b = selectBackend(targetCfg);
+    const useResp = b.responses;
+
+    if (forceNonStream || this.streamBroken) {
+      try {
+        return await this.fallbackIfLocalEmpty(await b.nonStream(opt), opt);
+      } catch (err) {
+        const retriedGrammar = await this.retryWithoutGrammar(err, opt);
+        if (retriedGrammar) return retriedGrammar;
+        const retried = await this.retryWithoutImages(err, opt);
+        if (retried) return retried;
+        const retriedNoThink = await this.retryWithoutReasoning(err, opt);
+        if (retriedNoThink) return retriedNoThink;
+        throw err;
+      }
+    }
+
+    const { promise, handle } = useResp ? wrapStream(opt, streamResponses) : b.once(opt);
+    this.stream = handle;
+    try {
+      return await this.fallbackIfLocalEmpty(await promise, opt);
+    } catch (err) {
+      // 服务端不认 grammar 约束解码 → 去掉参数重试一次（弱模型模式优雅降级）
+      const retriedGrammar = await this.retryWithoutGrammar(err, opt);
+      if (retriedGrammar) return retriedGrammar;
+      // 服务端明确拒收图片 → 记住这个模型不支持读图，去图重试一次
+      const retriedNoImg = await this.retryWithoutImages(err, opt);
+      if (retriedNoImg) return retriedNoImg;
+      // 服务端不认深度思考参数 → 去掉思考参数重试一次
+      const retriedNoThink = await this.retryWithoutReasoning(err, opt);
+      if (retriedNoThink) return retriedNoThink;
+      // 流式响应被截断/解析失败时，用非流式再试一次
+      if (err && err.canRetryNonStream) {
+        console.log('[fox-ai] fallback to non-stream because:', err.message);
+        this.streamBroken = true; // 本次会话后续都走非流式，避免反复撞墙
+        this.emit('notice', { text: '流式响应解析失败，已自动改用非流式请求…' });
+        // 部分厂商（通义）非流式禁止开思考，这里按非流式重新映射一次思考参数
+        const rpNs = reasoning.buildReasoningParams(targetCfg, { stream: false });
+        if (opt.extraBody) {
+          for (const k of ['reasoning', 'reasoning_effort', 'enable_thinking', 'thinking_budget', 'thinking']) delete opt.extraBody[k];
+          Object.assign(opt.extraBody, rpNs.extraBody || {});
+        } else if (rpNs.extraBody && Object.keys(rpNs.extraBody).length) {
+          opt.extraBody = Object.assign({}, rpNs.extraBody);
+        }
+        try {
+          let r = await b.nonStream(opt);
+          r = await this.fallbackIfLocalEmpty(r, opt);
+          // 非流式成功且非空，直接返回（不再把原始流式错误抛出去）
+          if (r && !(r.empty && !r.toolCalls.length)) return r;
+          // 非流式返回空：说明问题不是网络，而是模型/参数，抛非流式的结果让上层判断
+          if (r && r.empty) return r;
+        } catch (fallbackErr) {
+          console.log('[fox-ai] non-stream also failed:', fallbackErr.message);
+          const retried = await this.retryWithoutImages(fallbackErr, opt);
+          if (retried) return retried;
+          const retried2 = await this.retryWithoutReasoning(fallbackErr, opt);
+          if (retried2) return retried2;
+          // 不在这里私自降级到 chat，统一交给 run() 的降级分支处理：
+          // Chat 协议会降到 text 协议（仍有工具说明），Responses 协议只能降到 chat。
+          throw fallbackErr;
+        }
+      }
+      throw err;
+    }
+  }
+
+  /** 构造 failover 端点列表：首位为主模型（cfg 本身），其后为配置里的备用模型（本地或云端）。 */
+  _failoverEndpoints() {
+    const cfg = this.cfg;
+    const list = [Object.assign({}, cfg, { name: 'primary', isPrimary: true })];
+    if (this._failover && this._failover.enabled) {
+      for (const t of this._failover.targets) {
+        list.push({
+          name: t.name,
+          baseUrl: t.baseUrl,
+          apiKey: t.apiKey,
+          model: t.model,
+          local: t.local,
+          isPrimary: false,
+          // 备用模型统一走 OpenAI 兼容 chat 协议（覆盖本地 llama.cpp / Ollama 与各类云端兼容服）
+          transport: 'openai',
+          apiMode: 'chat'
+        });
+      }
+    }
+    return list;
+  }
+
+  /** 把错误归类成 failover 触发类型；返回 'other' 表示不应触发切换。 */
+  _errClass(err) {
+    if (!err) return 'other';
+    const m = String(err.message || '').toLowerCase();
+    if (err.status === 429) return 'rateLimit';
+    if (m.includes('timeout') || m.includes('etimedout') || m.includes('请求超时')) return 'timeout';
+    if (m.includes('econnrefused') || m.includes('enotfound') || m.includes('econn') || m.includes('连接') || m.includes('refused') || m.includes('dns')) return 'connection';
+    if (err.status && err.status >= 500) return 'serverError';
+    if (m.includes('500') || m.includes('502') || m.includes('503') || m.includes('504') || m.includes('internal server error') || m.includes('bad gateway') || m.includes('gateway timeout') || m.includes('service unavailable')) return 'serverError';
+    if (m.includes('429') || m.includes('rate limit') || m.includes('too many requests')) return 'rateLimit';
+    return 'other';
+  }
+
+  /** 该错误是否匹配配置的 failover 触发条件（未启用或类型不命中均返回 false）。 */
+  _isFailoverError(err) {
+    if (!this._failover || !this._failover.enabled) return false;
+    const cls = this._errClass(err);
+    if (cls === 'other') return false;
+    return this._failover.triggers.has(cls);
+  }
+
   /** 发起一次模型调用（默认流式，解析失败时自动非流式兜底） */
   async callModel(payload, useNative, toolsOverride) {
     return llmLimiter.run(async () => {
@@ -1850,8 +2344,24 @@ class AgentSession {
       console.log('[fox-ai] deepThinking ON (prompt-fallback) strategy=', rp.strategy, rp.reason);
     }
 
-    const b = selectBackend(cfg);
-    const useResp = b.responses;
+    // —— 本地弱模型辅助模式（1.1.17/1.1.19）：约束解码 ——
+    // 文本协议 + 弱模型时，向请求体注入通用 GBNF grammar，让模型只能输出「自然语言」
+    // 或「<foxtool name="..">{合法 JSON}</foxtool>」，从根源消灭缺引号/缺括号等格式错误。
+    // 1.1.19 起：默认（localConstrainedDecoding='auto'）先探测服务端是否支持 grammar，
+    // 支持才注入；不支持/挂起则跳过（绝不卡死）。显式 false 永不注入，true 强制注入。
+    // 若服务端不认 grammar（报 400/不支持），retryWithoutGrammar 仍会自动去掉该参数重试一次。
+    if (this._weakLocal && this.protocol === 'text' && cfg.localConstrainedDecoding !== false && !this._grammarStripped) {
+      const allow = await this._grammarAllowed(cfg);
+      if (allow) {
+        options.extraBody = Object.assign({}, options.extraBody);
+        options.extraBody.grammar = weakModel.TEXT_TOOL_GRAMMAR;
+        console.log('[fox-ai] weak-mode constrained decoding: grammar injected (server supported)');
+      } else {
+        // 服务端不支持/挂起：记住本会话不再注入，避免重复探测与卡顿
+        this._grammarStripped = true;
+        console.log('[fox-ai] weak-mode grammar skipped: server does not support it (probe said no)');
+      }
+    }
 
     // —— 动态工具注册（按模型条件性注入）——
     // deepseek + responses：toOpenAITools 已「排除本地 web_search、注入原生 {type:'web_search'}」，
@@ -1876,62 +2386,35 @@ class AgentSession {
       }
     }
 
-    // 强制非流式，或本次会话已确认流式不可用：直接走非流式
-    if (cfg.forceNonStream || this.streamBroken) {
+    // —— 失败降级 / 自动 failover（1.1.20）——
+    // 主模型（endpoints[0]）调用失败时，按配置的错误类型（超时/连接/服务端错误/限流/空响应）
+    // 自动切换到备用模型（endpoints[1..]）。备用可是本地或云端，UI 自由配置。
+    // 默认 failover 关闭 → endpoints 仅主模型，行为与旧版完全一致（无回归）。
+    const endpoints = this._failoverEndpoints();
+    const forceNonStream = cfg.forceNonStream || this.streamBroken;
+    let lastErr = null;
+    for (let i = 0; i < endpoints.length; i++) {
+      const ep = endpoints[i];
       try {
-        return await b.nonStream(options);
+        const r = await this._requestEndpoint(options, ep, forceNonStream, i === 0);
+        // 配置开启 emptyResponse 触发、主模型返回空、且还有备用 → 切备用
+        if (r && r.empty && i < endpoints.length - 1 && this._failover.enabled && this._failover.triggers.has('emptyResponse')) {
+          this.emit('notice', { text: `主模型「${ep.name}」返回空响应，自动切换到备用「${endpoints[i + 1].name}」…` });
+          lastErr = new Error('empty response from ' + ep.name);
+          continue;
+        }
+        return r;
       } catch (err) {
-        const retried = await this.retryWithoutImages(err, options);
-        if (retried) return retried;
-        const retriedNoThink = await this.retryWithoutReasoning(err, options);
-        if (retriedNoThink) return retriedNoThink;
-        throw err;
+        lastErr = err;
+        // 已到最后一条或 failover 未启用 → 原样抛出
+        if (i >= endpoints.length - 1 || !this._failover.enabled) throw err;
+        // 仅当错误类型命中触发条件才切换，否则原样抛出（避免无意义重试）
+        if (!this._isFailoverError(err)) throw err;
+        this.emit('notice', { text: `模型「${ep.name}」调用失败（${this._errClass(err)}），自动切换到备用「${endpoints[i + 1].name}」…` });
+        // 继续下一个端点
       }
     }
-
-    const { promise, handle } = useResp ? wrapStream(options, streamResponses) : b.once(options);
-    this.stream = handle;
-    try {
-      return await promise;
-    } catch (err) {
-      // 服务端明确拒收图片 → 记住这个模型不支持读图，去图重试一次
-      const retriedNoImg = await this.retryWithoutImages(err, options);
-      if (retriedNoImg) return retriedNoImg;
-      // 服务端不认深度思考参数 → 去掉思考参数重试一次
-      const retriedNoThink = await this.retryWithoutReasoning(err, options);
-      if (retriedNoThink) return retriedNoThink;
-      // 流式响应被截断/解析失败时，用非流式再试一次
-      if (err && err.canRetryNonStream) {
-        console.log('[fox-ai] fallback to non-stream because:', err.message);
-        this.streamBroken = true; // 本次会话后续都走非流式，避免反复撞墙
-        this.emit('notice', { text: '流式响应解析失败，已自动改用非流式请求…' });
-        // 部分厂商（通义）非流式禁止开思考，这里按非流式重新映射一次思考参数
-        const rpNs = reasoning.buildReasoningParams(cfg, { stream: false });
-        if (options.extraBody) {
-          for (const k of ['reasoning', 'reasoning_effort', 'enable_thinking', 'thinking_budget', 'thinking']) delete options.extraBody[k];
-          Object.assign(options.extraBody, rpNs.extraBody || {});
-        } else if (rpNs.extraBody && Object.keys(rpNs.extraBody).length) {
-          options.extraBody = Object.assign({}, rpNs.extraBody);
-        }
-        try {
-          const r = await b.nonStream(options);
-          // 非流式成功且非空，直接返回（不再把原始流式错误抛出去）
-          if (r && !(r.empty && !r.toolCalls.length)) return r;
-          // 非流式返回空：说明问题不是网络，而是模型/参数，抛非流式的结果让上层判断
-          if (r && r.empty) return r;
-        } catch (fallbackErr) {
-          console.log('[fox-ai] non-stream also failed:', fallbackErr.message);
-          const retried = await this.retryWithoutImages(fallbackErr, options);
-          if (retried) return retried;
-          const retried2 = await this.retryWithoutReasoning(fallbackErr, options);
-          if (retried2) return retried2;
-          // 不在这里私自降级到 chat，统一交给 run() 的降级分支处理：
-          // Chat 协议会降到 text 协议（仍有工具说明），Responses 协议只能降到 chat。
-          throw fallbackErr;
-        }
-      }
-      throw err;
-    }
+    throw lastErr;
     });
   }
 
@@ -1955,33 +2438,126 @@ class AgentSession {
     return false;
   }
 
-  /** 解析文本协议里的工具调用 */
-  parseTextCalls(content) {
+  /** 解析文本协议里的工具调用（增强：兼容 <foxtool> / <function> / 裸 JSON 多格式） */
+  parseTextCalls(content, knownTools) {
     const out = [];
     const text = String(content || '');
-    writeAgentLog('textcalls', [`parseTextCalls input len=${text.length}`, `head=${text.slice(0, 300).replace(/\s+/g, ' ')}`]);
+    const seen = new Set();
+    const push = (name, rawArgs) => {
+      if (!name) return;
+      const n = String(name).trim();
+      if (!n) return;
+      const key = n.toLowerCase();
+      if (seen.has(key)) return;
+      // 已知工具名过滤：避免把随机 JSON 对象误判成工具调用（增强③防误触）
+      if (knownTools && knownTools.length && !knownTools.includes(key)) return;
+      seen.add(key);
+      out.push({ id: 'text_' + out.length, name: n, rawArgs: rawArgs || '' });
+    };
+    writeAgentLog('textcalls', [`parseTextCalls input len=${text.length}`, `head=${text.slice(0, 300).replace(/\s+/g, ' ')}`, `known=${knownTools ? knownTools.length : 'none'}`]);
+
+    // 1) <foxtool name="..">...</foxtool> / <fox:tool> / <tool>
     TOOL_BLOCK.lastIndex = 0;
     let m;
     while ((m = TOOL_BLOCK.exec(text)) !== null) {
-      out.push({ id: 'text_' + out.length, name: m[1], rawArgs: m[2] });
-      if (out.length >= 3) break;
+      push(m[2], m[3]);
+      if (out.length >= 5) break;
     }
-    if (!out.length) {
-      // 处理被 stopMarker 截断、结尾缺少闭合标签的情况
-      const open = TOOL_OPEN.exec(text);
-      if (open) {
-        const body = text.slice(open.index + open[0].length).replace(/<\/fox:?tool>[\s\S]*$/, '');
-        if (body.trim()) out.push({ id: 'text_0', name: open[1], rawArgs: body });
+
+    // 2) <function name="..">...</function> 风格（部分模型按 OpenAI 工具调用格式吐标签）
+    if (out.length < 5) {
+      const FN = /<function\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/function>/gi;
+      while ((m = FN.exec(text)) !== null) {
+        push(m[1], m[2]);
+        if (out.length >= 5) break;
       }
     }
+
+    // 3) 还没解析到，扫描 JSON 块（```json 围栏 或 裸对象 {name/tool/action:...}）
+    if (!out.length) {
+      for (const jc of collectJsonToolCandidates(text)) {
+        let parsed;
+        try { parsed = safeParseArgs(jc); } catch (_) { parsed = null; }
+        if (!parsed || typeof parsed !== 'object') continue;
+        const nm = parsed.name || parsed.tool || parsed.action || parsed.function;
+        if (!nm) continue;
+        let args;
+        if (typeof parsed.arguments === 'string') args = parsed.arguments;
+        else if (parsed.arguments !== undefined || parsed.parameters !== undefined)
+          args = JSON.stringify(parsed.arguments || parsed.parameters || {});
+        else {
+          // 其余字段当作参数
+          const rest = Object.assign({}, parsed);
+          delete rest.name; delete rest.tool; delete rest.action; delete rest.function;
+          args = JSON.stringify(rest);
+        }
+        push(nm, args);
+        if (out.length >= 5) break;
+      }
+    }
+
+    // 4) 截断兜底：开头是 <foxtool>/<fox:tool>/<tool>/<function> 但缺闭合标签
+    if (!out.length) {
+      const OPEN_ANY = /<(foxtool|fox:tool|fox-tool|tool|function)\s+name\s*=\s*["']([^"']+)["']\s*>/i;
+      const open = OPEN_ANY.exec(text);
+      if (open) {
+        const name = open[2]; // 统一把工具名放在第 2 组，避免 <function> 与 <foxtool> 分组错位
+        const body = text.slice(open.index + open[0].length).replace(/<[^>]+>[\s\S]*$/, '').trim();
+        if (body) push(name, body);
+      }
+    }
+
     writeAgentLog('textcalls', [`parseTextCalls output count=${out.length}`, `names=${out.map((c) => c.name).join(',')}`, `rawArgsPreview=${out.map((c) => String(c.rawArgs).slice(0, 100)).join(' | ')}`]);
     return out;
+  }
+
+  /** 已知工具名集合（小写），供 parseTextCalls 过滤误判 */
+  _toolNameSet() {
+    try {
+      const list = (typeof tools !== 'undefined' && tools.allTools) ? tools.allTools() : [];
+      return (list || []).map((t) => String(t.name).toLowerCase());
+    } catch (_) { return []; }
+  }
+
+  /**
+   * 弱模型模式：对解析出的文本协议工具调用做 JSON Schema 轻量校验。
+   * @param {Array} calls parseTextCalls 的结果（{id,name,rawArgs}）
+   * @returns {{valid:Array, invalid:Array, report:string}}
+   */
+  _validateTextCalls(calls) {
+    const valid = [];
+    const invalid = [];
+    const reports = [];
+    for (const c of calls) {
+      const tool = (typeof tools !== 'undefined' && tools.getTool) ? tools.getTool(c.name) : null;
+      if (!tool) {
+        invalid.push(c);
+        reports.push(`- 未知工具：${c.name}（不在可用工具列表中）`);
+        continue;
+      }
+      let args;
+      try {
+        args = JSON.parse(String(c.rawArgs || '{}'));
+      } catch (e) {
+        invalid.push(c);
+        reports.push(`- 工具 ${c.name} 的参数不是合法 JSON：${String(e.message).slice(0, 120)}`);
+        continue;
+      }
+      const v = weakModel.validateToolArgs(tool, args);
+      if (!v.ok) {
+        invalid.push(c);
+        reports.push(`- 工具 ${c.name}：${v.errors.join('；')}`);
+      } else {
+        valid.push(c);
+      }
+    }
+    return { valid, invalid, report: reports.join('\n') };
   }
 
   stripToolBlocks(content) {
     return String(content || '')
       .replace(TOOL_BLOCK, '')
-      .replace(/<fox:?tool[\s\S]*$/i, '')
+      .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '')
       .trim();
   }
 
@@ -2071,6 +2647,91 @@ class AgentSession {
   }
 
   /** 执行单个工具（含审批、结果回填） */
+  /**
+   * 把一次工具调用压成稳定签名（键排序、深度/长度截断），用于循环检测。
+   * @param {string} name
+   * @param {any} args
+   * @returns {string}
+   */
+  _toolSignature(name, args) {
+    const stable = (v, depth) => {
+      if (v === null || typeof v !== 'object') {
+        try { return JSON.stringify(v); } catch (_) { return '"?"'; }
+      }
+      if (depth > 3) return '"…"';
+      if (Array.isArray(v)) return '[' + v.slice(0, 12).map((x) => stable(x, depth + 1)).join(',') + ']';
+      return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stable(v[k], depth + 1)).join(',') + '}';
+    };
+    let s;
+    try { s = stable(args, 0); } catch (_) { s = String(args); }
+    return name + '|' + String(s).slice(0, 300);
+  }
+
+  /**
+   * 通用工具循环护栏（零模型开销，纯本地判断）。
+   * 覆盖两种最常见的失控形态：
+   *   1) 同一工具 + 同一参数在最近 8 次里出现 ≥3 次（原地打转）；
+   *   2) 周期为 2 或 3 的环状调用，如 A→B→A→B→A→B（互相触发）。
+   * 命中时不抛错，只把「别再重复了」当作工具结果回给模型，并在连续命中时
+   * 置 `_loopNudge`，由主循环在本批工具执行完后补一条强提醒，逼它收敛出结论。
+   *
+   * @param {string} name 工具名
+   * @param {any} args 已解析的参数
+   * @returns {{text:string, reason:string, suggest:string}|null} 命中返回拦截信息，否则 null
+   */
+  _loopGuardCheck(name, args) {
+    // 这些工具本身就是「反复小步推进」的语义，重复调用是正常的，不参与循环检测
+    const EXEMPT = new Set(['update_plan_task', 'present_plan', 'revise_plan', 'save_memory', 'checkpoint_create']);
+    if (EXEMPT.has(name)) return null;
+
+    if (!this._toolSigHistory) this._toolSigHistory = [];
+    const sig = this._toolSignature(name, args);
+    const hist = this._toolSigHistory;
+    let hit = '';
+
+    // 形态一：原地打转（同名同参）
+    const sameInWindow = hist.slice(-8).filter((s) => s === sig).length;
+    if (sameInWindow >= 2) hit = 'repeat';
+
+    // 形态二：环状调用（周期 2 / 3）
+    if (!hit) {
+      const seq = hist.concat(sig);
+      for (const p of [2, 3]) {
+        const need = p * 3;
+        if (seq.length < need) continue;
+        const tail = seq.slice(-need);
+        let cyclic = true;
+        for (let i = 0; i + p < need; i++) {
+          if (tail[i] !== tail[i + p]) { cyclic = false; break; }
+        }
+        // 全都一样的情况已由形态一覆盖，这里只认「不同工具交替」
+        if (cyclic && new Set(tail).size > 1) { hit = 'cycle-' + p; break; }
+      }
+    }
+
+    hist.push(sig);
+    if (hist.length > 16) hist.shift();
+    if (!hit) return null;
+
+    this._loopBlocks = (this._loopBlocks || 0) + 1;
+    try {
+      require('./log').appendLog('agent', `[loop-guard] ${hit} tool=${name} blocks=${this._loopBlocks} sig=${sig.slice(0, 120)}`);
+    } catch (_) {}
+    if (this._loopBlocks >= 2) this._loopNudge = true;
+    this.emit('notice', {
+      text: `检测到工具「${name}」重复调用（${hit === 'repeat' ? '同名同参' : '环状'}），已拦截以免空转。`
+    });
+
+    const text = hit === 'repeat'
+      ? `已拦截：工具 ${name} 在最近几步里用完全相同的参数重复调用过 ${sameInWindow + 1} 次，结果不会变。请直接用已经拿到的结果继续，或换一个不同的思路/参数。`
+      : `已拦截：检测到 ${name} 与其他工具在来回循环调用（周期 ${hit.slice(-1)}），没有产生新信息。请停止这条链路，基于现有信息给出结论或换方案。`;
+    return {
+      text,
+      reason: '重复/环状工具调用',
+      suggest: '不要再用相同参数重试。若信息已足够就直接作答；确实缺信息就换工具或换参数，并说明你改变了什么。'
+    };
+  }
+
   async handleToolCall(call) {
     const name = call.name;
     const callId = call.id || 'call_' + Math.random().toString(36).slice(2, 10);
@@ -2094,15 +2755,38 @@ class AgentSession {
       return;
     }
 
-    // —— 重复读取去重：同一文件连续读 3 次以上 → 拒绝 ——
+    // —— 通用循环护栏：任何工具（含 skill / MCP / 子代理）陷入重复或环状调用时刹车 ——
+    // 长任务里最常见的失控形态：同一 MCP 工具带同一参数反复调、或 A→B→A→B 来回打转，
+    // 把步数和 token 全烧光却毫无进展。这里做纯本地、零模型开销的检测。
+    {
+      const guard = this._loopGuardCheck(name, args);
+      if (guard) {
+        this.emit('toolEnd', { id: 'tool-' + callId, ok: false, output: guard.text, rejected: true });
+        this.pushToolResult(callId, name, guard.text, true, { reason: guard.reason, suggest: guard.suggest });
+        return;
+      }
+    }
+
+    // —— 重复读取去重：同一文件「相同区间」连续读 3 次以上 → 拒绝 ——
+    // 注意：刷新窗口 / 重载扩展后会话上下文会丢失，模型需要重新读取文件才能拿回内容。
+    // 因此不能按「文件路径」一刀切拦截，否则模型用不同区间（如 1-300、547、530-168）反复重读
+    // 也会被误判为重复而卡死。这里只拦截「完全相同区间反复读」的死循环；不同区间的读取一律放行，
+    // 刷新后恢复上下文不受阻。
     if (name === 'read_file' && args && args.path) {
       if (!this._readFileHistory) this._readFileHistory = [];
-      const recent = this._readFileHistory.slice(-6).filter((r) => r.path === args.path).length;
+      const sig = readFileSig(args.path, args);
+      const recent = this._readFileHistory.slice(-6).filter((r) => r.sig === sig).length;
       if (recent >= 3) {
-        this.pushToolResult(callId, name, `文件 ${args.path} 已在最近 ${recent} 轮中多次读取，内容未变。请直接基于已有信息继续，不要重复读取同一文件。`, true, {
-          reason: '已知信息未变，无需反复读取',
-          suggest: '基于之前已读取的文件内容继续推进任务，不做无意义的重复操作。'
-        });
+        const range = (args.start_line || args.end_line || args.start_char || args.end_char)
+          ? `（start_line=${args.start_line || 1}, end_line=${args.end_line || '到末尾'}）`
+          : '（全文）';
+        this.pushToolResult(callId, name,
+          `文件 ${args.path} 的同一区间${range}你已连续读取 ${recent} 次，内容未变。` +
+          `若你是因刷新窗口 / 重载丢失了上下文，请用不同的 start_line / end_line 重新读取（分区间读取不会被判定为重复）；否则请直接基于已读内容继续，不要对同一区间反复读取。`,
+          true, {
+            reason: '同一区间重复读取，无新信息',
+            suggest: '确认该区间内容是否已在上下文中；若需更多内容请读取其他区间，不要对同一区间反复读取。'
+          });
         return;
       }
     }
@@ -2452,10 +3136,10 @@ class AgentSession {
           });
         }
       }
-      // 记录 read_file 调用（用于去重）—— 成功执行后存档
+      // 记录 read_file 调用（用于去重）—— 成功执行后存档，按「路径+区间」签名区分，避免不同区间被误判为重复
       if (name === 'read_file' && args && args.path) {
         if (!this._readFileHistory) this._readFileHistory = [];
-        this._readFileHistory.push({ path: args.path, time: Date.now() });
+        this._readFileHistory.push({ path: args.path, sig: readFileSig(args.path, args), time: Date.now() });
         if (this._readFileHistory.length > 12) this._readFileHistory.shift();
       }
       this.pushToolResult(callId, name, finalOutput, false, okMeta);
@@ -2777,7 +3461,8 @@ class AgentSession {
     try {
       const out = await kbOrg.summarizeConversation(this.context, toCompress, {
         onLog: (t) => { try { this.emit('notice', { text: '[知识库-2] ' + t }); } catch (_) {} },
-        sessionId: this.sessionId
+        sessionId: this.sessionId,
+        protocol: this.protocol
       });
       if (out) {
         kb.invalidate(); // 重新索引，把新摘要纳入 RAG
@@ -2805,8 +3490,46 @@ class AgentSession {
         });
       }
     } catch (e) {
-      appendLog('autoSummarize', '[fail] ' + String(e.message).split('\n')[0]);
-      this.emit('notice', { text: '自动压缩失败：' + String(e.message).split('\n')[0] });
+      const reason = String(e.message || '').split('\n')[0];
+      appendLog('autoSummarize', '[fail] ' + reason);
+      // —— 零 token 兜底（关键修复 Bug④）——
+      // 当没有「上下文整理」的 API Key、或可达性/配额问题时，远程摘要必然失败。
+      // 若只 emit 通知就 return，会陷入「每次都失败、messages 持续膨胀、重载易丢内容」的死循环。
+      // 这里做一次性本地裁剪：把最早 compressible 条对话就地折叠成一条系统标记，不调用任何模型，
+      // 既不费 token，也保证上下文有界、存档可控、重载可见。
+      try {
+        const collapse = Math.max(1, compressible);
+        const dropped = msgs.slice(0, collapse);
+        msgs.splice(0, collapse);
+        const note = {
+          role: 'system',
+          content: `[本地折叠] 因自动压缩不可用（${reason.slice(0, 80)}），已在本机把最早的 ${dropped.length} 条对话就地折叠，以释放上下文空间。原始内容未做语义摘要，如需完整回顾请改用带有效 API Key 的上下文整理。`
+        };
+        msgs.unshift(note);
+        appendLog('autoSummarize', '[fallback-local] collapsed=' + dropped.length);
+        if (dataBefore) {
+          try {
+            const dataAfter = contextUsage.measureContext({
+              baseSystem: dataBefore.raw.baseSystem,
+              toolsText: dataBefore.raw.toolsText,
+              history: msgs,
+              maxTokens: this.cfg.maxTokens || 0,
+              contextWindow: cw
+            });
+            dataAfter.compressMeta = this._buildCompressMeta();
+            this.emit('contextUsage', dataAfter);
+          } catch (_) {}
+        }
+      } catch (e2) {
+        appendLog('autoSummarize', '[fallback-local][err] ' + String(e2 && e2.message || e2));
+      }
+      // 同一会话内只提示一次，避免每步刷屏
+      if (!this._autoSummaryDisabledNoticed) {
+        this._autoSummaryDisabledNoticed = true;
+        this.emit('notice', {
+          text: '上下文自动压缩当前不可用（缺少有效的「上下文整理」API Key 或调用失败），已改为本机零 token 折叠旧消息来释放空间；设置有效的 API Key 后才会恢复语义摘要。'
+        });
+      }
     }
   }
 

@@ -24,6 +24,7 @@ const mcpServers = require('./tools/mcpServers');
 const mcpSetup = require('./tools/mcpSetup');
 const mcpSecurity = require('./tools/mcpSecurity');
 const mcpCatalog = require('./mcpCatalog');
+const sandbox = require('./sandbox');
 const DisposableBag = require('./disposableBag');
 const mcpAuthor = require('./tools/mcpAuthor'); // 用户自写 MCP 的磁盘目录清理
 
@@ -76,6 +77,7 @@ function getHtml(context, webview) {
     <div class="tab" data-tab="tasks" tabindex="0" role="button" aria-pressed="false">📋 任务</div>
     <div class="tab" data-tab="project" tabindex="0" role="button" aria-pressed="false">🗺️ 项目</div>
     <div class="tab" data-tab="mcp" tabindex="0" role="button" aria-pressed="false">🌐 MCP</div>
+    <div class="tab" data-tab="sandbox" tabindex="0" role="button" aria-pressed="false">🧪 沙盒</div>
   </div>
 
   <div class="pane active" id="env">
@@ -115,7 +117,7 @@ function getHtml(context, webview) {
   <div class="pane" id="ext">
     <h2>插件联动（跨扩展调用）</h2>
     <p class="hint danger">⚠️ 默认禁止一切跨插件调用。勾选命令将其加入白名单后，狐狸 AI 才能调用它；调用前仍会弹确认。</p>
-    <div class="row" style="position:sticky;top:0;background:var(--vscode-editor-background);z-index:10;padding:6px 0;border-bottom:1px solid var(--vscode-panel-border);margin-bottom:8px;">
+    <div class="row" style="background:var(--vscode-editor-background);padding:6px 0;border-bottom:1px solid var(--vscode-panel-border);margin-bottom:8px;">
       <label><input type="checkbox" id="silent"/> 白名单命令免二次确认</label>
       <input id="ext-search" type="text" placeholder="搜索扩展或命令…" autocomplete="off" style="flex:1;min-width:180px;margin-left:12px;"/>
     </div>
@@ -320,6 +322,48 @@ function getHtml(context, webview) {
     </div>
   </div>
 
+  <div class="pane" id="sandbox">
+    <h2>🧪 代码沙盒管理</h2>
+    <p class="hint">隔离运行各类语言代码的环境目录；<b>内置沙盒不可删除</b>，仅用户自建沙盒可删。目录变化会<b>自动热感知</b>刷新。</p>
+    <div class="row">
+      <label style="width:auto">沙盒目录</label>
+      <code id="sb-dir" class="hint" style="flex:1;min-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></code>
+      <button id="sb-open-dir">打开目录</button>
+      <button id="sb-reload">刷新</button>
+    </div>
+    <p class="hint" style="margin-top:6px">📁 此目录只存放你<b>自建的用户沙盒</b>；内置的 Node.js / Python / Go / Rust / Java 由程序内置提供、<b>不在此目录中</b>，所以目录为空是正常的。新建沙盒或丢入带 manifest.json 的文件夹后这里才会出现内容。</p>
+
+    <div id="sb-list"><span class="hint">加载中…</span></div>
+
+    <h3 style="margin:14px 0 4px">＋ 新建用户沙盒</h3>
+    <p class="hint">每个沙盒 = 沙盒目录下的一个子文件夹，内含 manifest.json。模板可一键套用，再按需改运行命令。</p>
+    <div class="row">
+      <label style="width:auto">模板</label>
+      <select id="sb-template"><option value="">— 空白 —</option></select>
+      <button id="sb-template-fill">套用</button>
+    </div>
+    <div class="row">
+      <label style="width:auto">名称</label>
+      <input id="sb-name" placeholder="如 MyGo"/>
+      <label style="width:auto;margin-left:8px">语言</label>
+      <input id="sb-language" placeholder="如 go"/>
+    </div>
+    <div class="row">
+      <label style="width:auto">运行命令</label>
+      <input id="sb-command" style="flex:1;min-width:200px" placeholder='数组 ["go","run","{{file}}"] 或 shell 字符串（用 {{file}} {{workdir}}）'/>
+    </div>
+    <div class="row">
+      <label style="width:auto">扩展名</label>
+      <input id="sb-ext" placeholder=".go" style="width:80px"/>
+      <label style="width:auto;margin-left:8px">canary 代码</label>
+      <input id="sb-canary" style="flex:1" placeholder="选填，建好后用于可用性自检"/>
+    </div>
+    <div class="row">
+      <button id="sb-save">保存沙盒</button>
+      <span id="sb-msg" class="hint"></span>
+    </div>
+  </div>
+
 <script nonce="${nonce}" src="${envUri}"></script>
 </body>
 </html>`;
@@ -411,6 +455,18 @@ function openEnvPanel(context, chatProvider, initialTab) {
         panel.webview.postMessage({ type: 'mcpList', enabled: false, catalog: [], servers: [], error: String(e.message) });
         vscode.window.showErrorMessage(tw('加载 MCP 服务器目录失败：{0}', e.message));
       }
+    }
+
+    async function postSandboxList() {
+      const mgr = sandbox.getManager(cfg);
+      const list = await mgr.list();
+      panel.webview.postMessage({
+        type: 'sandboxList',
+        dir: mgr.defaultDir(),
+        templates: Object.keys(sandbox.TEMPLATES),
+        builtins: list.builtins,
+        user: list.user
+      });
     }
 
     try {
@@ -811,6 +867,92 @@ function openEnvPanel(context, chatProvider, initialTab) {
         const rels = paths.map((p) => root ? path.relative(root, p) : p);
         const text = '请读取并分析以下文件：\n' + rels.map((p) => '- ' + p.replace(/\\/g, '/')).join('\n');
         chatProvider.ask(text, { showText: '📂 读取选中的 ' + rels.length + ' 个文件' });
+      } else if (msg.type === 'loadSandbox') {
+        await postSandboxList();
+        if (!panel._sandboxWatch) {
+          const mgr = sandbox.getManager(cfg);
+          panel._sandboxWatch = mgr.watch((list) => {
+            panel.webview.postMessage({
+              type: 'sandboxList', dir: mgr.defaultDir(),
+              templates: Object.keys(sandbox.TEMPLATES),
+              builtins: list.builtins, user: list.user
+            });
+          });
+        }
+      } else if (msg.type === 'reloadSandbox') {
+        const mgr = sandbox.getManager(cfg);
+        const list = await mgr.reload();
+        panel.webview.postMessage({
+          type: 'sandboxList', dir: mgr.defaultDir(),
+          templates: Object.keys(sandbox.TEMPLATES),
+          builtins: list.builtins, user: list.user
+        });
+      } else if (msg.type === 'saveSandbox') {
+        try {
+          const spec = msg.spec || {};
+          const mgr = sandbox.getManager(cfg);
+          const res = await mgr.createSandbox(spec);
+          if (res.ok) {
+            panel.webview.postMessage({
+              type: 'sandboxList', dir: mgr.defaultDir(),
+              templates: Object.keys(sandbox.TEMPLATES),
+              builtins: res.list.builtins, user: res.list.user
+            });
+          } else {
+            panel.webview.postMessage({ type: 'sandboxSaved', ok: false, error: res.error });
+          }
+        } catch (e) {
+          panel.webview.postMessage({ type: 'sandboxSaved', ok: false, error: String(e.message) });
+        }
+      } else if (msg.type === 'deleteSandbox') {
+        try {
+          const mgr = sandbox.getManager(cfg);
+          const res = await mgr.removeSandbox(msg.name);
+          if (res.ok) {
+            panel.webview.postMessage({
+              type: 'sandboxList', dir: mgr.defaultDir(),
+              templates: Object.keys(sandbox.TEMPLATES),
+              builtins: res.list.builtins, user: res.list.user
+            });
+          } else {
+            panel.webview.postMessage({ type: 'sandboxDeleted', ok: false, error: res.error });
+          }
+        } catch (e) {
+          panel.webview.postMessage({ type: 'sandboxDeleted', ok: false, error: String(e.message) });
+        }
+      } else if (msg.type === 'openSandboxDir') {
+        try {
+          const mgr = sandbox.getManager(cfg);
+          mgr.list(); // 确保目录存在
+          await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(mgr.defaultDir()));
+        } catch (e) {
+          vscode.window.showErrorMessage(tw('打开沙盒目录失败：{0}', e.message));
+        }
+      } else if (msg.type === 'testSandbox') {
+        try {
+          const mgr = sandbox.getManager(cfg);
+          const list = await mgr.reload();
+          const all = list.builtins.concat(list.user);
+          const s = all.find((x) =>
+            x.name === msg.name || x.language === msg.name ||
+            (x.folder && path.basename(x.folder) === msg.name));
+          if (!s) {
+            panel.webview.postMessage({ type: 'sandboxTestResult', ok: false, name: msg.name, error: '未找到沙盒' });
+          } else if (s.builtin) {
+            panel.webview.postMessage({ type: 'sandboxTestResult', ok: true, name: s.name, builtin: true, note: '内置沙盒默认可用' });
+          } else {
+            const code = (s._def && s._def.canary && s._def.canary.code) || 'print("ok")';
+            const r = await mgr.run(s.name, code);
+            panel.webview.postMessage({
+              type: 'sandboxTestResult', ok: !!r.ok, name: s.name,
+              stdout: (r.stdout || '').slice(0, 2000),
+              stderr: (r.stderr || '').slice(0, 2000),
+              error: r.error || null, exit: r.exit
+            });
+          }
+        } catch (e) {
+          panel.webview.postMessage({ type: 'sandboxTestResult', ok: false, name: msg.name, error: String(e.message) });
+        }
       }
     } catch (e) {
       vscode.window.showErrorMessage(tw('环境与插件面板出错：{0}', e.message));
@@ -818,6 +960,7 @@ function openEnvPanel(context, chatProvider, initialTab) {
   }));
 
   panel.onDidDispose(() => {
+    if (panel._sandboxWatch) { try { panel._sandboxWatch(); } catch (_) {} panel._sandboxWatch = null; }
     if (panel._bag) { try { panel._bag.dispose(); } catch (_) {} panel._bag = null; }
     _panel = null;
   });
