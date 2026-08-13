@@ -54,19 +54,43 @@
     </div>
   </div>
 
-  <main id="messages" class="messages">
-    <div class="welcome" id="welcome">
-      <div class="fox">🦊</div>
-      <h3 data-i18n="狐狸 AI 智能体">狐狸 AI 智能体</h3>
-      <p data-i18n-html="能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。">能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。</p>
-      <div class="quick">
-        <button class="quick-btn" data-q="看一下这个项目的结构，告诉我它是干什么的">🔍 摸清这个项目</button>
-        <button class="quick-btn" data-q="检查工作区里现在有哪些报错，并逐个修复">🛠 修掉所有报错</button>
-        <button class="quick-btn" data-q="读一下终端里最近的输出，看看有没有报错，有的话分析原因">📟 分析终端报错</button>
-        <button class="quick-btn" data-q="用一句话介绍你自己，并说明你现在跑在哪个模型上">✅ 测试模型连通</button>
+  <div class="content-wrap">
+    <main id="messages" class="messages">
+      <div class="welcome" id="welcome">
+        <div class="fox">🦊</div>
+        <h3 data-i18n="狐狸 AI 智能体">狐狸 AI 智能体</h3>
+        <p data-i18n-html="能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。">能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。</p>
+        <div class="quick">
+          <button class="quick-btn" data-q="看一下这个项目的结构，告诉我它是干什么的">🔍 摸清这个项目</button>
+          <button class="quick-btn" data-q="检查工作区里现在有哪些报错，并逐个修复">🛠 修掉所有报错</button>
+          <button class="quick-btn" data-q="读一下终端里最近的输出，看看有没有报错，有的话分析原因">📟 分析终端报错</button>
+          <button class="quick-btn" data-q="用一句话介绍你自己，并说明你现在跑在哪个模型上">✅ 测试模型连通</button>
+        </div>
       </div>
-    </div>
-  </main>
+    </main>
+
+    <aside id="workchainPanel" class="workchain-panel collapsed">
+      <div class="workchain-head" id="workchainHead">
+        <span class="workchain-title" data-i18n="工作链">工作链</span>
+        <span class="workchain-count" id="workchainCount"></span>
+        <span class="spacer"></span>
+        <button class="mini ghost" id="workchainToggle" title="展开/收起工作链" data-i18n-title="展开/收起工作链" data-i18n="收起">收起</button>
+        <button class="mini ghost" id="workchainClear" data-i18n="清空">清空</button>
+      </div>
+      <div class="workchain-subbar" id="workchainSubbar">
+        <div class="wc-filters" id="wcFilters">
+          <button class="wc-f active" data-grp="all" data-i18n="全部">全部</button>
+          <button class="wc-f" data-grp="tool" data-i18n="工具">工具</button>
+          <button class="wc-f" data-grp="reason" data-i18n="思考">思考</button>
+          <button class="wc-f" data-grp="error" data-i18n="错误">错误</button>
+          <button class="wc-f" data-grp="info" data-i18n="状态">状态</button>
+        </div>
+        <span class="spacer"></span>
+        <button class="mini ghost" id="wcDetail" data-i18n="详细">详细</button>
+      </div>
+      <div id="workchainList" class="workchain-list"></div>
+    </aside>
+  </div>
 
   <div id="errorBar" class="error-bar hidden"><span id="errorText"></span><button id="errorClose">×</button></div>
 
@@ -82,6 +106,7 @@
   <div id="ragHint" class="rag-hint hidden"></div>
 
   <footer class="composer">
+    <div id="cacheStatus" class="cache-status hidden" title="前缀缓存（Prompt Cache）命中情况。命中部分通常按折扣计费。">前缀缓存 · 等待首轮请求…</div>
     <div id="attachments" class="attachments hidden"></div>
     <div id="slashPopup" class="slash-popup hidden"></div>
     <textarea id="input" rows="3" placeholder="让狐狸 AI 做点什么…（Enter 发送，Shift+Enter 换行；/mcp 查看可用 MCP 工具；需要调用插件或 MCP 时请明说）" data-i18n-placeholder="让狐狸 AI 做点什么…（Enter 发送，Shift+Enter 换行；/mcp 查看可用 MCP 工具；需要调用插件或 MCP 时请明说）"></textarea>

@@ -357,6 +357,38 @@ class ChatViewProvider {
         }
         break;
       }
+      case 'openLocal': {
+        // 本地知识库来源角标：在系统文件资源管理器中定位该文件
+        const raw = String(msg.path || '').trim();
+        if (!raw) break;
+        const uri = vscode.Uri.file(raw);
+        let exists = false;
+        try {
+          await vscode.workspace.fs.stat(uri);
+          exists = true;
+        } catch (_) {
+          exists = false;
+        }
+        log('openLocal', raw, 'exists=', exists);
+        if (!exists) {
+          vscode.window.showWarningMessage(i18n.tw('文件不存在：{0}', raw));
+          break;
+        }
+        // 优先用 revealFileInOS：直接打开系统资源管理器并选中文件，对任意路径（含工作区外）都有效。
+        // revealInExplorer 仅在 VS Code 侧边栏资源管理器里定位“工作区内”的文件；KB 文件位于 ~/.fox-ai/ 等工作区外，
+        // 对它静默无反应（不报错也不弹窗），所以不能作为首选。
+        try {
+          await vscode.commands.executeCommand('revealFileInOS', uri);
+        } catch (e) {
+          log('revealFileInOS failed, fallback to revealInExplorer', e && e.message ? e.message : String(e));
+          try {
+            await vscode.commands.executeCommand('revealInExplorer', uri);
+          } catch (e2) {
+            vscode.window.showWarningMessage(i18n.tw('无法定位文件：{0}', e2 && e2.message ? e2.message : String(e2)));
+          }
+        }
+        break;
+      }
       case 'copy':
         await vscode.env.clipboard.writeText(msg.code || '');
         vscode.window.setStatusBarMessage(i18n.tw('$(check) 已复制'), 1500);
@@ -737,10 +769,11 @@ class ChatViewProvider {
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'chat.css'));
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'chat.js'));
     const i18nUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'i18n.js'));
-    // 富文本增强依赖的第三方库（代码高亮 + 数学公式），以 nonce 注入，遵循 CSP script-src
-    const hljsUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'highlight.min.js'));
+    // 数学公式渲染：本地 vendor 的 KaTeX（离线可用），在 chat.js 之前加载，保证 window.katex 可用
     const katexCssUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'katex', 'katex.min.css'));
-    const katexUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'katex', 'katex.min.js'));
+    const katexJsUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'vendor', 'katex', 'katex.min.js'));
+    const katexHead = '<link rel="stylesheet" nonce="' + nonce + '" href="' + katexCssUri.toString() + '" />';
+    const katexScript = '<script nonce="' + nonce + '" src="' + katexJsUri.toString() + '"></script>';
     // 跟随系统语言：仅非中文环境注入「中文 -> 英文」映射；中文环境不注入，直接展示原文（零回退风险）
     const locale = i18n.currentLocale();
     const isZh = locale.toLowerCase().indexOf('zh') === 0;
@@ -755,13 +788,11 @@ class ChatViewProvider {
     const i18nScript =
       '<script nonce="' + nonce + '">window.__FOX_LOCALE__=' + JSON.stringify(locale) +
       ';window.__FOX_I18N__=' + JSON.stringify(i18nMap) + ';</script>';
-    // 第三方库：KaTeX 样式（link）+ highlight.js / katex 脚本（nonce 注入，置于 head 末尾，先于 chat.js 执行）
-    const vendorHead =
-      '<link rel="stylesheet" href="' + katexCssUri.toString() + '" />' +
-      '<script nonce="' + nonce + '" src="' + hljsUri.toString() + '"></script>' +
-      '<script nonce="' + nonce + '" src="' + katexUri.toString() + '"></script>';
+    // 数学公式渲染：本地 KaTeX（vendor/katex，离线可用）。CSS 与 JS 都注入 head，
+    // 在 chat.js 之前加载，保证 window.katex 可用；注意 KaTeX 脚本是独立 <script> 标签，
+    // 绝不能拼进 ${scriptUri} 的 src 属性里（否则会破坏 HTML、导致 chat.js 完全不加载、按钮全失效）。
     return html
-      .replace('</head>', i18nScript + vendorHead + '</head>')
+      .replace('</head>', katexHead + i18nScript + katexScript + '</head>')
       .replace(/\$\{i18nUri\}/g, i18nUri.toString())
       .replace(/\$\{cspSource\}/g, webview.cspSource)
       .replace(/\$\{nonce\}/g, nonce)
@@ -1062,6 +1093,7 @@ class ChatViewProvider {
           : atts;
         const { appendLog } = require('./log');
         appendLog('router', '[force-agent] 复述上一轮用户问题重交智能体：' + String(effectiveText).slice(0, 80));
+        this.post({ type: 'replaceLastAssistant' });
         this.post({
           type: 'notice',
           text: '〔已切换智能体〕正在用智能体重新处理你刚才的问题'
@@ -1479,7 +1511,8 @@ class ChatViewProvider {
     const prev = this.session;
     const prevReadFileHistory = (prev && prev._readFileHistory) ? prev._readFileHistory.slice() : [];
     const prevForceText = prev ? prev._forceText : false;
-    const prevOfficialSearch = prev ? prev._officialSearchStarted : false;
+    // 1.1.18：computeOfficialSearch 已改为「仅当次请求时效性」触发，不再永久粘连，
+    // 因此无需把旧会话的官方搜索标记传给新 session，避免旧 bug 的遗留状态继续污染新对话。
     const prevScVerified = prev && prev._scVerified ? new Set(prev._scVerified) : null;
     // 规划状态跨「继续」/resume 保持：优先取上一个 session，否则取 chatView 镜像（resume 时已从存档恢复）
     const prevPlanTaskId = (prev && prev._planTaskId) || this._planTaskId || null;
@@ -1499,7 +1532,6 @@ class ChatViewProvider {
     });
     if (prevReadFileHistory.length) session._readFileHistory = prevReadFileHistory;
     if (prevForceText) session._forceText = true;
-    if (prevOfficialSearch) session._officialSearchStarted = true;
     if (prevScVerified) session._scVerified = prevScVerified;
     if (prevPlanTaskId) session._planTaskId = prevPlanTaskId;
     if (prevPlanned) session._planned = true;
@@ -1620,17 +1652,22 @@ class ChatViewProvider {
   buildUi() {
     const self = this;
     return {
-      text: ({ text }) => {
-        this.ensureBubble();
-        this.post({ type: 'delta', id: this.bubbleId, text });
+      assistantStart: ({ channel, msg_id }) => {
+        if (channel === 'final') this.bubbleId = msg_id;
+        this.post({ type: 'assistantStart', channel, msg_id });
       },
-      reasoning: ({ text }) => {
-        this.ensureBubble();
-        this.post({ type: 'reasoning', id: this.bubbleId, text });
+      text: ({ text, channel, msg_id }) => {
+        this.post({ type: 'delta', channel, msg_id: msg_id || this.bubbleId, text });
       },
-      image: ({ src, alt }) => {
-        this.ensureBubble();
-        this.post({ type: 'image', id: this.bubbleId, src, alt });
+      reasoning: ({ text, channel, msg_id }) => {
+        this.post({ type: 'reasoning', channel, msg_id: msg_id || this.bubbleId, text });
+      },
+      image: ({ src, alt, channel, msg_id }) => {
+        this.post({ type: 'image', channel, msg_id: msg_id || this.bubbleId, src, alt });
+      },
+      assistantEnd: ({ channel, msg_id, done }) => {
+        this.post({ type: 'assistantEnd', channel, msg_id: msg_id || this.bubbleId, done });
+        if (channel === 'final' || !channel) this.bubbleId = null;
       },
       // 运行中检查点：agent 每完成一步 emit 一次，chatView debounce 落盘，
       // 保证长任务中途重载窗口也能恢复最近进度（Bug④ 兜底）
@@ -1648,19 +1685,16 @@ class ChatViewProvider {
       },
       toolStart: ({ id, name, kind, title, args, preview }) => {
         this.endBubble();
-        // 步骤时间线：工具调用前先收尾仍在运行的「思考」步骤，再开本条工具步骤
+        // 步骤时间线：工具调用前先收尾仍在运行的「思考」步骤，避免工具步骤里残留 ⏳
         if (self._lastThinkingId) {
           self.post({ type: 'step', id: self._lastThinkingId, status: 'ok' });
           self._lastThinkingId = null;
         }
-        self.post({ type: 'step', id, kind: kind || 'info', title, status: 'running' });
-        if (preview && preview.before !== undefined) {
-          this.previews.set(id, { path: preview.path, before: preview.before, after: preview.after });
-        }
-        // 记录 agent 碰过的文件，方便在「文件」导航树里一键跳转
-        if (this.fileNav && args && args.path && typeof name === 'string' && name.endsWith('_file')) {
-          this.fileNav.addFile(args.path, { op: name });
-        }
+        // 记录开始时间，工具结束时计算耗时（结构化工作链元数据之一）
+        self._toolTimes = self._toolTimes || new Map();
+        self._toolTimes.set(id, Date.now());
+        // 结构化工作链：工具调用本身就是一条时间线节点（不再额外发一条冗余 step），
+        // 携带 tool_name/parameters/timestamp 等元数据，供前端折叠详情渲染
         this.post({
           type: 'tool',
           id,
@@ -1671,23 +1705,39 @@ class ChatViewProvider {
           preview: preview
             ? { path: preview.path, existed: preview.existed, stat: preview.stat, text: preview.text }
             : null,
+          tool_name: name,
+          parameters: args,
+          summary: title,
+          group: 'tool',
+          stepType: 'tool_call',
+          timestamp: Date.now(),
           status: 'running'
         });
+        if (preview && preview.before !== undefined) {
+          this.previews.set(id, { path: preview.path, before: preview.before, after: preview.after });
+        }
+        // 记录 agent 碰过的文件，方便在「文件」导航树里一键跳转
+        if (this.fileNav && args && args.path && typeof name === 'string' && name.endsWith('_file')) {
+          this.fileNav.addFile(args.path, { op: name });
+        }
       },
       toolStream: ({ id, text }) => this.post({ type: 'toolStream', id, text }),
       toolEnd: ({ id, ok, output, rejected }) => {
+        const dur = self._toolTimes ? (Date.now() - (self._toolTimes.get(id) || Date.now())) : 0;
+        if (self._toolTimes) self._toolTimes.delete(id);
+        const status = rejected ? 'rejected' : ok ? 'ok' : 'error';
         self.post({
           type: 'toolUpdate',
           id,
-          status: rejected ? 'rejected' : ok ? 'ok' : 'error',
-          output: String(output || '').slice(0, 4000)
+          status,
+          output: String(output || '').slice(0, 4000),
+          duration: dur
         });
-        self.post({ type: 'step', id, status: rejected ? 'error' : ok ? 'ok' : 'error', detail: String(output || '').slice(0, 240) });
         self.pushStatus();
       },
       requestApproval: (req, cb) => {
         this.post({ type: 'approval', id: req.id, name: req.name, kind: req.kind, title: req.title });
-        this.post({ type: 'step', id: 'ap-' + req.id, kind: 'approval', title: i18n.tw('等待审批：{0}', req.title || req.name), status: 'running' });
+        this.post({ type: 'step', id: 'ap-' + req.id, kind: 'approval', title: i18n.tw('等待审批：{0}', req.title || req.name), status: 'running', group: 'warn', stepType: 'approval', timestamp: Date.now() });
         // 包装回调：用户决策后同步刷新 step 状态，避免「已允许」后步骤列表仍显示 running
         const wrappedCb = (decision) => {
           const status = decision === 'reject' || decision === 'reject-cancel' ? 'error' : 'ok';
@@ -1703,28 +1753,39 @@ class ChatViewProvider {
           self.post({ type: 'step', id: self._lastThinkingId, status: 'ok' });
           self._lastThinkingId = null;
         }
-        self.post({ type: 'step', id: id || ('s' + (++self._stepSeq)), kind: kind || 'info', title: title || '', detail: detail || '', status: status || 'running' });
+        // 按类型归类（思考链归类用）：工具/思考/错误/警告/系统状态各自成组，避免一堆「完成」
+        const grp = kind === 'error' ? 'error' : (kind === 'approval' || kind === 'warn' || kind === 'notice') ? 'warn' : kind === 'system_status' ? 'info' : 'llm';
+        const stepType = kind === 'done' ? 'done' : kind === 'error' ? 'error' : kind === 'approval' ? 'approval' : kind === 'system_status' ? 'system_status' : 'llm';
+        self.post({ type: 'step', id: id || ('s' + (++self._stepSeq)), kind: kind || 'info', title: title || '', detail: detail || '', status: status || 'running', group: grp, stepType, timestamp: Date.now() });
       },
-      state: ({ state }) => {
+      state: ({ state, thinkingMsgId }) => {
         this.pushStatus(state);
         if (state === 'thinking') {
-          this._stepSeq = this._stepSeq || 0;
-          if (this._lastThinkingId) this.post({ type: 'step', id: this._lastThinkingId, status: 'ok' });
-          const sid = 'st' + (++this._stepSeq);
+          this._stepSeq = self._stepSeq || 0;
+          if (this._lastThinkingId) {
+            this.post({ type: 'step', id: self._lastThinkingId, status: 'ok' });
+          }
+          const sid = thinkingMsgId || ('st' + (++self._stepSeq));
           this._lastThinkingId = sid;
-          this.post({ type: 'step', id: sid, kind: 'llm', title: i18n.tw('调用模型'), status: 'running' });
+          this.post({ type: 'step', id: sid, kind: 'llm', title: i18n.tw('调用模型'), status: 'running', group: 'reason', stepType: 'llm', timestamp: Date.now() });
         }
       },
       notice: ({ text }) => this.post({ type: 'notice', text }),
       // 原生联网（DeepSeek/OpenAI Responses 的 web_search_call）的搜索结果 URL，
       // 透传给前端 harvest，补全引用角标成可点击链接。
       searchSources: ({ text }) => { if (text) this.post({ type: 'searchSources', text }); },
+      // 本地知识库检索命中的来源文件（label + 绝对路径），透传给前端用于角标定位。
+      kbSources: ({ sources }) => { if (Array.isArray(sources) && sources.length) this.post({ type: 'kbSources', sources }); },
+      cacheStats: (data) => { this.post({ type: 'cacheStats', ...data }); },
+      cacheUnsupported: (data) => { this.post({ type: 'cacheUnsupported', ...data }); },
       contextUsage: (data) => {
         this.lastContextUsage = data;
         try { this.context.globalState.update('lastContextUsage', data); } catch (_) {}
         this.post({ type: 'contextUsage', ...data });
       },
-      finalText: () => this.endBubble(),
+      finalText: () => {
+        // 已合并到 assistantEnd，保留空回调兼容旧版 agent 事件
+      },
       planPending: ({ plan, revised }) => {
         self.post({ type: 'planPending', plan: plan || [], revised: !!revised });
       },

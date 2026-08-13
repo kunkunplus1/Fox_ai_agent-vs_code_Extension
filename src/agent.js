@@ -18,6 +18,7 @@ const caps = require('./capabilities');
 const harness = require('./harness');
 const bridge = require('./extensionBridge');
 const contextUsage = require('./contextUsage');
+const nativeSearch = require('./nativeSearch'); // 多厂商原生联网能力判定 + 引用收割（纯函数）
 const { MemoryStore } = require('./memory');
 const { UserSkillStore } = require('./skills');
 const { PlanTaskStore } = require('./planTasks');
@@ -28,6 +29,7 @@ const reasoning = require('./reasoningParams'); // 深度思考：跨后端参�
 
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 
 // —— 模块级 LLM 并发限流 ——
 // 跨所有 session / 可移动面板限制「同时飞向模型的请求数」。多个面板/会话同时跑任务时，
@@ -314,13 +316,11 @@ ${envBrief}
     ? '\n【结构化输出】在总结、计划、任务清单、配置说明等场景，优先输出 JSON 或 YAML 等结构化格式，避免冗余自然语言描述。'
     : '';
 
-  // DeepSeek + Responses API 下，web_search 是服务端内置的官方联网搜索（免费、免 key），
-  // 主动提示模型“你有可用联网能力”，避免它误以为自己没有实时信息。
+  // 多厂商原生联网（服务端执行）：按 provider/apiMode 生成「你有可用联网能力」提示段，
+  // 覆盖 DeepSeek / OpenAI / 通义百炼（Responses 与 Chat enable_search）/ 智谱 / Kimi / Claude。
   const provider = cfg.provider || 'llamacpp';
   const apiMode = cfg.apiMode || 'chat';
-  const nativeSearchHint = (provider === 'deepseek' && apiMode === 'responses')
-    ? '\n【联网能力（重要）】当前为 DeepSeek Responses API 模式，你已具备服务端内置的官方联网搜索（web_search，由 DeepSeek 服务端自动执行，免费免 key）。当用户问到时效性、实时、最新资讯、排行、价格、当前事件、今天/本周/最新 等需要最新数据的问题时：\n1) 你必须先通过联网搜索获取真实最新信息，再据此回答；\n2) 严禁用 fetch / Chrome DevTools / 其他 MCP 去抓取实时数据——这些拿不到实时结果，只会得到过期或错误内容；\n3) 不要以“我没有实时信息”为由拒绝回答，联网搜索会被自动执行，你只需在回答里引用搜索到的内容。\n4) 【准确性要求】你必须严格基于联网搜索返回的真实结果来回答，禁止编造、臆测或把不相关的内容套到问题上。如果搜索结果里没有明确给出答案，就如实说明“搜索结果未直接提及”，并给出已检索到的相关线索，不要硬凑一个似是而非的答案。\n5) 【不要自己拼 URL】不要尝试用 open_page / fetch / 构造链接去“验证”搜索结果；官方 web_search 已经把可信结果返回给你，直接基于它回答即可。'
-    : '';
+  const nativeSearchHint = nativeSearch.nativeSearchSystemHint({ provider, apiMode }) || '';
 
   // 强制引用与溯源护栏（对应生产级方法论「生成必附来源、无依据输出信息不足」）。
   // 开启后，要求基于检索/文件/代码的内容必须标注来源；无可靠依据不得编造，须明确说信息不足。
@@ -494,6 +494,15 @@ class AgentSession {
     // 续跑：关联会话 id 与要复用的任务 id
     this.sessionId = opts.sessionId || null;
     this.resumeTaskId = opts.resumeTaskId || null;
+    // 会话标识：每个会话固定一个 conversationId，仅作内部标识/日志关联使用，
+    // 不注入任何 HTTP 头（已核实：DeepSeek 等 stateless API 不认 conversation id，缓存按前缀内容自动匹配）。
+    this.conversationId = opts.conversationId || opts.sessionId || ('fox-' + crypto.randomBytes(8).toString('hex'));
+    // 缓存命中监控状态
+    this._cachePrefixHash = null;       // 本轮请求前缀（system+tools）SHA 指纹
+    this._cacheBaselineHash = null;     // 本会话首次请求前缀指纹（用于漂移检测）
+    this._cachePrevHitRate = null;      // 上一轮命中率（用于「命中骤降」告警）
+    this._cachePrevRequested = false;
+    this._cacheWarmed = false;          // 预热是否已做过
     // 长期记忆（跨会话记住用户偏好/约定/教训）
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
@@ -550,6 +559,14 @@ class AgentSession {
     this._subagentBatch = 0;
     // ---- 后台 / 异步 agent（懒建；store 跨会话共享，所以挂在 opts 上可注入）----
     this._background = opts.background || null;
+    // ---- 工作链/正文物理隔离：本 run 的唯一消息 ID ----
+    this.runId = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    this.finalMsgId = 'final-' + this.runId;
+    this.thinkingMsgId = null;
+    this._thinkingBuffer = { text: '', reasoning: '', images: [] };
+    this._finalStarted = false;
+    this._finalStreamed = false; // 最终正文是否已实时流式推送（用于轮末避免重复 flush）
+    this._inFinalPhase = false;
   }
 
   /**
@@ -1196,6 +1213,14 @@ class AgentSession {
   }
 
   async run() {
+    // 缓存能力点对点判定：决定预热是否执行、以及不支持的模型只提醒一次
+    if (!this._cacheCapability) {
+      try { this._cacheCapability = require('./client').getCacheCapability(this.cfg && this.cfg.meta, this.cfg && this.cfg.transport, this.cfg && this.cfg.model); } catch (_) { this._cacheCapability = { supported: true, kind: 'auto', provider: 'openai-compatible' }; }
+    }
+    if (this._cacheCapability && !this._cacheCapability.supported && !this._warnedCacheUnsupported) {
+      this._warnedCacheUnsupported = true;
+      this.emit('cacheUnsupported', { reason: this._cacheCapability.reason, provider: this._cacheCapability.provider, model: (this.cfg && this.cfg.model) || '' });
+    }
     // 增量刷新运行时可能被用户改过的配置项（上下文窗口上限、自动压缩开关），
     // 让改动在当前会话即时生效，不必重启或 Reload Window。
     // 只覆盖这两个字段，不动 baseUrl/model 等（避免覆盖会话创建时传入的值）。
@@ -1336,13 +1361,16 @@ class AgentSession {
     await this._maybeAutoCompress(queryText, envBrief);
   } catch (_) {}
 
+  // ===== 铁打前缀：system 只放「绝对静态」的基础系统提示词；所有每轮变动内容收集到 dynParts，
+  // 最后注入「最后一条 user 消息（当前轮提问）」前面，确保 system 前缀永远不变、前缀缓存整段命中。
   let baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol, queryText);
-    const beforeKb = baseSystem;
-    let system = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId);
-    let knowledgeText = '';
-    if (system.length > beforeKb.length) {
-      knowledgeText = system.slice(beforeKb.length).replace(/^\n+/, '');
-    }
+  // 知识库检索：向量模型（语义）启用时走异步召回，未启用时内部等价于旧的同步 BM25 路径。
+  // 失败一律回退，绝不阻塞主流程。
+  const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
+  let knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
+  // 动态附录收集器：每轮随 query/记忆/kb/审查变动，但绝不写入 system
+  const dynParts = [];
+  if (knowledgeText) dynParts.push(knowledgeText);
 
     // 长期记忆：把用户偏好/约定/教训注入系统提示词
     // 结构化主题记忆走「按需加载」：只挑与本次提问最相关的 2~3 个主题，受字符预算约束，
@@ -1358,27 +1386,27 @@ class AgentSession {
       const flat = this.memory.renderForPrompt();
       if (flat) memoryText = memoryText ? memoryText + '\n\n' + flat : flat;
     } catch (_) {}
-    if (memoryText) system += '\n\n【长期记忆】\n' + memoryText;
+    if (memoryText) dynParts.push('【长期记忆】\n' + memoryText);
 
     // 用户技能：把 agent 自己编写的可复用工作流清单注入系统提示词
     let skillText = '';
     try {
       skillText = this.skills.renderForPrompt();
     } catch (_) {}
-    if (skillText) system += '\n\n【用户技能】\n' + skillText;
+    if (skillText) dynParts.push('【用户技能】\n' + skillText);
 
     // 项目任务清单：把当前可见任务注入系统提示词
     let planTaskText = '';
     try {
       planTaskText = this.planTasks.renderForPrompt();
     } catch (_) {}
-    if (planTaskText) system += '\n\n【项目任务清单】\n' + planTaskText;
+    if (planTaskText) dynParts.push('【项目任务清单】\n' + planTaskText);
 
     // Agent 模式人格：非默认模式才注入后缀（code 模式一个字都不加，不浪费 token）
     if (this.mode) {
       try {
         const suffix = require('./modes').renderForPrompt(this.mode);
-        if (suffix) system += '\n\n' + suffix;
+        if (suffix) dynParts.push(suffix);
       } catch (_) {}
     }
 
@@ -1394,7 +1422,7 @@ class AgentSession {
             root: rulesRoot,
             budget: config.conf().get('projectRules.budget', 6000)
           });
-          if (rulesText) system += '\n\n' + rulesText;
+          if (rulesText) dynParts.push(rulesText);
         }
       }
     } catch (_) {}
@@ -1402,15 +1430,17 @@ class AgentSession {
     // 项目结构：自动扫描工作区并注入概览，让 agent 始终知道文件布局；
     // 多语言项目会明确提示「按语言拆分、每个职责一个文件」地写入。
     const projCtx = this._buildProjectContext();
-    if (projCtx) system += '\n\n【项目结构】\n' + projCtx;
+    if (projCtx) dynParts.push('【项目结构】\n' + projCtx);
 
-    // 对明确的时间查询，直接把当前时间注入 system，避免模型“装傻”
+    // 对明确的时间查询，取真实时间——但只进 dynamicAppendix（user 消息），绝不进 system，避免 system 前缀掺入变动时间戳
+    let timeInfo = '';
     if (/现在几点|当前时间|今天几号|今天日期|几点了|什么时间|几点钟/i.test(queryText)) {
       try {
-        const timeInfo = await tools.execute('current_time', {}, { maxToolOutput: 500 });
-        if (timeInfo) system += '\n\n【当前时间信息】\n' + timeInfo;
+        const ti = await tools.execute('current_time', {}, { maxToolOutput: 500 });
+        if (ti) timeInfo = ti;
       } catch (_) {}
     }
+    if (timeInfo) dynParts.push('【当前时间信息】\n' + timeInfo);
 
     let downgraded = false;
 
@@ -1430,8 +1460,10 @@ class AgentSession {
         this.deltaSeen = false;
         this.reasoningSeen = false;
         this._estDeltaChars = 0;
+        this.thinkingMsgId = 'thinking-' + this.runId + '-' + this.stepCount;
+        this._thinkingBuffer = { text: '', reasoning: '', images: [] };
         this.state = 'thinking';
-        this.emit('state', { state: 'thinking', step: this.stepCount });
+        this.emit('state', { state: 'thinking', step: this.stepCount, thinkingMsgId: this.thinkingMsgId });
 
         // 等待本轮可能触发的代码审查结果（限时，默认 8s）。
         // 若审查在限时内完成，把摘要注入 system 供主控参考，主控的最终回答会自然吸纳这些意见；
@@ -1441,11 +1473,17 @@ class AgentSession {
           : 8000;
         const reviewSnapshot = await this._awaitReview(reviewTimeout);
         const reviewInjectText = (reviewSnapshot && reviewSnapshot.text)
-          ? '\n\n【本轮代码审查意见】\n' + reviewSnapshot.text +
+          ? '【本轮代码审查意见】\n' + reviewSnapshot.text +
             '\n请把这些意见纳入当前思考；若认同，在最终回答中说明你将如何修正。'
           : '';
 
+        // ★ 铁打前缀：system 恒等于静态 baseSystem，不掺任何动态内容；
+        // 动态附录（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查）注入到最后一条 user 消息前面，
+        // 位于请求尾部、随轮 append-only，绝不污染可缓存的静态前缀。
+        const system = baseSystem;
+        const appendix = dynParts.concat(reviewInjectText || []).filter(Boolean).join('\n\n');
         const preparedHistory = await this.prepareHistory();
+        this._injectDynamicAppendix(preparedHistory, appendix);
         this._emitContextUsage({
           baseSystem,
           memoryText,
@@ -1457,7 +1495,7 @@ class AgentSession {
           maxTokens: cfg.maxTokens,
           contextWindow: cfg.contextWindow
         });
-        const payload = [{ role: 'system', content: system + reviewInjectText }].concat(preparedHistory);
+        const payload = [{ role: 'system', content: system }].concat(preparedHistory);
         const useNative = this.protocol === 'native';
 
         let result;
@@ -1474,14 +1512,11 @@ class AgentSession {
             // 让模型用 <fox:tool> 块输出调用，客户端解析执行；不再直接落到无工具的 chat。
             this._forceText = true;
             this.protocol = 'text';
+            // 只重建静态 baseSystem；知识库检索文本与动态附录（记忆/技能/任务/结构/审查）由主循环统一注入到最后一条 user 消息，
+            // 绝不写回 system —— system 始终等于 baseSystem，铁打不变、可缓存。
             baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol);
-            system = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId);
-            knowledgeText = system.length > baseSystem.length ? system.slice(baseSystem.length).replace(/^\n+/, '') : '';
-            if (memoryText) system += '\n\n【长期记忆】\n' + memoryText;
-            if (skillText) system += '\n\n【用户技能】\n' + skillText;
-            if (planTaskText) system += '\n\n【项目任务清单】\n' + planTaskText;
-            const projCtx2 = this._buildProjectContext();
-            if (projCtx2) system += '\n\n【项目结构】\n' + projCtx2;
+            const kbSys2 = await this._augmentWithKnowledge(baseSystem, queryText);
+            knowledgeText = this.kbInjectedSegment(kbSys2, baseSystem);
             this.emit('notice', {
               text: '当前模型不支持原生函数调用，已自动切换为文本协议模式继续。'
             });
@@ -1532,11 +1567,9 @@ class AgentSession {
         const visibleText =
           this.protocol === 'text' ? this.stripToolBlocks(textSource) : result.content;
 
-        // 模型生成图片：推到 UI 并保存进历史（存档时会剥离 base64）
+        // 模型生成图片：暂存到本轮缓冲区，最终随 channel（thinking/final）统一发出
         const resultImages = Array.isArray(result.images) ? result.images : [];
-        for (const img of resultImages) {
-          this.emit('image', { src: img.src, alt: img.alt || '模型生成图片' });
-        }
+        this._thinkingBuffer.images = this._thinkingBuffer.images.concat(resultImages);
 
         // 记录 assistant 消息
         if (this.protocol === 'native') {
@@ -1569,6 +1602,8 @@ class AgentSession {
         }
 
         if (!calls.length) {
+          // final 阶段：禁止再触发工具调用，把最终答案统一推送进主正文
+          this._inFinalPhase = true;
           this.state = 'done';
           if ((!visibleText || !String(visibleText).trim()) && !resultImages.length) {
             const modelHint = cfg.model ? `当前模型：${cfg.model}` : '当前模型名未配置';
@@ -1576,26 +1611,16 @@ class AgentSession {
               text: `模型没有返回任何内容。${modelHint}。\n常见原因：1) 模型名不存在；2) API Key 无效；3) 该模型不支持 function calling。可尝试在设置里切换 foxAi.agent.toolProtocol（native/text/auto）。`
             });
           }
-          // 非流式（或文本协议）下 onDelta 不会触发，需手动把完整文本/思考推给 UI，否则面板看不到回复
-          if (visibleText && String(visibleText).trim() && !this.deltaSeen) {
-            this.emit('text', { text: visibleText });
-          }
-          // 展示 reasoning 时也去掉工具标签，避免把 <fox:tool> 当思考内容显示
-          const cleanReasoning = result.reasoning ? this.stripToolBlocks(result.reasoning) : '';
-          if (cleanReasoning && String(cleanReasoning).trim() && !this.reasoningSeen) {
-            this.emit('reasoning', { text: cleanReasoning });
-          }
 
           // ---- 输出截断自动继续 ----
-          // OpenAI chat.completions: finish_reason='length'; Responses API: 'incomplete'; Anthropic 已统一映射为 'length'
           const maxContinues = Math.max(0, Number(cfg.maxContinues) || 3);
-          if (shouldAutoContinue(result, cfg, this._continuesUsed)) {
+          const willAutoContinue = shouldAutoContinue(result, cfg, this._continuesUsed);
+          if (willAutoContinue) {
             this._continuesUsed++;
             appendLog('agent', `[auto-continue] finishReason=${result.finishReason} count=${this._continuesUsed}/${maxContinues} contentLen=${String(visibleText || '').length}`);
             this.emit('notice', { text: `模型输出达到长度上限，正在自动继续（${this._continuesUsed}/${maxContinues}）…` });
             // 静默插入 continue 提示：不触发 UI 用户消息，只追加到历史供下次请求使用
             this.messages.push({ role: 'user', content: '继续输出剩余内容，保持与上文连贯，不要重复已经输出的部分。' });
-            continue;
           }
           const truncated = result.finishReason === 'length' || result.finishReason === 'incomplete';
           if (truncated && this._continuesUsed >= maxContinues) {
@@ -1603,27 +1628,68 @@ class AgentSession {
             this.emit('notice', { text: `已自动继续 ${maxContinues} 次，输出仍被模型长度限制截断。如需继续，请手动发送「继续」。` });
           }
 
-          this.emit('finalText', { text: visibleText });
-          if (this.task) {
-            try {
-              await this.taskManager.appendStep(this.task.id, {
-                kind: 'final',
-                text: String(visibleText || '').slice(0, 200)
-              });
-              await this.taskManager.updateState(this.task.id, harness.TASK_STATES.COMPLETED);
-            } catch (_) {}
+          // 最终答案统一使用同一个 finalMsgId；仅在第一次 final 时发 assistantStart
+          if (!this._finalStarted) {
+            this.emit('assistantStart', { channel: 'final', msg_id: this.finalMsgId });
+            this._finalStarted = true;
           }
-          // planner 生成的「执行计划」在任务完成后自动标记完成
-          if (this._planTaskId && this.planTasks) {
-            try { await this.planTasks.setStatus(this._planTaskId, 'completed'); } catch (_) {}
+          // 最终答案的思考过程（深度思考）渲染进主气泡顶部的「已思考」折叠面板，
+          // 与最终正文同属 final 通道：物理隔离于右侧工作链，但思考过程对用户可见。
+          const finalReasoning = result.reasoning || this._thinkingBuffer.reasoning || '';
+          if (finalReasoning && String(finalReasoning).trim()) {
+            this.emit('reasoning', { text: finalReasoning, channel: 'final', msg_id: this.finalMsgId });
           }
-          // 任务结束前尝试一次上下文压缩（防止戛然而止导致压缩永远不触发）
-          try { await this._maybeAutoCompress(queryText, envBrief); } catch (_) {}
-          // 结构化记忆自动沉淀：规则式抽取用户的纠正 / 约定 / 偏好，零模型调用、不额外花钱
-          this._harvestMemories();
-          this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
-          return { finished: true, text: visibleText };
+          // 实时流式已在 onDelta 中逐字推送（含 DeepSeek reasoningGate 的延时内容：客户端
+          // gate 会把缓冲正文按 20 字/16ms 重放完，onDelta 已覆盖全文）。因此只要实时流式发生过
+          // （this._finalStreamed===true），就绝不再补发整段，否则最终正文会被原样追加两遍
+          // （deepseek+responses 下 _reasoningGate 恒为 true，旧守卫 `!(_finalStreamed && !_reasoningGate)`
+          // 会被恒置真而强制补发，正是正文重复两遍的根因）。
+          if (visibleText && String(visibleText).trim() && !this._finalStreamed) {
+            this.emit('text', { text: visibleText, channel: 'final', msg_id: this.finalMsgId });
+          }
+          for (const img of resultImages) {
+            this.emit('image', { src: img.src, alt: img.alt || '模型生成图片', channel: 'final', msg_id: this.finalMsgId });
+          }
+          if (!willAutoContinue) {
+            this.emit('assistantEnd', { channel: 'final', msg_id: this.finalMsgId, done: true });
+            if (this.task) {
+              try {
+                await this.taskManager.appendStep(this.task.id, {
+                  kind: 'final',
+                  text: String(visibleText || '').slice(0, 200)
+                });
+                await this.taskManager.updateState(this.task.id, harness.TASK_STATES.COMPLETED);
+              } catch (_) {}
+            }
+            // planner 生成的「执行计划」在任务完成后自动标记完成
+            if (this._planTaskId && this.planTasks) {
+              try { await this.planTasks.setStatus(this._planTaskId, 'completed'); } catch (_) {}
+            }
+            // 任务结束前尝试一次上下文压缩（防止戛然而止导致压缩永远不触发）
+            try { await this._maybeAutoCompress(queryText, envBrief); } catch (_) {}
+            // 结构化记忆自动沉淀：规则式抽取用户的纠正 / 约定 / 偏好，零模型调用、不额外花钱
+            this._harvestMemories();
+            this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
+            return { finished: true, text: visibleText };
+          }
+
+          // 自动继续：继续下一轮，仍使用同一 finalMsgId
+          continue;
         }
+
+        // 存在工具调用：本轮属于 thinking，内容进工作链面板，不污染主正文
+        this.emit('assistantStart', { channel: 'thinking', msg_id: this.thinkingMsgId });
+        const turnReasoning = result.reasoning || this._thinkingBuffer.reasoning || '';
+        if (turnReasoning && String(turnReasoning).trim()) {
+          this.emit('reasoning', { text: turnReasoning, channel: 'thinking', msg_id: this.thinkingMsgId });
+        }
+        if (visibleText && String(visibleText).trim()) {
+          this.emit('text', { text: visibleText, channel: 'thinking', msg_id: this.thinkingMsgId });
+        }
+        for (const img of resultImages) {
+          this.emit('image', { src: img.src, alt: img.alt || '模型生成图片', channel: 'thinking', msg_id: this.thinkingMsgId });
+        }
+        this.emit('assistantEnd', { channel: 'thinking', msg_id: this.thinkingMsgId, done: false });
 
         // 逐个执行工具
         for (const call of calls) {
@@ -1959,6 +2025,37 @@ class AgentSession {
     return (messages || []).some((m) => Array.isArray(m.content) && m.content.some(caps.isImagePart));
   }
 
+  /**
+   * 把「动态附录」（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查）注入到历史里
+   * 「最后一条 user 消息（即当前轮提问）」的前面，而不是写进 system。
+   * 这样 system 前缀始终固定、可缓存；动态内容位于请求尾部、随轮自然 append-only，不污染静态前缀。
+   * 关键点：深拷贝最后一条 user 消息再改，绝不改动 this.messages 共享历史（否则跨轮会累积重复）。
+   * @param {Array} history prepareHistory() 返回的（已 sanitize 的）消息数组
+   * @param {string} appendix 已用 '\n\n' 拼接好的动态内容；为空则不动
+   */
+  _injectDynamicAppendix(history, appendix) {
+    if (!appendix || !history || !history.length) return;
+    // 找到最后一条 user 角色消息（当前轮提问）。工具结果用 role:'tool'，不会误判。
+    let idx = -1;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i] && history[i].role === 'user') { idx = i; break; }
+    }
+    if (idx < 0) {
+      // 兜底：历史里没有 user 消息，直接追加一条承载动态附录
+      history.push({ role: 'user', content: appendix });
+      return;
+    }
+    const m = history[idx];
+    const clone = Object.assign({}, m);
+    if (Array.isArray(m.content)) {
+      // 多模态：在内容数组最前面插一个文本块（图片还在后面）
+      clone.content = [{ type: 'text', text: appendix }].concat(m.content);
+    } else {
+      clone.content = appendix + '\n\n' + (typeof m.content === 'string' ? m.content : (m.content == null ? '' : String(m.content)));
+    }
+    history[idx] = clone;
+  }
+
   /** 用第二个多模态模型看一张图，返回文字描述 */
   async _callSecondaryVision(imageUrl) {
     const v = this.cfg.visionConfig;
@@ -2177,6 +2274,15 @@ class AgentSession {
     // 原生联网（Responses 的 web_search_call）结果含真实 URL：透传给前端 harvest，
     // 让模型回复里的 [^n] 引用角标补全成可点击链接（本地 web_search 工具走 toolUpdate 已覆盖）。
     opt.onSearchResults = (text) => this.emit('searchSources', { text });
+    // 会话标识：conversationId 仅作内部标识传递，不注入 HTTP 头
+    //（stateless API 的上下文缓存按请求前缀内容自动匹配，不依赖 conversation id）。
+    opt.conversationId = this.conversationId;
+    // 缓存命中监控：usage 回调里抽取命中率并检测前缀漂移。
+    opt.onUsage = (usage) => this._onCacheUsage(usage);
+    // 计算本轮请求前缀指纹（system 内容 + 工具定义），用于检测前缀漂移导致整段缓存失效。
+    const sysMsg = (Array.isArray(opt.messages) && opt.messages[0] && opt.messages[0].role === 'system') ? opt.messages[0].content : '';
+    const prefixStr = (typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg)) + '\u0000' + JSON.stringify(opt.tools || []);
+    this._cachePrefixHash = crypto.createHash('sha256').update(prefixStr).digest('hex').slice(0, 16);
     // 切到非主模型时，不假设它支持 grammar 约束解码，去掉以免卡死
     if (!isPrimary && opt.extraBody && opt.extraBody.grammar) {
       const eb = Object.assign({}, opt.extraBody);
@@ -2186,6 +2292,14 @@ class AgentSession {
     }
     const b = selectBackend(targetCfg);
     const useResp = b.responses;
+
+    // 缓存预热（默认关闭，设置 foxAi.cacheWarmup.enabled 开启）：新会话首轮先发一个
+    // 只含 system+tools、max_tokens=1 的请求，把「铁打前缀」提前灌进服务商缓存，
+    // 使随后真实的（大体量）请求能直接命中前缀缓存。
+    const warmupEnabled = (() => { try { return config.conf().get('cacheWarmup.enabled', false); } catch (_) { return false; } })();
+    if (warmupEnabled && !this._cacheWarmed && isPrimary && this._cacheCapability && this._cacheCapability.supported) {
+      await this._warmupCache(opt, useResp, b, targetCfg);
+    }
 
     if (forceNonStream || this.streamBroken) {
       try {
@@ -2250,6 +2364,71 @@ class AgentSession {
     }
   }
 
+  /** 缓存命中监控回调：解析 usage 里的缓存命中 token，计算命中率，检测前缀漂移与命中骤降。 */
+  _onCacheUsage(usage) {
+    if (!this._cacheCapability) {
+      try { this._cacheCapability = require('./client').getCacheCapability(this.cfg && this.cfg.meta, this.cfg && this.cfg.transport, this.cfg && this.cfg.model); } catch (_) { this._cacheCapability = { supported: true, kind: 'auto', provider: 'openai-compatible' }; }
+    }
+    if (this._cacheCapability && !this._cacheCapability.supported) {
+      if (!this._warnedCacheUnsupported) { this._warnedCacheUnsupported = true; this.emit('cacheUnsupported', { reason: this._cacheCapability.reason, provider: this._cacheCapability.provider, model: (this.cfg && this.cfg.model) || '' }); }
+      return;
+    }
+    let stats = null;
+    try { stats = require('./client').extractCacheStats(usage); } catch (_) { stats = null; }
+    if (!stats) return;
+    const prefixHash = this._cachePrefixHash || '';
+    if (!this._cacheBaselineHash) this._cacheBaselineHash = prefixHash;
+    const driftByHash = !!(this._cacheBaselineHash && prefixHash && prefixHash !== this._cacheBaselineHash);
+    const prevHit = this._cachePrevHitRate;
+    const hitDrop = this._cachePrevRequested && prevHit != null && prevHit > 0.05 && stats.hitRate < 0.01;
+    this._cachePrevHitRate = stats.hitRate;
+    this._cachePrevRequested = true;
+    const report = {
+      conversationId: this.conversationId,
+      prefixHash,
+      baselineHash: this._cacheBaselineHash,
+      cachedTokens: stats.cachedTokens,
+      promptTokens: stats.promptTokens,
+      completionTokens: stats.completionTokens,
+      hitRate: Math.round(stats.hitRate * 1000) / 1000,
+      driftByHash,
+      hitDrop
+    };
+    this.emit('cacheStats', report);
+    console.log('[fox-ai] prompt-cache stats', JSON.stringify(report));
+    if (driftByHash) {
+      this.emit('notice', { text: '⚠️ 请求前缀哈希与本会话首次不一致（' + this._cacheBaselineHash + ' → ' + prefixHash + '），前缀缓存将整段失效，请检查系统提示词/工具定义是否被改动。' });
+    } else if (hitDrop) {
+      this.emit('notice', { text: '⚠️ 缓存命中率骤降：上一轮 ' + Math.round(prevHit * 100) + '% 命中，本轮 <1%，前缀缓存可能已被驱逐或失效。' });
+    }
+  }
+
+  /** 缓存预热：发一个极简请求（仅 system + tools，max_tokens=1）把前缀灌进服务商缓存。失败静默忽略。 */
+  async _warmupCache(opt, useResp, b, targetCfg) {
+    if (this._cacheWarmed) return;
+    this._cacheWarmed = true;
+    try {
+      const sysMsg = (Array.isArray(opt.messages) && opt.messages[0] && opt.messages[0].role === 'system') ? opt.messages[0].content : '';
+      const warmOpt = Object.assign({}, opt, {
+        baseUrl: targetCfg.baseUrl,
+        apiKey: targetCfg.apiKey,
+        model: targetCfg.model,
+        messages: [{ role: 'system', content: typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg) }],
+        tools: opt.tools || [],
+        toolChoice: undefined,
+        maxTokens: 1,
+        stream: false,
+        onDelta: null, onReasoning: null, onToolCallStart: null, onDone: null, onError: null, onSearchResults: null, onUsage: null
+      });
+      delete warmOpt.extraBody;
+      console.log('[fox-ai] cache warmup priming conversation ' + this.conversationId);
+      await b.nonStream(warmOpt);
+      console.log('[fox-ai] cache warmup done');
+    } catch (e) {
+      console.log('[fox-ai] cache warmup failed (ignored):', e && e.message);
+    }
+  }
+
   /** 构造 failover 端点列表：首位为主模型（cfg 本身），其后为配置里的备用模型（本地或云端）。 */
   _failoverEndpoints() {
     const cfg = this.cfg;
@@ -2307,6 +2486,9 @@ class AgentSession {
       return '';
     })();
     const openAiTools = tools.toOpenAITools(queryForTools, cfg);
+    // DeepSeek 非 reasoner 模型经 Responses API 开 reasoning 时，content 会被 gate 缓存后延时释放，
+    // 此时最终正文不能完全靠 onDelta 实时流式覆盖，轮末仍需补发 flush（否则可能漏字）。
+    this._reasoningGate = cfg.apiMode === 'responses' && /deepseek/.test(String(cfg.providerId || cfg.provider || cfg.baseUrl || '').toLowerCase()) && !/reasoner|r1/.test(cfg.model);
     console.log('[fox-ai] callModel', cfg.baseUrl, cfg.model, 'native=', useNative, 'isDeepResp=', isDeepResp, 'tools=', openAiTools.length, openAiTools.map((t) => (t.function && t.function.name) || t.type).join(','));
     const options = {
       baseUrl: cfg.baseUrl,
@@ -2318,15 +2500,32 @@ class AgentSession {
       timeout: cfg.timeout,
       insecureHTTPParser: cfg.insecureHttpParser,
       streamFormat: cfg.streamFormat,
+      // DeepSeek 非 reasoner 模型（v4-flash 等）通过 Responses API 开启 reasoning 时，
+      // reasoning_text 与 output_text 会交错到达，导致“思考没结束就回答”。开启 gate
+      // 后 reasoning 活跃期间 content 先缓存，等静默窗口（300ms）后再释放。
+      reasoningGate: cfg.apiMode === 'responses' && /deepseek/.test(String(cfg.providerId || cfg.provider || cfg.baseUrl || '').toLowerCase()) && !/reasoner|r1/.test(cfg.model),
       onDelta: (t) => {
+        if (!t) return;
         this.deltaSeen = true;
-        this.emit('text', { text: t });
+        this._thinkingBuffer.text += t;
         this._estDeltaChars = (this._estDeltaChars || 0) + String(t).length;
         if (this._estDeltaChars % 100 < String(t).length || this._estDeltaChars < 100) {
           this._emitContextUsageDelta(this._estDeltaChars);
         }
+        // 实时流式：native/completions 协议且 provider 真正流式时，把最终正文逐字推到 final 通道，
+        // 让主对话栏逐字显示，而不是轮次末一次性蹦出。文本协议（含 <fox:tool> 标签）仍走轮末统一 flush，
+        // 避免把工具调用标签裸流到主对话栏；非流式 provider（forceNonStream/streamBroken）也不在此流式。
+        const streaming = !(cfg.forceNonStream || this.streamBroken);
+        if (this.protocol !== 'text' && streaming) {
+          if (!this._finalStarted) {
+            this._finalStarted = true;
+            this.emit('assistantStart', { channel: 'final', msg_id: this.finalMsgId });
+          }
+          this._finalStreamed = true;
+          this.emit('text', { text: t, channel: 'final', msg_id: this.finalMsgId });
+        }
       },
-      onReasoning: (t) => { this.reasoningSeen = true; this.emit('reasoning', { text: t }); },
+      onReasoning: (t) => { this.reasoningSeen = true; this._thinkingBuffer.reasoning += t; },
       onToolCallStart: (name) => this.emit('toolPending', { name })
     };
 
@@ -2342,6 +2541,19 @@ class AgentSession {
       console.log('[fox-ai] deepThinking', rp.enabled ? 'ON' : 'OFF', 'strategy=', rp.strategy, rp.reason, JSON.stringify(rp.extraBody));
     } else if (rp.enabled) {
       console.log('[fox-ai] deepThinking ON (prompt-fallback) strategy=', rp.strategy, rp.reason);
+    }
+
+    // —— 多厂商原生联网（服务端执行）：按 provider/apiMode 注入对应请求参数 ——
+    // 1) 通义百炼 Chat：enable_search:true + search_options.enable_source:true（结果在 chunk 顶层 search_info.search_results）
+    // 2) 向 options 透传 nativeSearchProvider，供后端（anthropic.js 注入 server tool web_search_20250305）识别。
+    //    Responses 家族（OpenAI/DeepSeek/通义）与 Chat 工具式（智谱/Kimi）的原生工具已由 toOpenAITools 注入，无需此处处理。
+    const nsProvider = nativeSearch.nativeSearchProvider(cfg);
+    if (nsProvider) options.nativeSearchProvider = nsProvider;
+    if (nsProvider === 'chat' && nativeSearch.isChatNativeFlagSearch(cfg)) {
+      options.extraBody = Object.assign({}, options.extraBody);
+      options.extraBody.enable_search = true;
+      options.extraBody.search_options = Object.assign({}, options.extraBody.search_options, { enable_source: true });
+      console.log('[fox-ai] native chat search: dashscope enable_search injected');
     }
 
     // —— 本地弱模型辅助模式（1.1.17/1.1.19）：约束解码 ——
@@ -2373,16 +2585,20 @@ class AgentSession {
       options.stopMarker = TOOL_END;
     }
 
-    // —— 时效性提问：deepseek+responses 下「只给原生搜索工具」并持续保持，彻底杜绝模型改用
-    //    fetch / Chrome DevTools / MCP 代替官方联网，同时保证搜索连续不中途断掉 ——
-    if (isDeepResp) {
-      const dec = computeOfficialSearch(payload, this._officialSearchStarted);
+    // —— 时效性提问：Responses 原生联网厂商（DeepSeek / OpenAI / 通义百炼 responses）下
+    //    「只给原生搜索工具」杜绝模型改用 fetch / Chrome DevTools / MCP 代替官方联网（1.1.17 起改为
+    //    仅当「本次请求本身时效」，非时效追问交还完整工具集，本地 file 工具不再被永久剥夺）——
+    if (isDeepResp || nativeSearch.isResponsesNativeSearch(cfg)) {
+      const dec = computeOfficialSearch(payload, this._officialSearchStarted, openAiTools);
       if (dec) {
         this._officialSearchStarted = dec.started;
         options.tools = dec.tools;
         if (dec.toolChoice) options.toolChoice = dec.toolChoice;
         else delete options.toolChoice;
-        console.log('[fox-ai] official web_search session keep, query=', String(dec.query || '').slice(0, 50), 'forceChoice=', !!dec.toolChoice);
+        console.log('[fox-ai] official web_search forced (this turn), query=', String(dec.query || '').slice(0, 50), 'forceChoice=', !!dec.toolChoice);
+      } else {
+        // 非时效 / 用户要本地工具：保留完整工具集（含本地 file 工具 + 官方 web_search）
+        console.log('[fox-ai] official web_search not forced this turn, full tools kept (', (openAiTools.length), 'tools )');
       }
     }
 
@@ -3077,6 +3293,24 @@ class AgentSession {
 
       const output = await tools.execute(name, args, execCtx);
       this.emit('toolEnd', { id: uiId, ok: true, output });
+      // 本地联网搜索类工具（web_fetch / browser / mcp 抓取类 / 原生 web_search 等）的返回里若含网址，
+      // 抽出来喂给前端 harvest，使回答里的引用角标能带上可点击链接（与官方联网搜索同机制）。
+      try {
+        if (NETWORK_ONLY_TOOL_RE.test(name) && output && /https?:\/\//.test(String(output))) {
+          const urls = String(output).match(/https?:\/\/[^\s，。；、）)】\]]+/g) || [];
+          const seen = new Set();
+          const lines = [];
+          let i = 0;
+          for (const u of urls) {
+            if (seen.has(u)) continue;
+            seen.add(u);
+            i++;
+            const host = u.replace(/^https?:\/\//, '').split('/')[0] || u;
+            lines.push('[' + i + '] ' + host + '\nURL: ' + u);
+          }
+          if (lines.length) this.emit('searchSources', { text: lines.join('\n') });
+        }
+      } catch (_) {}
       // ---- 冲突感知：read_file 成功后记录快照，供后续写前比对 ----
       if (name === 'read_file' && args && args.path && config.conf().get('conflictWatch.enabled', true)) {
         try {
@@ -3395,6 +3629,62 @@ class AgentSession {
   }
 
   /**
+   * 知识库注入（统一入口，1.1.33）。
+   *
+   * 情况一：只配了「整理模型」→ retrieveAsync 内部检测到向量模型未启用，
+   *         直接走原来的同步 BM25 / 整理模式全量注入，行为与旧版一字不差。
+   * 情况二：整理模型 + 向量模型都配了 → 向量模型先做语义召回（前置），
+   *         整理模型继续负责产出笔记（在后），向量只读它的产物。
+   * 任何异常都回退到同步版，保证知识库永不因向量服务抖动而失效。
+   * @param {string} baseSystem 静态系统提示词
+   * @param {string} queryText 当前用户提问
+   * @returns {Promise<string>} 注入知识库参考后的提示词（未命中则原样返回）
+   */
+  async _augmentWithKnowledge(baseSystem, queryText) {
+    const { appendLog } = require('./log');
+    try {
+      const kbSources = [];
+      const augmented = await kb.augmentSystemPromptAsync(baseSystem, queryText, this.sessionId, {
+        context: this.context,
+        signal: this._abortCtrl ? this._abortCtrl.signal : undefined,
+        onLog: (t) => {
+          try { appendLog('kb', String(t)); } catch (_) {}
+        },
+        onSources: (list) => {
+          try {
+            for (const s of list || []) if (s && s.file) kbSources.push(s);
+          } catch (_) {}
+        }
+      });
+      if (kbSources.length) this.emit('kbSources', { sources: kbSources });
+      return augmented;
+    } catch (e) {
+      try { appendLog('kb', '向量检索异常，回退关键词检索：' + String((e && e.message) || e)); } catch (_) {}
+      try {
+        const kbSources = [];
+        const augmented = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId, {
+          onSources: (list) => { try { for (const s of list || []) if (s && s.file) kbSources.push(s); } catch (_) {} }
+        });
+        if (kbSources.length) this.emit('kbSources', { sources: kbSources });
+        return augmented;
+      } catch (_) {
+        return baseSystem;
+      }
+    }
+  }
+
+  /**
+   * 从「注入知识库后的提示词」抽取相对「基准提示词」新增的片段（即真正注入主控的那段知识库参考）。
+   * 纯函数；两处 KB 注入（首轮装配 + 模型降级重试）共用，避免重复逻辑漂移。
+   * @param {string} kbSys 注入知识库后的完整提示词
+   * @param {string} base 注入前的基准提示词
+   * @returns {string} 新增片段（去除前导空行）
+   */
+  kbInjectedSegment(kbSys, base) {
+    return kbSys.length > base.length ? kbSys.slice(base.length).replace(/^\n+/, '') : '';
+  }
+
+  /**
    * 上下文超限自动压缩：用量占比超过阈值时，把较早的对话用「整理 AI」压缩成摘要写入
    * 「知识库-2」，并就地裁剪历史（splice，保持与 chatView 共享的数组引用一致），
    * 立即释放上下文；同时 invalidate 知识库缓存，让新摘要可被后续检索。
@@ -3438,36 +3728,43 @@ class AgentSession {
       should = true;
       reason = 'turn-based';
     }
+    const usedPct = dataBefore ? Math.round(dataBefore.percentage) : 0;
+    this._ctxStepSeq = (this._ctxStepSeq || 0) + 1;
+    const statusStep = (title, detail) => this.emit('step', {
+      id: 'ctx-' + Date.now() + '-' + this._ctxStepSeq,
+      kind: 'system_status',
+      stepType: 'system_status',
+      title: title || '上下文状态',
+      detail,
+      status: 'ok',
+      group: 'info',
+      timestamp: Date.now()
+    });
     if (!should) return;
     if (compressible < 1) {
       // 已超阈值但没有可压缩的对话消息：占用主要来自固定开销（系统提示词、工具定义、知识库等）
-      const fixedPct = dataBefore ? Math.round(((dataBefore.totalMeasured - dataBefore.historyTokens) / dataBefore.contextWindow) * 100) : 0;
+      const denom = dataBefore.contextWindow || cw || 1;
+      const fixedPct = dataBefore ? Math.round(((dataBefore.totalMeasured - dataBefore.historyTokens) / denom) * 100) : 0;
       appendLog('autoSummarize', '[skip] no compressible messages; fixed cost dominates ~' + fixedPct + '%');
-      this.emit('notice', {
-        text: `上下文已用约 ${usedPct}%，但可压缩的对话消息不足。当前占用主要由系统提示词、工具定义、知识库/任务/记忆等固定开销构成，无法通过压缩释放。如需减少占用，可关闭不用的 MCP/工具或缩小知识库范围。`
-      });
+      statusStep('上下文状态', `上下文已用约 ${usedPct}%，但可压缩的对话消息不足。当前占用主要由系统提示词、工具定义、知识库/任务/记忆等固定开销构成，无法通过压缩释放。如需减少占用，可关闭不用的 MCP/工具或缩小知识库范围。`);
       return;
     }
 
     // 取较早消息去压缩，保留最近 keep 条
     const { clampMessage } = require('./messageSanitize');
     const toCompress = msgs.slice(0, compressible).map((m) => clampMessage(m, 8000));
-    const usedPct = dataBefore ? Math.round(dataBefore.percentage) : 0;
     appendLog('autoSummarize', '[compress] used%=' + usedPct + ' threshold%=' + Math.round(threshold * 100) + ' compressible=' + toCompress.length + ' reason=' + reason);
-    this.emit('notice', {
-      text: `上下文已用约 ${usedPct}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`
-    });
+    statusStep('上下文压缩', `上下文已用约 ${usedPct}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`);
 
     try {
       const out = await kbOrg.summarizeConversation(this.context, toCompress, {
-        onLog: (t) => { try { this.emit('notice', { text: '[知识库-2] ' + t }); } catch (_) {} },
+        onLog: (t) => { try { statusStep('上下文压缩', '[知识库-2] ' + t); } catch (_) {} },
         sessionId: this.sessionId,
         protocol: this.protocol
       });
       if (out) {
         kb.invalidate(); // 重新索引，把新摘要纳入 RAG
         msgs.splice(0, compressible); // 就地裁剪，保持数组引用一致（chatView 同步看到）
-        try { this.emit('autoSummary', { file: out, count: toCompress.length }); } catch (_) {}
         appendLog('autoSummarize', '[ok] compressed=' + toCompress.length + ' file=' + out);
 
         // 压缩完成后立即刷新上下文用量面板：用统一口径重新计算，让用户看到「对话消息」部分已释放
@@ -3485,9 +3782,7 @@ class AgentSession {
           } catch (_) {}
         }
 
-        this.emit('notice', {
-          text: `已把较早 ${toCompress.length} 条对话压缩进知识库-2，上下文已释放；后续回答会结合检索到的摘要继续。`
-        });
+        statusStep('上下文压缩', `已把较早 ${toCompress.length} 条对话压缩进知识库-2，上下文已释放；后续回答会结合检索到的摘要继续。`);
       }
     } catch (e) {
       const reason = String(e.message || '').split('\n')[0];
@@ -3526,9 +3821,7 @@ class AgentSession {
       // 同一会话内只提示一次，避免每步刷屏
       if (!this._autoSummaryDisabledNoticed) {
         this._autoSummaryDisabledNoticed = true;
-        this.emit('notice', {
-          text: '上下文自动压缩当前不可用（缺少有效的「上下文整理」API Key 或调用失败），已改为本机零 token 折叠旧消息来释放空间；设置有效的 API Key 后才会恢复语义摘要。'
-        });
+        statusStep('上下文压缩', '上下文自动压缩当前不可用（缺少有效的「上下文整理」API Key 或调用失败），已改为本机零 token 折叠旧消息来释放空间；设置有效的 API Key 后才会恢复语义摘要。');
       }
     }
   }
@@ -3637,35 +3930,75 @@ class AgentSession {
  * 计算 DeepSeek Responses 官方联网（web_search）在本次请求里该如何注入工具。
  * 纯函数，便于离线测试（不触碰网络 / vscode）。
  * @param {Array} payload 当前对话消息数组
- * @param {boolean} officialSearchStarted 本会话是否已经进入「仅官方搜索」模式
+ * @param {boolean} officialSearchStarted 历史参数（保留签名兼容）；1.1.17 起不再用于「永久粘连」
+ * @param {Array} [openAiTools] 当前完整工具集（含 web_search + 全部合法 function 工具），用于
+ *   在强制官方搜索时合并「核心本地文件/诊断/终端工具」，避免误触发时文件能力被剥。
  * @returns {null | {tools:Array, toolChoice:Object|undefined, started:boolean, query:string}}
- *   - null 表示本次不应进入「仅官方搜索」模式（未触发 / 已被用户解除）
- *   - 否则返回只含 [{type:'web_search'}] 的工具集：首轮强制 tool_choice 触发，后续轮放开（auto）
+ *   - null 表示本次不应强制「仅官方搜索」模式：交还完整工具集（含本地 file 工具 + web_search）
+ *   - 否则返回「官方 web_search + 除纯联网抓取类以外的全部本地能力工具」的混合集：首轮强制 tool_choice 触发联网，
+ *     后续轮放开（auto），模型既能官方联网、又能用任意本地能力工具（生图/识图/沙盒/技能/记忆/文件/终端…），
+ *     杜绝「只剩 web_search 」或「白名单漏写导致某能力工具被剥」的 Bug（1.1.30 起改为反向过滤）。
  *
- * 关键约束（对应伙伴反馈的格式问题）：
- *   1) 一旦进入该模式，**绝不**把本地 function 工具（fetch / MCP 等）和 web_search 混发，
- *      否则模型会挑本地工具去抓网页 → 大陆网络抓不到 → 空 →「断掉 / 牛头不对马嘴」。
- *   2) 工具集是完整对象 [{type:'web_search'}]，不是字符串占位符。
+ * 关键约束与 1.1.17/1.1.18/1.1.19/1.1.30 修复（对应伙伴反馈「智能体模式下没有工具能用」）：
+ *   1) 1.1.17 修复永久粘连：仅「本次请求本身」时效才强制官方搜索；非时效追问返回 null 交还完整集。
+ *   2) 1.1.18 修复泛指词误触发：从时效正则移除「当前/现在/此刻/现阶段」，否则「当前有什么工具」
+ *      也被误判为时效、强制 web_search-only，模型便脑补出 search/open_page/find_in_page 等不存在的工具。
+ *   3) 1.1.19 双保险：即使本分支被触发，也不再只发 web_search，而是「web_search + 核心本地 file 工具」
+ *      （read_file/write_file/edit_file/list_dir/run_command/get_diagnostics 等），从根本上保证文件操作能力
+ *      永不被剥；仅排除可能用于抓网页的网络类本地工具（mcp__* / fetch 等），仍以官方 web_search 承担联网。
+ *   4) 1.1.30 通用防掉工具（根治「白名单漏写 → 能力被剥」）：1.1.19 的「核心本地 file 工具」仍是一份
+ *      写死白名单，新增工具（如 generate_image 生图）若漏写就会在时效分支被剥掉。本版改为**反向过滤**——
+ *      只剔除与官方 web_search 重复的「纯联网抓取类工具」（mcp__* / web_fetch / fetch-url / browser 等），
+ *      其余一切本地能力工具（生图 / 识图 / 沙盒 / 技能 / 记忆 / 文件 / 终端 / 诊断 …）一律保留。
+ *      今后新增任何本地能力工具都会自动保留，不再出现漏写白名单导致能力丢失的回归。
  */
-function computeOfficialSearch(payload, officialSearchStarted) {
+// 纯联网抓取类工具（与官方 web_search 能力重复，本地搜索工具 URL 收割也复用此正则判定）
+const NETWORK_ONLY_TOOL_RE = /^(mcp__|web_fetch|fetch[_-]?url|browser|scrape|crawl|open_page|find_in_page)|web_search$/i;
+
+function computeOfficialSearch(payload, officialSearchStarted, openAiTools) {
   const lastUser = [...payload].reverse().find((m) => m && m.role === 'user');
   const ut = lastUser
     ? (typeof lastUser.content === 'string' ? lastUser.content : (lastUser.content || []).map((c) => (c && c.text) || '').join(''))
     : '';
-  const timely = /(今天|今日|昨天|明天|本周|本月|今年|最新|最近|现在|当前|实时|新闻|排行|排名|榜单|股价|价格|汇率|天气|赛事|发布会|更新|发布|刚刚|此刻|现阶段|怎么查|怎么看|哪里可以|202[0-9]年|202[0-9]-)/.test(ut);
-  // 用户明确表达「想用本地工具 / 不要官方联网」时，解除官方搜索会话标记，允许本地工具
+  const timely = /(今天|今日|昨天|明天|本周|本月|今年|最新|最近|实时|新闻|排行|排名|榜单|股价|价格|汇率|天气|赛事|发布会|更新|发布|刚刚|怎么查|怎么看|哪里可以|202[0-9]年|202[0-9]-)/.test(ut);
+  // 用户明确表达「想用本地工具 / 不要官方联网」时，交还完整工具集（含本地 file 工具）
   const userWantsLocal = /(用\s*mcp|用\s*本地|本地\s*工具|别\s*联网|不要\s*联网|关闭\s*搜索|关掉\s*搜索|自己\s*搜|用\s*fetch|直接\s*fetch|别\s*用\s*官方)/i.test(ut);
-  let started = officialSearchStarted;
-  if (timely) started = true;
-  if (userWantsLocal) started = false;
-  if (!started) return null;
+
+  // —— 1.1.17 修复：官方搜索「仅当次时效」而非「永久粘连」 ——
+  // 旧逻辑：officialSearchStarted 一旦置真，后续所有轮次都被覆盖为仅 [{type:'web_search'}]，
+  // 导致 read_file/edit_file/write_file 被永久剥夺。
+  // 新逻辑：仅当「本次请求本身」时效（且用户没明确要本地工具）才强制 web_search；
+  // 否则返回 null → 调用方保留完整工具集（toOpenAITools 已含 web_search + 全部本地 file 工具），
+  // 模型既能在需要时主动用官方联网，又不会再丢失本地工具。
+  if (!timely || userWantsLocal) return null;
+
+  // 本次确实时效性 → 强制官方 web_search，并保留「除纯联网抓取类以外的全部本地能力工具」。
+  //
+  // 1.1.30 通用防掉工具方案（根治「白名单漏写 → 工具被剥」）：
+  //   上游 toOpenAITools 在 deepseek+responses 下已用正则剔除 MCP/含非法字符的网络抓取类工具，
+  //   进入本函数的 openAiTools 已只剩有独立能力的本地 function 工具。官方 web_search 只替代
+  //   「联网检索」这一种能力，绝不应当顺手剥掉生图 / 识图 / 沙盒 / 技能 / 记忆 / 文件 / 终端 / 诊断等
+  //   任何其他能力。因此这里改为「只排除与官方搜索重复的纯联网抓取工具，其余全部保留」。
+  //   好处：今后新增任何本地能力工具都会自动保留，不会再出现 generate_image 被漏写白名单而丢失的回归。
+  const NETWORK_ONLY = NETWORK_ONLY_TOOL_RE;
+  // 原生联网工具有 web_search / web_search_2025_08_26 两种形态，前置注入时避免重复
+  const isNativeSearchTool = (t) => t.type === 'web_search' || t.type === 'web_search_2025_08_26';
+  const localTools = (openAiTools || []).filter((t) => {
+    if (isNativeSearchTool(t)) return false; // 原生联网工具，统一在下方前置注入，避免重复
+    const n = (t.function && t.function.name) || t.name || '';
+    if (!n) return false;
+    return !NETWORK_ONLY.test(n); // 仅剔除「纯联网抓取、与官方 web_search 重复」的工具
+  });
   const hasAssistantReply = [...payload].reverse().some((m) => m && m.role === 'assistant');
+  // 与 toOpenAITools 保持一致：DeepSeek Responses 走 web_search_2025_08_26，其余走 web_search
+  const existingSearchTool = (openAiTools || []).find(isNativeSearchTool);
+  const searchToolType = existingSearchTool ? existingSearchTool.type : 'web_search';
   return {
-    tools: [{ type: 'web_search' }],
+    tools: [{ type: searchToolType }].concat(localTools),
     // 首轮（还没有任何助手回复）强制触发官方联网；后续轮放开 tool_choice（=auto），
-    // 允许模型基于已搜到的内容直接作答或再搜一次，避免死循环，同时仍只给官方 web_search。
-    toolChoice: hasAssistantReply ? undefined : { type: 'web_search' },
-    started,
+    // 允许模型基于已搜到的内容直接作答 / 再搜一次 / 或用任意本地能力工具，避免死循环。
+    toolChoice: hasAssistantReply ? undefined : { type: searchToolType },
+    started: true,
     query: ut
   };
 }

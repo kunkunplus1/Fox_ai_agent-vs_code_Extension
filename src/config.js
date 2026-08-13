@@ -72,6 +72,21 @@ async function setOrganizeApiKey(context, id, value) {
   await context.secrets.store(SECRET_PREFIX + 'organize.' + (id || 'llamacpp'), value);
 }
 
+// 知识库「向量模型」（embedding）专用：又一套独立 secret 键，与主对话、整理 AI 三者互不覆盖。
+// 键格式：foxAi.apiKey.embed.<providerId>（如 foxAi.apiKey.embed.dashscope）
+// 说明：向量模型与整理模型是两件事——向量模型只做语义检索，不产出笔记，故密钥也独立存放。
+async function getEmbedApiKey(context, id) {
+  const pid = id || 'ollama';
+  const secret = await context.secrets.get(SECRET_PREFIX + 'embed.' + pid);
+  if (secret) return secret;
+  // 兜底：用户可能只在主对话模型里填过同一家的 key
+  return getApiKey(context, pid);
+}
+
+async function setEmbedApiKey(context, id, value) {
+  await context.secrets.store(SECRET_PREFIX + 'embed.' + (id || 'ollama'), value);
+}
+
 /** 汇总一次调用需要的全部参数 */
 async function resolve(context) {
   const id = currentProviderId();
@@ -289,6 +304,19 @@ async function resolve(context) {
       threshold: c.get('knowledgeBase.autoSummarize.threshold', 0.9),
       keepRecent: c.get('knowledgeBase.autoSummarize.keepRecent', 6),
       dir: c.get('knowledgeBase.autoSummarize.dir', '')
+    },
+    // —— 知识库向量模型（语义检索，1.1.33）——
+    // 与「整理模型」完全解耦：整理模型产出笔记，向量模型只负责把文本转向量做语义召回。
+    // enabled 默认 false，关闭时知识库检索行为与旧版完全一致（BM25 关键词）。
+    embeddingConfig: {
+      enabled: c.get('knowledgeBase.embedding.enabled', false),
+      provider: c.get('knowledgeBase.embedding.provider', 'ollama'),
+      baseUrl: (c.get('knowledgeBase.embedding.baseUrl', '') || '').trim().replace(/\/+$/, ''),
+      model: (c.get('knowledgeBase.embedding.model', '') || '').trim(),
+      dimensions: c.get('knowledgeBase.embedding.dimensions', 0),
+      batchSize: c.get('knowledgeBase.embedding.batchSize', 0),
+      timeout: c.get('knowledgeBase.embedding.timeout', 30000),
+      hybrid: c.get('knowledgeBase.embedding.hybrid', true)
     }
   };
 }
@@ -315,6 +343,8 @@ module.exports = {
   getInlineApiKey,
   getOrganizeApiKey,
   setOrganizeApiKey,
+  getEmbedApiKey,
+  setEmbedApiKey,
   resolve,
   PROVIDERS
 };

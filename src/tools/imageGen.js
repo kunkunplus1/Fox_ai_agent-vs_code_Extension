@@ -150,65 +150,211 @@ function extractImageUrls(result) {
   return out;
 }
 
+/**
+ * 按厂商/模型自动选择生图通道（1.1.31 通用厂商适配）。
+ *  - dashscope-native：阿里百炼 / 通义万相。百炼的 OpenAI 兼容端点（compatible-mode/v1）官方只支持
+ *    qwen 对话/视觉模型，万相文生图系列（wanx* / wan2* / qwen-image*）**只能走百炼原生异步 API**
+ *    （/api/v1/services/aigc/text2image/image-synthesis），否则报
+ *    "Unsupported model `wanx2.1-t2i-turbo` for OpenAI compatibility mode."——即伙伴遇到的「协议不匹配」。
+ *  - openai-images：OpenAI 官方 DALL·E / gpt-image，走 /images/generations。
+ *  - openai-chat：其余（Qwen 兼容端点 chat、本地模型、自托管等）沿用 OpenAI 兼容 chat/completions。
+ */
+function isDashscopeHost(baseUrl) {
+  return /dashscope|maas\.aliyuncs\.com/i.test(baseUrl || '');
+}
+function classifyImageVendor({ provider, baseUrl, model }) {
+  const m = String(model || '').toLowerCase();
+  const p = String(provider || '').toLowerCase();
+  // 百炼（按 provider 或域名判定）一律走原生异步 API——万相与通义万相都如此，chat 兼容端点不支持生图。
+  if (p === 'dashscope' || isDashscopeHost(baseUrl)) return 'dashscope-native';
+  // 非百炼：模型名命中 OpenAI 官方生图（DALL·E / gpt-image）时走 images 接口
+  if ((p === 'openai' || /openai\.com/i.test(baseUrl || '')) && /(dall-e|gpt-image|sora|image-)/.test(m)) {
+    return 'openai-images';
+  }
+  return 'openai-chat';
+}
+
+/** 从任意 baseUrl（兼容端点 /v1、/compatible-mode/v1 等）推导出厂商原生 API 的 origin。 */
+function deriveNativeBase(baseUrl) {
+  let b = String(baseUrl || '').trim().replace(/\/+$/, '');
+  b = b.replace(/\/(compatible-mode|v1|chat|completions|images)\b.*$/i, '');
+  return b || 'https://dashscope.aliyuncs.com';
+}
+
+/** 把用户给的尺寸统一成百炼要求的「宽*高」（星号）格式；无法识别则返回空（交给模型默认）。 */
+function normalizeDashscopeSize(size) {
+  if (!size) return '';
+  const s = String(size).trim().replace(/[xX×]/g, '*');
+  if (/^\d+\*\d+$/.test(s)) return s;
+  if (/^\d+$/.test(s)) return s + '*' + s;
+  return '';
+}
+/** 把用户给的尺寸统一成 OpenAI 要求的「宽x高」（字母 x）格式。 */
+function normalizeOpenAISize(size) {
+  if (!size) return '';
+  const s = String(size).trim().replace(/[×*]/g, 'x');
+  if (/^\d+x\d+$/i.test(s)) return s;
+  if (/^\d+$/.test(s)) return s + 'x' + s;
+  return '';
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/**
+ * 阿里百炼原生异步文生图（万相 / 通义万相 / qwen-image 通用）。
+ * 官方文档：POST {base}/api/v1/services/aigc/text2image/image-synthesis
+ *   Headers: Authorization: Bearer <key>, X-DashScope-Async: enable, Content-Type: application/json
+ *   Body: { model, input:{ prompt, negative_prompt? }, parameters:{ size?:'1024*1024', n:1 } }
+ * 返回 output.task_id → GET {base}/api/v1/tasks/{task_id} 轮询，SUCCEEDED 后 output.results[].url（24h 有效）。
+ */
+async function generateViaDashscope({ baseUrl, apiKey, model, prompt, size, negativePrompt, timeout, insecureHTTPParser }) {
+  const nativeBase = deriveNativeBase(baseUrl);
+  const createUrl = nativeBase + '/api/v1/services/aigc/text2image/image-synthesis';
+  const body = { model, input: { prompt } };
+  if (negativePrompt) body.input.negative_prompt = negativePrompt;
+  body.parameters = {};
+  const sz = normalizeDashscopeSize(size);
+  if (sz) body.parameters.size = sz;
+  body.parameters.n = 1; // 万相/qwen-image 的 n 固定为 1，其它值会报错
+
+  debugImageGen('DASHSCOPE_CREATE', { url: createUrl, model, prompt: prompt.slice(0, 80) });
+  let createRes;
+  try {
+    createRes = await (require('../client').requestJson)(createUrl, {
+      method: 'POST', apiKey, body, timeout, insecureHTTPParser,
+      extra: { 'X-DashScope-Async': 'enable' }
+    });
+  } catch (e) {
+    debugImageGen('DASHSCOPE_CREATE_ERR', { error: String((e && e.message) || e) });
+    throw e;
+  }
+
+  // 顶层错误（如 { code, message }）
+  if (createRes && createRes.code && createRes.message && !(createRes.output && createRes.output.task_id)) {
+    throw new Error('百炼生图创建任务失败：' + createRes.code + ' - ' + createRes.message);
+  }
+  let taskId = createRes && createRes.output && createRes.output.task_id;
+  // 极少数同步返回结果的情况（兜底）
+  if (!taskId && createRes && createRes.output && Array.isArray(createRes.output.results)) {
+    const urls = (createRes.output.results || []).map((r) => r.url).filter(Boolean);
+    if (urls.length) return urls;
+  }
+  if (!taskId) {
+    throw new Error('百炼生图未返回 task_id，原始响应：' + JSON.stringify(createRes).slice(0, 300));
+  }
+
+  // 轮询任务（每 3.5s 一次，直到 SUCCEEDED / FAILED 或超时）
+  const deadline = Date.now() + (timeout || 60000);
+  const taskUrl = nativeBase + '/api/v1/tasks/' + encodeURIComponent(taskId);
+  let last = null;
+  while (Date.now() < deadline) {
+    await sleep(3500);
+    let poll;
+    try {
+      poll = await (require('../client').requestJson)(taskUrl, { method: 'GET', apiKey, timeout: 20000, insecureHTTPParser });
+    } catch (e) {
+      debugImageGen('DASHSCOPE_POLL_ERR', { taskId, error: String((e && e.message) || e) });
+      continue; // 单次轮询失败不放弃，等下一轮；直到超时才抛出
+    }
+    last = poll;
+    const st = poll && poll.output && poll.output.task_status;
+    if (st === 'SUCCEEDED') {
+      const urls = (poll && poll.output.results || []).map((r) => r.url).filter(Boolean);
+      if (urls.length) return urls;
+      throw new Error('百炼生图任务成功但未返回图片 URL');
+    }
+    if (st === 'FAILED') {
+      const msg = (poll.output && (poll.output.message || poll.output.code)) || poll.message || '未知失败';
+      throw new Error('百炼生图任务失败：' + msg);
+    }
+  }
+  debugImageGen('DASHSCOPE_TIMEOUT', { taskId, last });
+  throw new Error('百炼生图任务轮询超时（' + (timeout || 60000) + 'ms），task_id=' + taskId + '，可稍后在百炼控制台查看结果');
+}
+
+/** OpenAI 官方 DALL·E / gpt-image：走 /images/generations。 */
+async function generateViaOpenAIImages({ baseUrl, apiKey, model, prompt, size, timeout, insecureHTTPParser }) {
+  const nativeBase = deriveNativeBase(baseUrl);
+  const url = nativeBase + '/images/generations';
+  const body = { model, prompt, n: 1, response_format: 'url' };
+  const sz = normalizeOpenAISize(size);
+  if (sz) body.size = sz;
+  debugImageGen('OPENAI_IMAGES_CREATE', { url, model, prompt: prompt.slice(0, 80) });
+  const res = await (require('../client').requestJson)(
+    url, { method: 'POST', apiKey, body, timeout, insecureHTTPParser }
+  );
+  const out = [];
+  if (Array.isArray(res && res.data)) {
+    for (const d of res.data) {
+      if (d.url) out.push(d.url);
+      else if (d.b64_json) out.push('data:image/png;base64,' + d.b64_json);
+    }
+  }
+  return out;
+}
+
+/** OpenAI 兼容 chat/completions 生图（Qwen 兼容端点、本地模型等）。沿用旧逻辑。 */
+async function generateViaChat({ baseUrl, apiKey, model, prompt, size, maxTokens, timeout, insecureHTTPParser }) {
+  const text = size ? `${prompt}\n[尺寸要求：${size}]` : prompt;
+  const messages = [{ role: 'user', content: [{ type: 'text', text: text }] }];
+  const result = await (require('../client').chatNonStream)({
+    baseUrl, apiKey, model, messages,
+    temperature: 0.9, maxTokens, timeout, insecureHTTPParser, includeRaw: true
+  });
+  debugImageGen('RESPONSE', { prompt, model, result: { content: result.content, images: result.images, raw: result.raw } });
+  return extractImageUrls(result);
+}
+
 async function run(a, ctx) {
   a = a || {};
   const prompt = String(a.prompt || '').trim();
   if (!prompt) return '⚠️ 缺少 prompt 参数，无法生成图片。请描述你想生成的画面。';
   const size = String(a.size || '').trim();
+  const negativePrompt = String(a.negative_prompt || '').trim();
   const context = (ctx && ctx.context) || null;
 
   const cfg = await (require('../config').resolve(context));
   const ig = cfg.imageGenConfig || {};
   if (!ig.enabled) {
-    return '⚠️ 生图通道未开启。请在 VS Code 设置里找到「狐狸 AI · 多模态生图（实验）」，勾选 Enabled 并填写 provider/baseUrl/apiKey/model（如通义 wan2.1-image）。';
+    return '⚠️ 生图通道未开启。请在 VS Code 设置里找到「狐狸 AI · 多模态生图（实验）」，勾选 Enabled 并填写 provider/baseUrl/apiKey/model（如阿里万相 wanx2.1-t2i-turbo）。';
   }
   const baseUrl = ig.baseUrl || cfg.baseUrl;
   const apiKey = ig.apiKey || cfg.apiKey;
-  const model = ig.model || 'wan2.1-image';
+  const model = ig.model || 'wanx2.1-t2i-turbo';
   if (!baseUrl || !apiKey) {
     return '⚠️ 生图通道缺少 baseUrl 或 apiKey，无法调用。请在「狐狸 AI · 多模态生图（实验）」设置里填好。';
   }
 
-  // 专门为图像生成模型构造请求：单条 user + list content（绕开 wan2.1-image 的格式校验）
-  const text = size ? `${prompt}\n[尺寸要求：${size}]` : prompt;
-  const messages = [{ role: 'user', content: [{ type: 'text', text: text }] }];
-
-  const requestBody = {
-    model,
-    messages,
-    stream: false,
-    temperature: 0.9,
-    max_tokens: ig.maxTokens || 1024
-  };
-
-  let result;
+  // 按厂商自动选择生图通道（1.1.31）：阿里万相/通义万相 → 原生异步 API；OpenAI DALL·E → images 接口；其余 → chat。
+  const vendor = classifyImageVendor({ provider: ig.provider, baseUrl, model });
+  let images;
   try {
-    result = await (require('../client').chatNonStream)({
-      baseUrl,
-      apiKey,
-      model,
-      messages,
-      temperature: 0.9,
-      maxTokens: ig.maxTokens || 1024,
-      timeout: ig.timeout || 60000,
-      insecureHTTPParser: cfg.insecureHttpParser,
-      includeRaw: true
-    });
+    if (vendor === 'dashscope-native') {
+      images = await generateViaDashscope({
+        baseUrl, apiKey, model, prompt, size, negativePrompt,
+        timeout: ig.timeout || 60000, insecureHTTPParser: cfg.insecureHttpParser
+      });
+    } else if (vendor === 'openai-images') {
+      images = await generateViaOpenAIImages({
+        baseUrl, apiKey, model, prompt, size,
+        timeout: ig.timeout || 60000, insecureHTTPParser: cfg.insecureHttpParser
+      });
+    } else {
+      images = await generateViaChat({
+        baseUrl, apiKey, model, prompt, size,
+        maxTokens: ig.maxTokens || 1024, timeout: ig.timeout || 60000, insecureHTTPParser: cfg.insecureHttpParser
+      });
+    }
   } catch (e) {
-    debugImageGen('ERROR', { prompt, model, baseUrl, error: String((e && e.message) || e) });
+    debugImageGen('ERROR', { vendor, prompt, model, baseUrl, error: String((e && e.message) || e) });
     return '⚠️ 生图模型调用失败：' + String((e && e.message) || e);
   }
 
-  debugImageGen('RESPONSE', { prompt, model, result: { content: result.content, images: result.images, raw: result.raw } });
-
-  const images = extractImageUrls(result);
-  if (!images.length) {
+  if (!images || !images.length) {
     return (
-      '⚠️ 生图模型已调用，但未返回可识别的图片。\n' +
-      '可能原因：① 该模型不是生图模型；② 返回格式特殊，狐狸 AI 还没适配；③ 服务端返回了文本说明/拒绝。\n' +
-      '原始文本回复前 400 字：\n' +
-      String((result && result.content) || '').slice(0, 400) + '\n\n' +
-      '已将原始响应写入 ~/.fox-ai/logs/image-gen-debug.log，可贴出来帮我进一步定位。'
+      '⚠️ 生图通道已调用但未返回可识别的图片。\n' +
+      '可能原因：① 模型名不是生图模型（如把对话模型当生图模型填）；② 该厂商生图协议狐狸 AI 尚未适配；' +
+      '③ 服务端返回了拒绝/错误说明。\n' +
+      '已把本次请求与响应写入 ~/.fox-ai/logs/image-gen-debug.log，可贴出来帮我进一步定位。'
     );
   }
 
@@ -222,4 +368,4 @@ async function run(a, ctx) {
   return '✅ 已生成 ' + images.length + ' 张图片（已显示在对话中）：' + prompt.slice(0, 100);
 }
 
-module.exports = { run, extractImageUrls };
+module.exports = { run, extractImageUrls, classifyImageVendor, deriveNativeBase, normalizeDashscopeSize, normalizeOpenAISize, isDashscopeHost };

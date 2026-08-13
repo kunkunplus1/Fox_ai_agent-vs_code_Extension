@@ -6,6 +6,7 @@
 
   const messagesEl = $('messages');
   const stepItems = {};
+  const thinkingSteps = {};
   const inputEl = $('input');
   const btnSend = $('btnSend');
   const btnAttach = $('btnAttach');
@@ -21,6 +22,7 @@
   const errorBar = $('errorBar');
   const errorText = $('errorText');
   const ragHintEl = $('ragHint');
+  const cacheStatusEl = $('cacheStatus');
   const providerChip = $('providerChip');
   const modelChip = $('modelChip');
   const apiModeChip = $('apiModeChip');
@@ -35,6 +37,15 @@
   const contextPanel = $('contextPanel');
   const contextBody = $('contextBody');
   const btnStorage = $('btnStorage');
+  const workchainPanel = $('workchainPanel');
+  const workchainList = $('workchainList');
+  const workchainHead = $('workchainHead');
+  const workchainCount = $('workchainCount');
+  const workchainClear = $('workchainClear');
+  const workchainToggle = $('workchainToggle');
+  const workchainSubbar = $('workchainSubbar');
+  const wcFilters = $('wcFilters');
+  const wcDetail = $('wcDetail');
 
   const live = {};
   const toolCards = {};
@@ -105,6 +116,22 @@
     const u = String(url || '').trim();
     if (!/^https?:\/\//i.test(u)) return text;
     return '<a class="ext-link" data-url="' + u + '" title="' + u + '" role="link" tabindex="0">' + text + '</a>';
+  }
+
+  // 数学公式渲染：优先用本地 KaTeX（vendor/katex，离线），出错或库未加载时降级为 .math-fallback 纯文本
+  function renderMath(tex, display) {
+    try {
+      if (typeof window !== 'undefined' && window.katex) {
+        return window.katex.renderToString(tex, {
+          displayMode: !!display,
+          throwOnError: false,
+          errorColor: '#cc0000',
+          output: 'htmlAndMathml'
+        });
+      }
+    } catch (_) { /* 落到下面的纯文本降级 */ }
+    return (display ? '<div class="math-fallback">$$' : '$') +
+      escapeHtml(tex) + (display ? '$$</div>' : '$');
   }
 
   // GFM 表格：把一行按 | 拆成单元格（兼容首尾省略的 |）
@@ -230,17 +257,11 @@
     }
     flushPara(); closeList();
     let out = html.join('');
-    // 还原数学公式（块级 / 行内），失败时降级为原样文本，避免公式丢失
+    // 还原数学公式（块级 / 行内）：有 KaTeX 时渲染为公式，否则降级为 .math-fallback 纯文本
     out = out.replace(/\u0002M(\d+)\u0002/g, (m, i) => {
       const item = math[Number(i)];
       if (!item) return '';
-      try {
-        if (window.katex) {
-          return window.katex.renderToString(item.tex, { displayMode: item.display, throwOnError: false });
-        }
-      } catch (e) { /* 降级 */ }
-      return (item.display ? '<div class="math-fallback">$$' : '$') +
-        escapeHtml(item.tex) + (item.display ? '$$</div>' : '$');
+      return renderMath(item.tex, item.display);
     });
     return out;
   }
@@ -265,6 +286,8 @@
   const citeUrlIndex = [];
   const citeUrlByNum = {};   // [n] / [^n] 数字编号 -> { title, url }
   const CITE_INDEX_MAX = 400;
+  // 来源索引变化后重渲染 assistant 气泡的防抖 timer，避免工具流多次 delta 反复全量重排
+  let refreshAssistantBubblesTimer = null;
 
   function normKey(s) {
     return String(s || '')
@@ -275,7 +298,8 @@
   // 从工具输出中收割 `[1] 标题\nURL: https://...` / `[^1] 标题\nURL: ...` 形式的结果
   function harvestSourceUrls(text) {
     const s = String(text || '');
-    if (!s || s.indexOf('://') === -1) return;
+    if (!s || s.indexOf('://') === -1) return false;
+    let changed = false;
     const re = /^[ \t]*(?:\[\^?(\d+)\^?\][ \t]*)?(.+?)[ \t]*\r?\n[ \t]*(?:URL|url|链接|网址)[:：][ \t]*(https?:\/\/\S+)/gm;
     let m;
     while ((m = re.exec(s))) {
@@ -288,10 +312,18 @@
         if (!citeUrlIndex.some((it) => it.key === key && it.url === url)) {
           citeUrlIndex.push({ key, url });
           if (citeUrlIndex.length > CITE_INDEX_MAX) citeUrlIndex.shift();
+          changed = true;
         }
       }
-      if (num > 0) citeUrlByNum[num] = { title, url };
+      if (num > 0) {
+        const prev = citeUrlByNum[num];
+        if (!prev || prev.url !== url || prev.title !== title) {
+          citeUrlByNum[num] = { title, url };
+          changed = true;
+        }
+      }
     }
+    return changed;
   }
 
   // 直接从来源标签里抠 URL：支持 [标题](url) / 裸链接 / 纯域名
@@ -311,14 +343,94 @@
   function lookupCiteUrl(label) {
     const k = normKey(label);
     if (k.length < 2) return '';
+    // 1) 完全匹配
     for (const it of citeUrlIndex) if (it.key === k) return it.url;
+    // 2) 去掉模型常加的前缀后再匹配（如「web_search 结果——」「搜索结果：」等）
+    const k2 = k.replace(/^(web[_\-]?search|搜索|来源|参考|网页|结果|results?|sources?)[:：\-—–·\s]+/, '').replace(/^[\-—–·\s]+/, '');
+    if (k2.length >= 2 && k2 !== k) {
+      for (const it of citeUrlIndex) if (it.key === k2) return it.url;
+    }
+    // 3) 按常见分隔符拆成多段分别匹配（模型常把多个结果合并成一条用「、」隔开）。
+    //    每段先去前缀，再精确匹配；精确失败则按子串模糊匹配（段较长时）。
+    //    逐段顺序扫描、命中首段即返回，保证合并标签优先命中靠前的来源。
+    const segs = label.split(/[、，,；;|\\/]+/).map((s) => normKey(s)).filter((s) => s.length >= 2);
+    const stripCitePrefix = (x) => x.replace(/^(web[_\-]?search|搜索|来源|参考|网页|结果|results?|sources?)[:：\-—–·\s]+/, '').replace(/^[\-—–·\s]+/, '');
+    for (const seg of segs) {
+      const s2 = stripCitePrefix(seg);
+      const cands = [s2, seg].filter((c) => c.length >= 2);
+      for (const cand of cands) {
+        for (const it of citeUrlIndex) if (it.key === cand) return it.url;
+        if (cand.length >= 4) {
+          for (const it of citeUrlIndex) if (it.key.indexOf(cand) !== -1 || cand.indexOf(it.key) !== -1) return it.url;
+        }
+      }
+    }
+    // 4) 子串模糊匹配（要求稍长一点，避免误伤）
     if (k.length >= 4) {
       for (const it of citeUrlIndex) if (it.key.indexOf(k) !== -1 || k.indexOf(it.key) !== -1) return it.url;
     }
     return '';
   }
 
+  // 搜索结果索引更新后，重新渲染所有已结束的 assistant 气泡，
+  // 让原本因 URL 未到而只能静态显示的 [n] 角标变成可点击链接。
+  function refreshAssistantBubbles() {
+    if (!messagesEl) return;
+    if (refreshAssistantBubblesTimer) clearTimeout(refreshAssistantBubblesTimer);
+    refreshAssistantBubblesTimer = setTimeout(() => {
+      refreshAssistantBubblesTimer = null;
+      for (const wrap of messagesEl.querySelectorAll('.msg.assistant')) {
+        const bubble = wrap.querySelector('.bubble');
+        if (!bubble) continue;
+        const raw = bubble.dataset.raw;
+        if (!raw) continue;
+        const liveId = wrap.dataset.id;
+        if (liveId && live[liveId]) {
+          live[liveId].dirty = true;
+          continue;
+        }
+        bubble.innerHTML = renderAssistant(raw, liveId);
+      }
+      scheduleRender();
+    }, 120);
+  }
+
+  // 解析模型自带的「[n] 标题」参考列表（常出现在文末，可能无 URL）。
+  // 返回 { stripped, entries }；entries: [{ num, label, url, lineIndex }]。
+  // 用于把模型自己列的参考文献注册成可点角标，并把这些行从正文剥离（由末尾 .cites 统一展示）。
+  // 仅当是「连续 [n] 行（>=2）」或「来源/参考 标题 + [n] 行」时才识别，避免误判正文有序列表。
+  function parseReferenceList(src) {
+    const lines = String(src || '').split('\n');
+    const entries = [];
+    let headerIdx = -1;
+    let i = lines.length - 1;
+    while (i >= 0) {
+      const lm = lines[i].match(/^[ \t]*\[(\d+)\][ \t]*(.+?)[ \t]*$/);
+      if (lm) {
+        const label = String(lm[2] || '').trim();
+        if (label) {
+          const kb = findKbSource(label);
+          entries.push({ num: Number(lm[1]), label, url: pickUrlFromLabel(label), lineIndex: i, type: kb ? 'kb' : '', localPath: kb ? kb.file : '' });
+        }
+        i--;
+        continue;
+      }
+      if (lines[i].trim() === '' && entries.length) { i--; continue; } // 允许空行分隔
+      if (entries.length && /^\s*#{0,6}\s*(来源|参考来源|参考文献|引用来源|references?|sources?)\s*:?\s*$/i.test(lines[i])) {
+        headerIdx = i;
+      }
+      break;
+    }
+    if (entries.length < 2 && headerIdx === -1) return null; // 太短且无标题，避免误判正文有序列表
+    const removeSet = new Set(entries.map((e) => e.lineIndex));
+    if (headerIdx >= 0) removeSet.add(headerIdx);
+    const strippedLines = lines.filter((_, k) => !removeSet.has(k));
+    while (strippedLines.length && strippedLines[strippedLines.length - 1].trim() === '') strippedLines.pop();
+    return { stripped: strippedLines.join('\n'), entries: entries.reverse() };
+  }
+
   // 解析引用标记：
+  // 0) 模型自带的「[n] 标题」参考列表（注册成角标，并从正文剥离）
   // 1) 模型常用的 [^n] / [n] 数字引用（优先匹配 web_search 结果编号）
   // 2) 后端已有的「（来源：xxx）」/「【来源：xxx】」等中文标签
   // 合并为 [n] 角标 + 气泡末尾来源列表，不依赖后端改协议。
@@ -334,13 +446,39 @@
       const found = citeUrlByNum[num];
       const label = found ? found.title : ('来源 ' + num);
       const url = found ? found.url : '';
-      cites.push({ label, url });
+      const kb = found && found.localPath ? found : findKbSource(label);
+      cites.push({ label, url, type: kb ? 'kb' : '', localPath: kb ? kb.file : '' });
       numMap[num] = idx;
       return idx;
     }
 
+    let text = src;
+
+    // 阶段 0：模型自带的「[n] 标题」参考列表（常在文末，可能无 URL）
+    // 注册成引用角标，使内联 [n] 可点；并从正文剥离这些行（由末尾 .cites 统一展示）
+    const ref = parseReferenceList(text);
+    if (ref) {
+      for (const e of ref.entries) {
+        let url = e.url || lookupCiteUrl(e.label);
+        // 若 harvest 已按编号提供真实 URL（即使标题反查失败），优先回填，避免模型自列的合并摘要把链接弄丢
+        if (!url && citeUrlByNum[e.num] && citeUrlByNum[e.num].url) {
+          url = citeUrlByNum[e.num].url;
+        }
+        // 仅在 harvest 未提供更优先 URL 时才用模型自列（harvest 优先）
+        if (!citeUrlByNum[e.num] || !citeUrlByNum[e.num].url) {
+          citeUrlByNum[e.num] = { title: e.label, url, type: e.type || '', localPath: e.localPath || '' };
+        }
+        if (numMap[e.num] === undefined) {
+          const c = citeUrlByNum[e.num];
+          cites.push({ label: c.title, url: c.url, type: c.type || '', localPath: c.localPath || '' });
+          numMap[e.num] = cites.length - 1;
+        }
+      }
+      text = ref.stripped;
+    }
+
     // 阶段 1：[^n] 无条件识别为引用角标；[n] 只在存在数字索引时识别，避免一刀切误伤普通文本
-    let text = src.replace(/\[\^(\d+)\^?\]/g, (m, n) => {
+    text = text.replace(/\[\^(\d+)\^?\]/g, (m, n) => {
       const idx = resolveNum(Number(n));
       return '\u0003CIT' + idx + '\u0003';
     });
@@ -366,6 +504,15 @@
       if (!key) return m;
       let idx = map[key];
       if (idx === undefined) {
+        // 本地知识库来源：统一反查（剥包装 + basename 兜底）
+        const kb = findKbSource(key);
+        if (kb && kb.file) {
+          const show = key.replace(/^[\s,，·、:：\-—|]+|[\s,，·、:：\-—|]+$/g, '') || key;
+          idx = cites.length;
+          cites.push({ label: show, url: '', type: 'kb', localPath: kb.file });
+          map[key] = idx;
+          return '\u0003CIT' + idx + '\u0003';
+        }
         idx = cites.length;
         const url = pickUrlFromLabel(key);
         // 标签内已带链接时，展示文本去掉裸 url，避免又长又乱
@@ -379,27 +526,77 @@
     return { text, cites };
   }
 
+  // 引用源数据层：按消息 fid 存档 { label, url, type, localPath }，供点击角标弹浮窗取用，避免流式过程中来源数据丢失/串味
+  const sourceStore = {};
+  // 本地知识库命中来源：相对路径 label -> { label, file(绝对路径) }，供阶段 2 中文来源标签反查并标记为可定位本地文件的角标
+  const kbSourceMap = {};
+  function recordSources(fid, cites) {
+    if (!fid) return;
+    sourceStore[fid] = cites.map((c) => ({ label: c.label || '', url: c.url || '', type: c.type || '', localPath: c.localPath || '' }));
+  }
+  function getSource(fid, idx) {
+    const arr = sourceStore[fid];
+    if (!arr) return null;
+    const s = arr[Number(idx)];
+    if (!s) return null;
+    return { label: s.label || '', url: s.url || '', type: s.type || '', localPath: s.localPath || '' };
+  }
+  // 测试/外部重置本地知识库来源映射（仅 Node 导出）
+  function setKbSources(sources) {
+    for (const k of Object.keys(kbSourceMap)) delete kbSourceMap[k];
+    if (Array.isArray(sources)) {
+      for (const s of sources) {
+        if (s && s.label && s.file) kbSourceMap[String(s.label)] = { label: s.label, file: s.file };
+      }
+    }
+  }
+  // 本地知识库标签归一化：剥「（知识库-2）」/「· 相关度」/「本地知识库《...》」/「知识库《...》」/《...》包装，并去掉包装后的 trailing 描述
+  function normalizeForKbLookup(label) {
+    let s = String(label || '').replace(/[（(]知识库-2[）)]?\s*$/i, '').replace(/\s*·\s*相关度\s*[\d.]+\s*$/, '').trim();
+    s = s.replace(/^(?:本地\s*)?知识库[《〈「『]/, '').replace(/[》〉」』]$/, '').trim();
+    // 也处理没有「知识库」前缀的《...》/〈...〉/「...」/『...』
+    s = s.replace(/^[《〈「『]/, '').replace(/[》〉」』]$/, '').trim();
+    // 模型常在《...》后加描述，如「知识库《大纲.md》总故事梗概」→只取文件名部分
+    const wrapped = s.match(/^([^》〉」』]+)[》〉」』]\s*(.*)$/);
+    if (wrapped) s = wrapped[1].trim();
+    return s;
+  }
+  // 用 label 反查本地知识库：精确匹配 → basename 兜底匹配
+  function findKbSource(label) {
+    const bare = normalizeForKbLookup(label);
+    if (!bare) return null;
+    let kb = kbSourceMap[bare];
+    if (kb && kb.file) return kb;
+    const base = bare.split(/[\\/]/).pop();
+    if (!base) return null;
+    for (const k of Object.keys(kbSourceMap)) {
+      if (k.split(/[\\/]/).pop() === base) return kbSourceMap[k];
+    }
+    return null;
+  }
+
   // 渲染助手消息：先抽引用角标，再走 markdown（含公式/代码），最后把角标还原为 [n] 并追加来源列表
-  function renderAssistant(raw) {
+  function renderAssistant(raw, fid) {
     const { text, cites } = extractCitations(String(raw == null ? '' : raw));
-    // 补全链接：标签自带 > 搜索结果索引反查
-    const resolved = cites.map((c) => ({ label: c.label, url: c.url || lookupCiteUrl(c.label) }));
+    // 补全链接：标签自带 > 搜索结果索引反查；并把来源存档到该消息，供点击角标取用（URL 晚到也会在重绘时回填）
+    const resolved = cites.map((c) => ({ label: c.label, url: c.url || lookupCiteUrl(c.label), type: c.type, localPath: c.localPath }));
+    recordSources(fid, resolved);
     let html = renderMarkdown(text);
     html = html.replace(/\u0003CIT(\d+)\u0003/g, (m, i) => {
       const c = resolved[Number(i)] || { label: '', url: '' };
       const n = Number(i) + 1;
+      const sid = fid ? (fid + ':' + i) : ('_:' + i);
       const tip = escapeHtml(c.url ? c.label + ' · ' + c.url : c.label);
-      if (!c.url) return '<sup class="cite" title="' + tip + '">[' + n + ']</sup>';
-      return '<sup class="cite link" data-url="' + escapeHtml(c.url) + '" title="' + tip +
+      // 角标始终可交互（点击弹浮窗，有 URL 则提供跳转）。不再因缺 URL 静默渲染成不可点纯文本。
+      return '<sup class="cite link" data-source-id="' + escapeHtml(String(sid)) + '" title="' + tip +
         '" role="link" tabindex="0">[' + n + ']</sup>';
     });
     if (resolved.length) {
       const items = resolved.map((c, i) => {
         const idx = '<span class="cite-idx">[' + (i + 1) + ']</span>';
-        const body = c.url
-          ? '<a class="cite-link" data-url="' + escapeHtml(c.url) + '" title="' + escapeHtml(c.url) +
-            '" role="link" tabindex="0">' + escapeHtml(c.label || c.url) + '</a>'
-          : escapeHtml(c.label);
+        const sid = fid ? (fid + ':' + i) : ('_:' + i);
+        const body = '<a class="cite-link" data-source-id="' + escapeHtml(String(sid)) + '" title="' +
+          escapeHtml(c.url || c.label) + '" role="link" tabindex="0">' + escapeHtml(c.label || c.url) + '</a>';
         return '<span class="cite-item">' + idx + body + '</span>';
       }).join('');
       html += '<div class="cites"><span class="cites-label">' + t('来源') + '</span>' + items + '</div>';
@@ -407,15 +604,84 @@
     return html;
   }
 
-  // 代码语法高亮：对已渲染的 .code-block 调用 highlight.js
-  function highlightCode(root) {
-    if (!window.hljs || !root) return;
-    const codes = root.querySelectorAll('.code-block pre code');
-    for (const el of codes) {
-      if (el.dataset.hl) continue;
-      try { window.hljs.highlightElement(el); el.dataset.hl = '1'; } catch (e) { /* 忽略单个块失败 */ }
-    }
+  // 点击引用角标/来源项时弹出的浮窗：展示标题与链接，提供「打开来源」跳转
+  let citePopupEl = null;
+  function ensureCitePopup() {
+    if (citePopupEl) return citePopupEl;
+    citePopupEl = document.createElement('div');
+    citePopupEl.id = 'citePopup';
+    citePopupEl.className = 'cite-popup hidden';
+    citePopupEl.innerHTML =
+      '<div class="cite-popup-title"></div>' +
+      '<button type="button" class="cite-popup-link">打开来源 ↗</button>' +
+      '<div class="cite-popup-url"></div>';
+    document.body.appendChild(citePopupEl);
+    const linkEl = citePopupEl.querySelector('.cite-popup-link');
+    linkEl.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const type = linkEl.getAttribute('data-type') || '';
+      const u = linkEl.getAttribute('data-url') || '';
+      if (type === 'kb') {
+        const p = linkEl.getAttribute('data-path') || '';
+        if (p) vscode.postMessage({ type: 'openLocal', path: p });
+      } else if (/^https?:\/\//i.test(u)) {
+        vscode.postMessage({ type: 'openExternal', url: u });
+      }
+      hideCitePopup();
+    });
+    return citePopupEl;
   }
+  function showCitePopup(anchor, src) {
+    const pop = ensureCitePopup();
+    const titleEl = pop.querySelector('.cite-popup-title');
+    const linkEl = pop.querySelector('.cite-popup-link');
+    const urlEl = pop.querySelector('.cite-popup-url');
+    titleEl.textContent = src.label || (src.type === 'kb' ? t('本地知识库文件') : t('来源'));
+    if (src.type === 'kb' && src.localPath) {
+      linkEl.style.display = '';
+      linkEl.textContent = '在资源管理器定位 ↗';
+      linkEl.setAttribute('data-type', 'kb');
+      linkEl.setAttribute('data-path', src.localPath);
+      linkEl.removeAttribute('data-url');
+      urlEl.textContent = src.localPath;
+    } else if (src.url) {
+      linkEl.style.display = '';
+      linkEl.textContent = '打开来源 ↗';
+      linkEl.setAttribute('data-url', src.url);
+      linkEl.removeAttribute('data-type');
+      linkEl.removeAttribute('data-path');
+      urlEl.textContent = src.url;
+    } else {
+      linkEl.style.display = 'none';
+      linkEl.removeAttribute('data-url');
+      linkEl.removeAttribute('data-type');
+      linkEl.removeAttribute('data-path');
+      urlEl.textContent = '（无可用链接）';
+    }
+    pop.classList.remove('hidden');
+    const r = anchor.getBoundingClientRect();
+    const pr = pop.getBoundingClientRect();
+    let left = r.left + window.scrollX;
+    const top = r.bottom + window.scrollY + 6;
+    const maxLeft = window.scrollX + document.documentElement.clientWidth - pr.width - 8;
+    if (left > maxLeft) left = maxLeft;
+    if (left < window.scrollX + 8) left = window.scrollX + 8;
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+    if (pop._closeTimer) clearTimeout(pop._closeTimer);
+    const closeFn = (ev) => {
+      if (pop.contains(ev.target)) return;
+      hideCitePopup();
+      document.removeEventListener('click', closeFn, true);
+    };
+    setTimeout(() => document.addEventListener('click', closeFn, true), 0);
+  }
+  function hideCitePopup() {
+    if (citePopupEl) citePopupEl.classList.add('hidden');
+  }
+
+  // 代码语法高亮已移除（富文本库精简）：代码块以带语言的纯文本展示。
 
   /* ================= DOM 辅助 ================= */
 
@@ -440,10 +706,16 @@
     const roleEl = document.createElement('div');
     roleEl.className = 'role';
     roleEl.textContent = role === 'user' ? t('你') : t('狐狸 AI');
+    wrap.appendChild(roleEl);
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    wrap.appendChild(roleEl);
     wrap.appendChild(bubble);
+    // 助手消息内部预留步骤容器，放在正文下方，让执行步骤卡片紧跟产生它的那段正文，避免压在开头或割裂流式输出
+    if (role === 'assistant') {
+      const steps = document.createElement('div');
+      steps.className = 'steps';
+      wrap.appendChild(steps);
+    }
     messagesEl.appendChild(wrap);
     return { wrap, bubble };
   }
@@ -469,6 +741,39 @@
     if (n >= 10000) return (n / 1000).toFixed(1) + 'K';
     if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
     return String(n);
+  }
+
+  function updateCacheStatus(data) {
+    if (!cacheStatusEl) return;
+    const cached = typeof data.cachedTokens === 'number' ? data.cachedTokens : 0;
+    const prompt = typeof data.promptTokens === 'number' ? data.promptTokens : 0;
+    const completion = typeof data.completionTokens === 'number' ? data.completionTokens : 0;
+    const hitRate = typeof data.hitRate === 'number' ? data.hitRate : 0;
+    const hitPct = Math.round(hitRate * 100);
+    // 估算节省：DeepSeek/OpenAI 命中部分约按 50% 计费，保守按命中 token 的 50% 算
+    const saved = Math.round(cached * 0.5);
+    let cls = 'cache-status';
+    let icon = '🦊';
+    if (prompt === 0 && completion === 0) {
+      cacheStatusEl.classList.add('hidden');
+      return;
+    }
+    if (hitPct >= 80) { cls += ' hit-high'; icon = '✨'; }
+    else if (hitPct >= 40) { cls += ' hit-mid'; icon = '🔥'; }
+    else if (hitPct > 0) { cls += ' hit-low'; icon = '💨'; }
+    else { cls += ' hit-none'; icon = '🧊'; }
+    if (data.driftByHash) cls += ' drift';
+    if (data.hitDrop) cls += ' drop';
+    const parts = [
+      icon + ' 前缀缓存命中 ' + hitPct + '%',
+      '命中 ' + formatTokens(cached),
+      '输出 ' + formatTokens(completion)
+    ];
+    if (saved > 0) parts.push('约省 ' + formatTokens(saved));
+    if (data.driftByHash) parts.push('⚠️ 前缀漂移');
+    if (data.hitDrop) parts.push('⚠️ 命中骤降');
+    cacheStatusEl.className = cls;
+    cacheStatusEl.textContent = parts.join(' · ');
   }
 
   function renderContextUsage(data) {
@@ -598,25 +903,46 @@
     }).join('');
   }
 
-  function renderReasoning(text) {
-    const lines = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
-    const rows = [];
-    for (const line of lines) {
-      const low = line.toLowerCase();
-      let icon = '•';
-      let cls = '';
-      if (/编辑|edit|修改|改写|\+\d+\s+-\d+/.test(line)) { icon = '✏️'; cls = 'edit'; }
-      else if (/读取|read|打开|查看|加载/.test(line)) { icon = '📖'; cls = 'read'; }
-      else if (/运行|执行|run|test|check|同步|sync|syntax|校验|验证/.test(line)) { icon = '⚡'; cls = 'exec'; }
-      else if (/思考|想|reasoning|consider|分析/.test(line)) { icon = '💭'; cls = 'think'; }
-      rows.push(
-        '<div class="reasoning-item ' + cls + '">' +
-        '<span class="reasoning-icon">' + icon + '</span>' +
-        '<span class="reasoning-text">' + escapeHtml(line) + '</span>' +
-        '</div>'
-      );
+  // 对「无标点、无 markdown 结构」的推理文本做兜底分段，避免一整坨“看了个寂寞”。
+  // 断点只由字符索引 / 句索引决定（在固定窗口内就近找停顿），随文本增长单调不变，流式重绘不抖动。
+  function softSegment(t) {
+    if (!t || t.length < 90) return t;
+    if (/^#{1,6}\s|^[-*+]\s|^\d+[.)]\s/m.test(t)) return t; // 已有 markdown 结构，不动
+    const SEG = 90, LOOK = 14;
+    // 有标点：按句末标点切句，每 3 句拼成一段（段边界按句索引，单调稳定，不抖动）
+    if (/[。！？!?；;…\n]/.test(t)) {
+      const sents = (t.match(/[^。！？!?；;…\n]+[。！？!?；;…\n]?/g) || [t]).filter(Boolean);
+      if (sents.length <= 3) return t;
+      const pieces = [];
+      for (let i = 0; i < sents.length; i += 3) pieces.push(sents.slice(i, i + 3).join(''));
+      return pieces.length > 1 ? pieces.join('\n\n') : t;
     }
-    return rows.join('');
+    // 无标点：按固定索引窗口就近找停顿符切（断点由字符索引决定，单调稳定）
+    const pieces = [];
+    let idx = 0;
+    while (idx < t.length) {
+      let end = Math.min(idx + SEG, t.length);
+      if (end < t.length) {
+        let at = end + LOOK;
+        for (let j = end; j <= end + LOOK && j < t.length; j++) {
+          const c = t[j];
+          if (c === '，' || c === ',' || c === '、' || c === '；' || c === '：' || c === ':' || c === ' ' || c === '\n') { at = j; break; }
+          if ('的了着呢吧啊吗呀与和及或在对为把被从向给到这那你我他它她'.indexOf(c) !== -1) { at = j; break; }
+        }
+        end = at;
+      }
+      pieces.push(t.slice(idx, end));
+      idx = end;
+    }
+    return pieces.length > 1 ? pieces.join('\n\n') : t;
+  }
+
+  function renderReasoning(text) {
+    const t = String(text || '').trim();
+    if (!t) return '';
+    // 用 markdown 渲染，让标题/列表/加粗/代码等结构清晰可见；
+    // 无标点/无结构的意识流先做兜底分段，至少从「一坨」变成「可读的多段」。
+    return '<div class="reasoning-md">' + renderMarkdown(softSegment(t)) + '</div>';
   }
 
   function scheduleRender() {
@@ -634,7 +960,8 @@
         }
         m.dirty = false;
         if (!m.bubble.isConnected) { delete live[id]; continue; }
-        m.bubble.innerHTML = m.raw ? renderAssistant(m.raw) : '<span class="typing"></span>';
+        m.bubble.innerHTML = m.raw ? renderAssistant(m.raw, id) : '<span class="typing"></span>';
+        if (m.raw) m.bubble.dataset.raw = m.raw;
         if (m.images && m.images.length) {
           for (const img of m.images) {
             const wrapper = document.createElement('div');
@@ -662,7 +989,7 @@
             m.reasonEl.className = 'reasoning open';
             m.reasonEl.innerHTML =
               '<div class="reasoning-head">' +
-                '<span class="reasoning-title">' + t('💭 深度思考') + '</span>' +
+                '<span class="reasoning-title">' + t('已思考') + '</span>' +
                 '<span class="reasoning-caret">▾</span>' +
               '</div>' +
               '<div class="reasoning-body"></div>';
@@ -674,6 +1001,7 @@
             // 避免被插在角色标签与气泡之间造成视觉错位；父节点缺失（已结束的消息）时跳过。
             if (wrap) wrap.insertBefore(m.reasonEl, wrap.firstChild || m.bubble);
           }
+          if (!m.reasoningStart) m.reasoningStart = Date.now();
           const body = m.reasonEl.querySelector('.reasoning-body');
           // 内容长度未变则不重建 innerHTML，减少长会话下的重排抖动
           const rev = String(m.reasoning.length);
@@ -690,9 +1018,12 @@
   }
 
   function finalizeLive(id, m) {
-    if (m.reasonEl) m.reasonEl.classList.remove('open');
-    // 流式结束后做最后一次高亮（避免逐帧重渲染造成的闪烁）
-    if (m.bubble && m.bubble.isConnected) highlightCode(m.bubble);
+    // 思考结束后在标题补上用时，并保持展开（参考 DeepSeek 的「已思考（用时 X 秒）」面板）
+    if (m.reasonEl) {
+      const titleEl = m.reasonEl.querySelector('.reasoning-title');
+      const secs = m.reasoningStart ? Math.max(1, Math.round((Date.now() - m.reasoningStart) / 1000)) : 0;
+      if (titleEl) titleEl.textContent = secs ? (t('已思考（用时 ') + secs + t(' 秒）')) : t('已思考');
+    }
     if (!m.raw && !m.reasoning && m.bubble && m.bubble.parentElement) m.bubble.parentElement.remove();
     delete live[id];
   }
@@ -719,13 +1050,48 @@
 
   const KIND_ICON = { read: '📖', edit: '✏️', exec: '⚡' };
   const STATUS_ICON = { running: '⏳', ok: '✅', error: '❌', rejected: '🚫' };
-  const STEP_ICON = { llm: '🧠', read: '🔍', write: '✏️', edit: '✏️', delete: '🗑️', exec: '🖥️', command: '🖥️', info: '•', review: '🔎', approval: '⏳', done: '✅', error: '❌' };
+  const STEP_ICON = { llm: '🧠', read: '🔍', write: '✏️', edit: '✏️', delete: '🗑️', exec: '🖥️', command: '🖥️', info: '•', review: '🔎', approval: '⏳', done: '✅', error: '❌', system_status: '📊' };
+  // 思考链按类型归类用的小图标（主聊天区状态轨迹 & 步骤分组）
+  const GROUP_ICON = { tool: '🔧', reason: '🧠', error: '❌', warn: '⚠️', llm: '✅' };
+
+  // 把增量消息合并进步骤节点的结构化元数据（tool_name/parameters/result/timestamp/duration/status/group）
+  function applyStepMeta(el, msg) {
+    const m = el._meta || (el._meta = {});
+    if (msg.tool_name !== undefined) m.tool_name = msg.tool_name;
+    if (msg.parameters !== undefined) m.parameters = msg.parameters;
+    if (msg.result !== undefined) m.result = msg.result;
+    if (msg.summary !== undefined) m.summary = msg.summary;
+    if (msg.title !== undefined) m.title = msg.title;
+    if (msg.status !== undefined) m.status = msg.status;
+    if (msg.group !== undefined) m.group = msg.group;
+    if (msg.stepType !== undefined) m.stepType = msg.stepType;
+    if (msg.timestamp !== undefined) m.timestamp = msg.timestamp;
+    if (msg.duration !== undefined) m.duration = msg.duration;
+    if (msg.detail !== undefined) m.detail = msg.detail;
+    if (msg.kind !== undefined) m.kind = msg.kind;
+    return m;
+  }
+
+  // 结构化参数渲染成可读文本（对象折叠成紧凑 JSON，其余直接转字符串）
+  function formatParams(p) {
+    if (p == null) return '';
+    if (typeof p === 'string') return p;
+    try { return JSON.stringify(p, null, 2); } catch (_) { return String(p); }
+  }
+
+  function fmtDuration(ms) {
+    if (!ms || ms < 0) return '';
+    if (ms < 1000) return ms + 'ms';
+    return (ms / 1000).toFixed(1) + 's';
+  }
 
   function addToolCard(msg) {
     hideWelcome();
     const card = document.createElement('div');
-    card.className = 'tool-card kind-' + (msg.kind || 'read') + ' status-running';
+    card.className = 'tool-card kind-' + (msg.kind || 'read') + ' status-running grp-tool';
     card.dataset.id = msg.id;
+    card.dataset.grp = 'tool';
+    const meta = applyStepMeta(card, msg);
 
     const stat = msg.preview && msg.preview.stat
       ? `+${msg.preview.stat.added} -${msg.preview.stat.removed}`
@@ -735,19 +1101,40 @@
     card.dataset.hasPreview = isEdit ? '1' : '';
 
     card.innerHTML =
-      '<div class="tool-head">' +
-        '<span class="icon">' + (KIND_ICON[msg.kind] || '🔧') + '</span>' +
-        '<span class="title"></span>' +
-        '<span class="stat">' + escapeHtml(stat) + '</span>' +
-        '<span class="state">⏳</span>' +
-        '<span class="caret">▾</span>' +
-      '</div>' +
-      '<div class="tool-body">' +
-        '<div class="args"></div>' +
-        '<pre class="out"></pre>' +
+      '<div class="step-rail"></div>' +
+      '<div class="step-node"><span class="step-dot">' + (KIND_ICON[msg.kind] || '🔧') + '</span></div>' +
+      '<div class="step-main">' +
+        '<div class="tool-head">' +
+          '<span class="icon">' + (KIND_ICON[msg.kind] || '🔧') + '</span>' +
+          '<span class="title"></span>' +
+          '<span class="stat">' + escapeHtml(stat) + '</span>' +
+          '<span class="step-dur"></span>' +
+          '<span class="state">⏳</span>' +
+          '<span class="caret">▾</span>' +
+        '</div>' +
+        '<div class="step-detail">' +
+          '<div class="step-params"></div>' +
+          '<div class="tool-body">' +
+            '<div class="args"></div>' +
+            '<pre class="out"></pre>' +
+          '</div>' +
+        '</div>' +
       '</div>';
 
     card.querySelector('.title').textContent = msg.title || msg.name;
+    // 点击表头折叠/展开详情（结构化参数 + 工具输出）
+    card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('open'));
+    const paramsEl = card.querySelector('.step-params');
+    const ptext = formatParams(meta.parameters);
+    if (ptext) {
+      const pre = document.createElement('pre');
+      pre.className = 'params-pre';
+      pre.textContent = ptext;
+      paramsEl.appendChild(pre);
+    } else {
+      paramsEl.remove();
+    }
+
     const argsEl = card.querySelector('.args');
     if (msg.preview && msg.preview.text) {
       argsEl.innerHTML = renderDiff(msg.preview.text);
@@ -771,8 +1158,11 @@
       card.querySelector('.tool-body').appendChild(actions);
     }
 
-    messagesEl.appendChild(card);
+    // 工具卡片物理隔离到独立工作链面板，不再和正文流抢同一个轨道，杜绝插中间问题
+    if (workchainList) workchainList.appendChild(card);
+    else messagesEl.appendChild(card);
     toolCards[msg.id] = card;
+    updateWorkchainCount();
     scrollDown();
     return card;
   }
@@ -782,15 +1172,24 @@
     if (!card) return;
     card.classList.remove('status-running');
     card.classList.add('status-' + msg.status);
+    if (msg.status === 'ok') {
+      card.classList.remove('just-done');
+      void card.offsetWidth; // 重置动画，保证每次成功都脉冲一次
+      card.classList.add('just-done');
+      setTimeout(() => card.classList.remove('just-done'), 760);
+    }
     const state = card.querySelector('.state');
     if (state) state.textContent = STATUS_ICON[msg.status] || '';
+    const durEl = card.querySelector('.step-dur');
+    if (durEl) durEl.textContent = fmtDuration(msg.duration);
     const out = card.querySelector('.out');
     if (out && msg.output) {
       out.textContent = msg.output;
       if (msg.status === 'error') card.classList.add('open');
     }
-    // 收割搜索结果里的「标题 → 网址」，供引用角标反查真实链接
-    if (msg.output) harvestSourceUrls(msg.output);
+    // 收割搜索结果里的「标题 → 网址」，供引用角标反查真实链接；
+    // 只有索引真有变化才重渲染，且用防抖避免工具流多次 delta 反复全量重排。
+    if (msg.output) { const hadNew = harvestSourceUrls(msg.output); if (hadNew) refreshAssistantBubbles(); }
     // 写入/编辑类工具的改动预览默认保持展开，不用反复点
     if (card.dataset.hasPreview && msg.status === 'ok') {
       card.classList.add('open');
@@ -798,8 +1197,8 @@
     scrollDown();
   }
 
-  function addStep(msg) {
-    hideWelcome();
+  // 实际创建/更新步骤卡片 DOM（时间线节点：左圆点 + 摘要行 + 折叠详情）
+  function renderStepItem(msg) {
     let el = stepItems[msg.id];
     if (!el) {
       el = document.createElement('div');
@@ -807,26 +1206,130 @@
       el.dataset.id = msg.id;
       el.innerHTML =
         '<div class="step-rail"></div>' +
-        '<div class="step-icon"></div>' +
+        '<div class="step-node"><span class="step-dot"></span></div>' +
         '<div class="step-main">' +
           '<div class="step-row">' +
+            '<span class="step-icon"></span>' +
             '<span class="step-title"></span>' +
+            '<span class="step-dur"></span>' +
             '<span class="step-state"></span>' +
+            '<span class="step-caret">▾</span>' +
           '</div>' +
-          '<div class="step-detail"></div>' +
+          '<div class="step-detail">' +
+            '<div class="step-params"><span class="step-label" data-k="params">参数</span></div>' +
+            '<div class="step-result"><span class="step-label" data-k="result">结果</span></div>' +
+            '<div class="step-thinking"></div>' +
+          '</div>' +
         '</div>';
-      el.querySelector('.step-title').addEventListener('click', () => el.classList.toggle('open'));
-      messagesEl.appendChild(el);
+      el.querySelector('.step-row').addEventListener('click', () => el.classList.toggle('open'));
       stepItems[msg.id] = el;
     }
-    el.className = 'step-item kind-' + (msg.kind || 'info') + ' status-' + (msg.status || 'running') + (msg.detail ? ' has-detail' : '');
-    el.querySelector('.step-icon').textContent = STEP_ICON[msg.kind] || '•';
-    el.querySelector('.step-title').textContent = msg.title || '';
-    const st = msg.status || 'running';
-    el.querySelector('.step-state').textContent = st === 'ok' ? '✓' : st === 'error' ? '✗' : '⏳';
-    if (msg.detail) el.querySelector('.step-detail').textContent = msg.detail;
+    return refreshStepNode(el, msg);
+  }
+
+  // 依据 _meta + 当前消息重新渲染步骤节点的摘要行与折叠详情
+  function refreshStepNode(el, msg) {
+    if (msg) applyStepMeta(el, msg);
+    const m = el._meta || {};
+    const isThinking = String(el.dataset.id).startsWith('thinking-');
+    const grp = m.group || (isThinking ? 'reason' : 'llm');
+    el.dataset.grp = grp;
+    el.className = 'step-item kind-' + (m.kind || 'info') + ' status-' + (m.status || 'running') +
+      ' grp-' + grp + (m.detail || m.result || m.parameters ? ' has-detail' : '') + (isThinking ? ' open' : '');
+    const icon = STEP_ICON[m.kind] || GROUP_ICON[grp] || '•';
+    el.querySelector('.step-icon').textContent = icon;
+    el.querySelector('.step-dot').textContent = icon;
+    el.querySelector('.step-title').textContent = m.summary || m.title || (grp === 'reason' ? t('调用模型') : '');
+    el.querySelector('.step-dur').textContent = fmtDuration(m.duration);
+    const st = m.status || 'running';
+    el.querySelector('.step-state').textContent = st === 'ok' ? '✓' : st === 'error' || st === 'rejected' ? '✗' : '⏳';
+    // 结构化参数
+    const paramsEl = el.querySelector('.step-params');
+    const ptext = formatParams(m.parameters);
+    if (ptext) {
+      paramsEl.innerHTML = '<span class="step-label">参数</span>';
+      const pre = document.createElement('pre');
+      pre.className = 'params-pre';
+      pre.textContent = ptext;
+      paramsEl.appendChild(pre);
+      paramsEl.style.display = '';
+    } else if (paramsEl) paramsEl.style.display = 'none';
+    // 结构化结果
+    const resEl = el.querySelector('.step-result');
+    if (m.result) { resEl.textContent = String(m.result).slice(0, 2000); resEl.style.display = ''; }
+    else if (resEl) resEl.style.display = 'none';
+    // 普通 detail 文本（无结构化 result 时兜底）
+    const thinkEl = el.querySelector('.step-thinking');
+    if (m.detail && !m.result) { thinkEl.textContent = String(m.detail); thinkEl.style.display = ''; }
+    else if (thinkEl) thinkEl.style.display = 'none';
+    return el;
+  }
+
+  function addStep(msg) {
+    hideWelcome();
+    const el = renderStepItem(msg);
+    // 步骤卡片物理隔离到独立工作链面板，不再污染主聊天正文流
+    if (workchainList) workchainList.appendChild(el);
+    else messagesEl.appendChild(el);
+    // thinking 步骤（调用模型）初始化内容容器，供后续 delta/reasoning/image 写入
+    if (String(msg.id).startsWith('thinking-') || (msg.kind === 'llm' && msg.status === 'running')) {
+      thinkingSteps[msg.id] = { el, raw: '', reasoning: '', images: [] };
+    }
+    updateWorkchainCount();
     scrollDown();
     return el;
+  }
+
+  function updateStepMeta(id, patch) {
+    const el = stepItems[id];
+    if (!el) return;
+    refreshStepNode(el, patch);
+    if (patch && patch.status === 'running') scrollDown();
+  }
+
+  function updateThinkingStep(msg_id, type, data) {
+    const ts = thinkingSteps[msg_id];
+    if (!ts || !ts.el) return;
+    if (type === 'text') {
+      ts.raw += data.text || '';
+    } else if (type === 'reasoning') {
+      const t = data.text || '';
+      if (ts.reasoning) {
+        if (t.length > ts.reasoning.length && t.startsWith(ts.reasoning)) {
+          ts.reasoning = t;
+        } else if (t.length > 0 && ts.reasoning.includes(t)) {
+          // 完全相同片段已存在，跳过
+        } else {
+          ts.reasoning += t;
+        }
+      } else {
+        ts.reasoning = t;
+      }
+    } else if (type === 'image') {
+      if (!ts.images) ts.images = [];
+      ts.images.push({ src: data.src, alt: data.alt || '模型生成图片' });
+    }
+    const thinkEl = ts.el.querySelector('.step-thinking');
+    if (!thinkEl) return;
+    const parts = [];
+    if (ts.reasoning && String(ts.reasoning).trim()) {
+      parts.push('<div class="thinking-section"><div class="thinking-section-title">已思考</div>' + renderReasoning(ts.reasoning) + '</div>');
+    }
+    if (ts.raw && String(ts.raw).trim()) {
+      parts.push('<div class="thinking-section"><div class="thinking-section-title">输出</div>' + renderAssistant(ts.raw) + '</div>');
+    }
+    if (ts.images && ts.images.length) {
+      for (const img of ts.images) {
+        parts.push('<div class="generated-image"><img src="' + escapeHtml(img.src) + '" alt="' + escapeHtml(img.alt) + '"></div>');
+      }
+    }
+    if (parts.length) {
+      thinkEl.innerHTML = parts.join('');
+      thinkEl.style.display = '';
+      ts.el.classList.add('has-detail');
+      // thinking 步骤一旦有内容就自动展开，避免用户看不到思考过程
+      ts.el.classList.add('open');
+    }
   }
 
   function appendToolStream(msg) {
@@ -1032,6 +1535,48 @@
     inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
   }
 
+  /* —— 正反馈：轻量 toast（复制成功 / 操作确认） —— */
+  let toastWrap = null;
+  function toast(msg, icon) {
+    try {
+      if (!toastWrap) {
+        toastWrap = document.createElement('div');
+        toastWrap.className = 'toast-wrap';
+        document.body.appendChild(toastWrap);
+      }
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.innerHTML = (icon ? '<span class="toast-ico">' + escapeHtml(icon) + '</span>' : '') + escapeHtml(msg);
+      toastWrap.appendChild(el);
+      setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 1900);
+    } catch (_) { /* 提示失败不影响主流程 */ }
+  }
+
+  /* —— 正反馈：发送时狐狸橙迸发粒子 —— */
+  function foxBurst(btn) {
+    try {
+      if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+      const rect = btn.getBoundingClientRect();
+      const layer = document.createElement('div');
+      layer.className = 'fox-burst';
+      layer.style.position = 'fixed';
+      layer.style.left = (rect.left + rect.width / 2) + 'px';
+      layer.style.top = (rect.top + rect.height / 2) + 'px';
+      document.body.appendChild(layer);
+      const n = 7;
+      for (let i = 0; i < n; i++) {
+        const s = document.createElement('span');
+        s.className = 'fox-spark';
+        const ang = (Math.PI * 2 * i) / n + (Math.random() - 0.5) * 0.5;
+        const dist = 24 + Math.random() * 28;
+        s.style.setProperty('--dx', (Math.cos(ang) * dist) + 'px');
+        s.style.setProperty('--dy', (Math.sin(ang) * dist) + 'px');
+        layer.appendChild(s);
+      }
+      setTimeout(() => { if (layer.parentNode) layer.parentNode.removeChild(layer); }, 720);
+    } catch (_) { /* 动效失败不影响发送 */ }
+  }
+
   function send() {
     const text = inputEl.value.trim();
     if ((!text && !attachments.length) || busy) return;
@@ -1041,6 +1586,7 @@
     const toSend = attachments.slice();
     attachments = [];
     renderAttachments();
+    foxBurst(btnSend);
     vscode.postMessage({ type: 'send', text, attachments: toSend });
     inputEl.value = '';
     autoGrow();
@@ -1054,6 +1600,79 @@
   btnUndo.addEventListener('click', () => vscode.postMessage({ type: 'undo' }));
   btnReadTerminal.addEventListener('click', () => vscode.postMessage({ type: 'readTerminal' }));
   $('btnSettings').addEventListener('click', () => vscode.postMessage({ type: 'openSettings' }));
+
+  // 工作链面板：点击标题折叠/展开，专用按钮 also 切换；清空按钮清空前缀缓存
+  function syncWorkchainToggleText() {
+    if (!workchainToggle || !workchainPanel) return;
+    workchainToggle.textContent = workchainPanel.classList.contains('collapsed') ? t('展开') : t('收起');
+  }
+  if (workchainHead) {
+    workchainHead.addEventListener('click', (e) => {
+      if (e.target === workchainClear || workchainClear.contains(e.target)) return;
+      if (e.target === workchainToggle || workchainToggle && workchainToggle.contains(e.target)) return;
+      workchainPanel.classList.toggle('collapsed');
+      workchainPanel.classList.toggle('open');
+      syncWorkchainToggleText();
+    });
+  }
+  if (workchainToggle) {
+    workchainToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const collapsed = workchainPanel.classList.toggle('collapsed');
+      workchainPanel.classList.toggle('open', !collapsed);
+      syncWorkchainToggleText();
+    });
+  }
+  if (workchainClear) {
+    workchainClear.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (workchainList) workchainList.innerHTML = '';
+      updateWorkchainCount();
+    });
+  }
+  // 工作链子栏：分类筛选（全部/工具/思考/错误/状态）+ 详细程度切换（简洁/详细）
+  if (wcFilters) {
+    wcFilters.addEventListener('click', (e) => {
+      const btn = e.target.closest('.wc-f');
+      if (!btn) return;
+      const grp = btn.dataset.grp || 'all';
+      wcFilters.querySelectorAll('.wc-f').forEach((b) => b.classList.toggle('active', b === btn));
+      if (workchainList) {
+        workchainList.classList.remove('filter-all', 'filter-tool', 'filter-reason', 'filter-error', 'filter-info');
+        if (grp !== 'all') workchainList.classList.add('filter-' + grp);
+      }
+    });
+  }
+  if (wcDetail) {
+    wcDetail.addEventListener('click', () => {
+      if (!workchainList) return;
+      const on = workchainList.classList.toggle('detailed');
+      wcDetail.classList.toggle('active', on);
+      wcDetail.textContent = on ? t('简洁') : t('详细');
+    });
+  }
+  function updateWorkchainCount() {
+    if (!workchainCount || !workchainPanel) return;
+    const n = workchainList ? workchainList.children.length : 0;
+    workchainCount.textContent = n ? String(n) : '';
+    workchainPanel.classList.toggle('has-items', n > 0);
+    if (n > 0 && workchainPanel.classList.contains('collapsed')) {
+      workchainPanel.classList.remove('collapsed');
+      workchainPanel.classList.add('open');
+      syncWorkchainToggleText();
+    }
+  }
+  // 进度栏已移除（用户要求）：原 miniStatusBar 状态轨迹不再渲染，工作链面板仍独立展示步骤。
+  function focusWorkchainStep(id) {
+    if (!id) return;
+    const safe = String(id).replace(/"/g, '\\"');
+    const el = (workchainList && workchainList.querySelector('[data-id="' + safe + '"]')) || stepItems[id] || toolCards[id];
+    if (!el) return;
+    if (workchainPanel) { workchainPanel.classList.remove('collapsed'); workchainPanel.classList.add('open'); }
+    el.classList.add('open', 'flash');
+    setTimeout(() => el.classList.remove('flash'), 900);
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
   providerChip.addEventListener('click', () => vscode.postMessage({ type: 'pickProvider' }));
   modelChip.addEventListener('click', () => vscode.postMessage({ type: 'pickModel' }));
   apiModeChip.addEventListener('click', () => vscode.postMessage({ type: 'pickApiMode' }));
@@ -1286,6 +1905,18 @@
   });
 
   messagesEl.addEventListener('click', (e) => {
+    // 引用角标 / 来源项：优先处理 data-source-id，弹浮窗展示来源（有 URL 则提供跳转）
+    const citeEl = e.target.closest('sup[data-source-id], a[data-source-id]');
+    if (citeEl) {
+      const parts = String(citeEl.dataset.sourceId || '').split(':');
+      const src = getSource(parts[0], parts[1]);
+      if (src) {
+        e.preventDefault();
+        e.stopPropagation();
+        showCitePopup(citeEl, src);
+      }
+      return;
+    }
     // 外链 / 引用角标：交给扩展端用系统默认浏览器打开
     const linkEl = e.target.closest('[data-url]');
     if (linkEl) {
@@ -1338,7 +1969,7 @@
     const block = btn.closest('.code-block');
     const code = block ? block.querySelector('code').textContent : '';
     const act = btn.dataset.act;
-    if (act === 'copy') vscode.postMessage({ type: 'copy', code });
+    if (act === 'copy') { vscode.postMessage({ type: 'copy', code }); toast(t('已复制'), '✓'); }
     else if (act === 'insert') vscode.postMessage({ type: 'insertCode', code });
     else if (act === 'newfile') vscode.postMessage({ type: 'newFile', code });
   });
@@ -1423,42 +2054,78 @@
           break;
         }
         case 'assistantStart': {
+          if (msg.channel === 'thinking') {
+            // thinking 通道：复用 state:thinking 已创建的步骤卡片，只初始化内容容器
+            if (!thinkingSteps[msg.msg_id]) {
+              const el = stepItems[msg.msg_id];
+              if (el) {
+                thinkingSteps[msg.msg_id] = { el, raw: '', reasoning: '', images: [] };
+              }
+            }
+            break;
+          }
+          // final 通道：主正文气泡
+          const fid = msg.msg_id || msg.id;
           // 防御性清理：如果同 ID 的 live 气泡已存在（seq 冲突或旧状态残留），先移除旧 DOM，
           // 避免一个 bubbleId 同时对应两个 DOM 元素导致内容写到错误位置。
-          if (live[msg.id]) {
-            const old = live[msg.id];
+          if (live[fid]) {
+            const old = live[fid];
             if (old.bubble && old.bubble.parentElement) old.bubble.parentElement.remove();
-            delete live[msg.id];
+            delete live[fid];
           }
-          const { bubble } = addMessage('assistant', msg.id);
-          live[msg.id] = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true };
+          const { bubble } = addMessage('assistant', fid);
+          live[fid] = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true };
           scheduleRender();
           break;
         }
         case 'delta': {
-          let m = live[msg.id];
+          if (msg.channel === 'thinking') {
+            updateThinkingStep(msg.msg_id, 'text', msg);
+            break;
+          }
+          const fid = msg.msg_id || msg.id;
+          let m = live[fid];
           if (!m) {
             // 兜底：transcript 缺失 assistantStart 锚点（如长会话锚点被挤出、或旧版本存档）时，
-            // 自动建一个 assistant 气泡承载内容，避免 restore 重放时 delta 被静默丢弃导致对话栏变空
-            const { bubble } = addMessage('assistant', msg.id);
-            m = live[msg.id] = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true };
+            // 自动建一个 assistant 气泡承载内容，避免 restore 重放时 delta 被静默丢弃导致对话栏变空。
+            // 额外防御：如果同 id 的气泡已存在 DOM 中（如 assistantEnd 已 finalize 但仍有延迟 delta），
+            // 复用该气泡而不是新建第二气泡，防止同一答案被截断拆成两个。
+            let bubble = null;
+            let reasonEl = null;
+            if (fid) {
+              const existingWrap = messagesEl.querySelector('.msg.assistant[data-id="' + CSS.escape(fid) + '"]');
+              if (existingWrap) {
+                bubble = existingWrap.querySelector('.bubble');
+                reasonEl = existingWrap.querySelector('.reasoning');
+              }
+            }
+            if (!bubble) {
+              const created = addMessage('assistant', fid);
+              bubble = created.bubble;
+            }
+            m = live[fid] = { raw: bubble.dataset.raw || '', reasoning: '', bubble, reasonEl, dirty: true };
           }
           // 如果该气泡已经从 DOM 里移除（例如用户清屏、切换会话），不再追加内容，
           // 防止残存 delta 误写入其他同 ID 的泡泡。
-          if (!m.bubble.isConnected) { delete live[msg.id]; break; }
+          if (!m.bubble.isConnected) { delete live[fid]; break; }
           m.raw += msg.text;
           m.dirty = true;
           scheduleRender();
           break;
         }
         case 'reasoning': {
-          let m = live[msg.id];
+          if (msg.channel === 'thinking') {
+            updateThinkingStep(msg.msg_id, 'reasoning', msg);
+            break;
+          }
+          const fid = msg.msg_id || msg.id;
+          let m = live[fid];
           if (!m) {
             // 同上：缺锚点时自动建气泡，保证深度思考链也能被还原
-            const { bubble } = addMessage('assistant', msg.id);
-            m = live[msg.id] = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true };
+            const { bubble } = addMessage('assistant', fid);
+            m = live[fid] = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true };
           }
-          if (!m.bubble.isConnected) { delete live[msg.id]; break; }
+          if (!m.bubble.isConnected) { delete live[fid]; break; }
           const t = msg.text || '';
           // 兼容「增量」「全量重发」「完全相同片段循环重发」三种后端行为，避免思考链文字重复错位：
           // 1) 全量重发（t 是 m 的扩展前缀）→ 替换为最新全量；
@@ -1480,12 +2147,17 @@
           break;
         }
         case 'image': {
-          let m = live[msg.id];
+          if (msg.channel === 'thinking') {
+            updateThinkingStep(msg.msg_id, 'image', msg);
+            break;
+          }
+          const fid = msg.msg_id || msg.id;
+          let m = live[fid];
           if (!m || !m.bubble.isConnected) {
-            if (m) delete live[msg.id];
-            const { bubble } = addMessage('assistant', msg.id);
+            if (m) delete live[fid];
+            const { bubble } = addMessage('assistant', fid);
             m = { raw: '', reasoning: '', bubble, reasonEl: null, dirty: true, images: [] };
-            live[msg.id] = m;
+            live[fid] = m;
           }
           if (!m.images) m.images = [];
           m.images.push({ src: msg.src, alt: msg.alt || '模型生成图片' });
@@ -1495,14 +2167,63 @@
           break;
         }
         case 'assistant': {
-          const { bubble } = addMessage('assistant', msg.id);
-          bubble.innerHTML = renderAssistant(msg.text || '');
-          highlightCode(bubble);
+          // 一次性完整回答（如 RAG 直答）按 id 聚合，避免同 id 重复创建气泡
+          const id = msg.id;
+          let bubble;
+          if (id && live[id] && live[id].bubble && live[id].bubble.isConnected) {
+            bubble = live[id].bubble;
+            live[id].raw = msg.text || '';
+            live[id].dirty = true;
+          } else {
+            // 若 DOM 里已存在同 id 的 assistant 气泡（无 live 状态），直接复用
+            if (id) {
+              const existing = messagesEl.querySelector('.msg.assistant[data-id="' + CSS.escape(id) + '"] .bubble');
+              if (existing) {
+                bubble = existing;
+                const wrap = bubble.closest('.msg');
+                if (wrap && wrap.parentElement) {
+                  // 清理旧的 steps 容器，避免残留
+                  const oldSteps = wrap.querySelector('.steps');
+                  if (oldSteps) oldSteps.innerHTML = '';
+                }
+              }
+            }
+            if (!bubble) {
+              const created = addMessage('assistant', id);
+              bubble = created.bubble;
+            }
+            if (id) live[id] = { raw: msg.text || '', reasoning: '', bubble, reasonEl: null, dirty: true };
+          }
+          const text = msg.text || '';
+          bubble.innerHTML = renderAssistant(text, id);
+          bubble.dataset.raw = text;
+          scheduleRender();
           scrollDown(true);
           break;
         }
+        case 'replaceLastAssistant': {
+          // force-agent / 切换智能体重新回答时，移除上一轮 assistant 回答气泡，避免新旧回答并存
+          const wraps = messagesEl.querySelectorAll('.msg.assistant');
+          if (wraps.length) {
+            const last = wraps[wraps.length - 1];
+            const id = last.dataset.id;
+            if (id && live[id]) delete live[id];
+            last.remove();
+          }
+          break;
+        }
         case 'assistantEnd': {
-          const m = live[msg.id];
+          if (msg.channel === 'thinking') {
+            const ts = thinkingSteps[msg.msg_id];
+            if (ts && ts.el) {
+              // 用结构化刷新收尾思考步骤（保留分组/类型，仅把状态置 ok）
+              refreshStepNode(ts.el, { status: 'ok' });
+              delete thinkingSteps[msg.msg_id];
+            }
+            break;
+          }
+          const fid = msg.msg_id || msg.id;
+          const m = live[fid];
           if (m) {
             m.dirty = true;
             m.ended = true;
@@ -1531,8 +2252,36 @@
           break;
         case 'searchSources':
           // 原生联网（Responses 的 web_search_call）结果：收割标题→网址索引，补全引用角标链接
-          if (msg.text) harvestSourceUrls(msg.text);
+          if (msg.text) { harvestSourceUrls(msg.text); refreshAssistantBubbles(); }
           break;
+        case 'kbSources':
+          // 本地知识库命中来源（相对路径 label + 绝对路径 file）：建档，使中文来源标签角标可定位到本地文件
+          if (Array.isArray(msg.sources)) {
+            for (const s of msg.sources) {
+              if (s && s.label && s.file) kbSourceMap[String(s.label)] = { label: s.label, file: s.file };
+            }
+            refreshAssistantBubbles();
+          }
+          break;
+        case 'cacheStats':
+          updateCacheStatus(msg);
+          break;
+        case 'cacheUnsupported': {
+          // 点对点适配：本模型/服务商不支持服务端前缀缓存，仅提醒一次后静默
+          const ukey = 'foxai_cache_unsupported_' + (msg.provider || 'unknown');
+          let warned = null;
+          try { warned = sessionStorage.getItem(ukey); } catch (_) {}
+          if (!warned) {
+            try { sessionStorage.setItem(ukey, '1'); } catch (_) {}
+            toast(msg.reason || '当前模型不支持服务端前缀缓存，已静默跳过缓存优化', '⚠️');
+          }
+          if (cacheStatusEl) {
+            cacheStatusEl.className = 'cache-status cache-unsupported';
+            cacheStatusEl.textContent = '🧊 本模型不支持上下文缓存';
+            setTimeout(() => { if (cacheStatusEl && cacheStatusEl.classList.contains('cache-unsupported')) cacheStatusEl.classList.add('hidden'); }, 4500);
+          }
+          break;
+        }
         case 'approval':
           addApproval(msg);
           break;
@@ -1547,15 +2296,23 @@
           break;
         case 'clear':
           messagesEl.innerHTML = '';
+          if (workchainList) workchainList.innerHTML = '';
           hideRagHint();
           for (const k of Object.keys(live)) delete live[k];
           for (const k of Object.keys(toolCards)) delete toolCards[k];
           for (const k of Object.keys(stepItems)) delete stepItems[k];
+          for (const k of Object.keys(thinkingSteps)) delete thinkingSteps[k];
           // 重置搜索来源索引，避免上一会话的网址串到新会话的引用角标上
           for (const k of Object.keys(citeUrlByNum)) delete citeUrlByNum[k];
           citeUrlIndex.length = 0;
+          // 清掉待执行的重渲染防抖，避免旧会话 timer 在清屏后误触
+          if (refreshAssistantBubblesTimer) { clearTimeout(refreshAssistantBubblesTimer); refreshAssistantBubblesTimer = null; }
+          // 同时清空按消息存档的引用来源，避免旧会话数据串到新会话角标浮窗
+          for (const k of Object.keys(sourceStore)) delete sourceStore[k];
+          hideCitePopup();
           attachments = [];
           renderAttachments();
+          updateWorkchainCount();
           break;
         case 'prefill':
           inputEl.value = msg.text || '';
@@ -1564,8 +2321,10 @@
           break;
         case 'restore':
           messagesEl.innerHTML = '';
+          if (workchainList) workchainList.innerHTML = '';
           for (const item of msg.items || []) handle(item);
           scrollDown(true);
+          updateWorkchainCount();
           break;
         case 'planTasks':
           renderPlanTasks(msg.items);
@@ -1635,9 +2394,10 @@
   // 仅在 Node 测试环境下导出纯函数（浏览器中 module 未定义，此块不执行）
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-      renderMarkdown, renderInline, renderAssistant, extractCitations,
-      codeBlockHtml, escapeHtml, imgTag, linkTag, splitRow, isSepRow, isTableRow,
-      harvestSourceUrls, pickUrlFromLabel, lookupCiteUrl, normKey, citeUrlByNum
+      renderMarkdown, renderInline, renderAssistant, extractCitations, softSegment,
+      codeBlockHtml, escapeHtml, imgTag, linkTag, splitRow, isSepRow, isTableRow, renderMath,
+      harvestSourceUrls, pickUrlFromLabel, lookupCiteUrl, normKey, citeUrlByNum, getSource, recordSources, setKbSources,
+      normalizeForKbLookup, findKbSource
     };
   }
 })();

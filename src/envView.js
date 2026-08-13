@@ -197,6 +197,53 @@ function getHtml(context, webview) {
       <label>知识库-2 目录</label>
       <input id="kb-auto-dir" style="flex:1;min-width:200px" placeholder="C:/Users/asis/.fox-ai/knowledge-2（agent 检索这里）"/>
     </div>
+    <hr style="margin:14px 0;border:none;border-top:1px solid rgba(128,128,128,.25)"/>
+    <h3>向量模型（语义检索）</h3>
+    <p class="hint">和上面的「整理 AI」是两件不相干的事：整理 AI 负责<b>产出</b>知识笔记，向量模型只负责<b>找得准</b>（把文本转成向量做语义召回，不改内容）。<br/>
+    · 只配整理 AI → 检索行为与旧版完全一致（BM25 关键词）。<br/>
+    · 整理 AI + 向量模型都配 → 向量模型<b>先</b>做语义召回（前置），整理 AI 依旧<b>在后</b>负责产出笔记，向量只读它的产物。<br/>
+    · 下面这个开关随时可关：配了也能关，关掉立刻退回关键词检索。</p>
+    <label><input type="checkbox" id="kb-vec-enabled"/> 开启向量语义检索</label>
+    <div class="row">
+      <label>向量模型服务</label>
+      <select id="kb-vec-provider">
+        <option value="ollama">Ollama（本地·推荐 /api/embed）</option>
+        <option value="llamacpp">llama.cpp（本地·需 --embedding）</option>
+        <option value="lmstudio">LM Studio（本地）</option>
+        <option value="dashscope">阿里云百炼 / 通义（云端 text-embedding-v4）</option>
+        <option value="zhipu">智谱 GLM（云端 embedding-3）</option>
+        <option value="siliconflow">硅基流动（云端 BAAI/bge-m3）</option>
+        <option value="openai">OpenAI（云端 text-embedding-3-small）</option>
+        <option value="gemini">Google Gemini（云端兼容端点）</option>
+        <option value="mistral">Mistral（云端 mistral-embed）</option>
+        <option value="openrouter">OpenRouter（云端）</option>
+        <option value="custom">自定义 OpenAI 兼容 /embeddings</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>Base URL</label>
+      <input id="kb-vec-baseurl" style="flex:1" placeholder="留空用服务商默认；Ollama 自动改走 /api/embed，其余走 /v1/embeddings"/>
+    </div>
+    <div class="row">
+      <label>向量模型名</label>
+      <input id="kb-vec-model" style="flex:1" placeholder="留空用服务商默认，如 nomic-embed-text / text-embedding-v4"/>
+    </div>
+    <div class="row">
+      <label>向量维度</label>
+      <input id="kb-vec-dim" type="number" min="0" max="4096" step="1" style="width:110px" placeholder="0=默认"/>
+      <label style="margin-left:12px;"><input type="checkbox" id="kb-vec-hybrid"/> 与 BM25 混合排序（RRF，推荐）</label>
+    </div>
+    <div class="row">
+      <label>API Key</label>
+      <input id="kb-vec-key" type="password" style="flex:1" placeholder="选云端向量模型时填写；本地留空。存独立的 SecretStorage，不与整理 AI 互相覆盖"/>
+    </div>
+    <div class="row">
+      <button id="kb-vec-build">构建向量索引</button>
+      <button id="kb-vec-clear">清空向量缓存</button>
+      <span id="kb-vec-stat" class="hint"></span>
+    </div>
+    <p class="hint">提示：DeepSeek、Kimi、Claude 官方暂未提供 embeddings 接口，选它们需自行填一个兼容端点。换模型或换维度会自动作废旧向量缓存并重建。</p>
+    <p class="hint" style="color:#c0392b">⚠️ 纯文本知识库请用<b>文本</b>向量模型（如 text-embedding-v4、qwen3-embedding、nomic-embed-text）。像 <b>qwen3-vl-embedding</b> 这类<b>多模态/视觉语言</b>向量模型只支持百炼原生多模态协议、<b>不支持 OpenAI 兼容 /v1/embeddings</b>，填它会返回 400 "url error"。</p>
   </div>
 
   <div class="pane" id="tasks">
@@ -381,6 +428,35 @@ async function writeOrganize(cfg, patch) {
   if ('autoThreshold' in patch) await cfg.update('knowledgeBase.autoSummarize.threshold', Number(patch.autoThreshold) || 0.9, vscode.ConfigurationTarget.Global);
   if ('autoKeep' in patch) await cfg.update('knowledgeBase.autoSummarize.keepRecent', Number(patch.autoKeep) || 6, vscode.ConfigurationTarget.Global);
   if ('autoDir' in patch) await cfg.update('knowledgeBase.autoSummarize.dir', patch.autoDir || '', vscode.ConfigurationTarget.Global);
+  // —— 向量模型（语义检索，1.1.33）：与整理模型完全独立的一组键 ——
+  if ('vecEnabled' in patch) await cfg.update('knowledgeBase.embedding.enabled', !!patch.vecEnabled, vscode.ConfigurationTarget.Global);
+  if ('vecProvider' in patch) await cfg.update('knowledgeBase.embedding.provider', patch.vecProvider || 'ollama', vscode.ConfigurationTarget.Global);
+  if ('vecBaseUrl' in patch) await cfg.update('knowledgeBase.embedding.baseUrl', patch.vecBaseUrl || '', vscode.ConfigurationTarget.Global);
+  if ('vecModel' in patch) await cfg.update('knowledgeBase.embedding.model', patch.vecModel || '', vscode.ConfigurationTarget.Global);
+  if ('vecDim' in patch) await cfg.update('knowledgeBase.embedding.dimensions', Math.max(0, Number(patch.vecDim) || 0), vscode.ConfigurationTarget.Global);
+  if ('vecHybrid' in patch) await cfg.update('knowledgeBase.embedding.hybrid', patch.vecHybrid !== false, vscode.ConfigurationTarget.Global);
+}
+
+/** 把 webview 传来的知识库表单统一转成 writeOrganize 的 patch（整理 + 自动压缩 + 向量三段） */
+function kbPatchFromForm(c) {
+  return {
+    enabled: !!c.enabled,
+    sourcePaths: (c.source || '').split(',').map((x) => x.trim()).filter(Boolean),
+    outputDir: (c.output || '').trim(),
+    provider: c.provider || 'llamacpp',
+    baseUrl: (c.baseurl || '').trim(),
+    model: (c.model || '').trim(),
+    autoEnabled: !!c.autoEnabled,
+    autoThreshold: c.autoThreshold,
+    autoKeep: c.autoKeep,
+    autoDir: (c.autoDir || '').trim(),
+    vecEnabled: !!c.vecEnabled,
+    vecProvider: c.vecProvider || 'ollama',
+    vecBaseUrl: (c.vecBaseurl || '').trim(),
+    vecModel: (c.vecModel || '').trim(),
+    vecDim: c.vecDim,
+    vecHybrid: c.vecHybrid !== false
+  };
 }
 
 /**
@@ -559,9 +635,18 @@ function openEnvPanel(context, chatProvider, initialTab) {
         const sub = cfg.get('knowledgeBase') || {};
         const org = sub.organize || {};
         const as = sub.autoSummarize || {};
+        const vec = sub.embedding || {};
         const s = kb.stats();
+        const vs = kb.vectorStats();
         panel.webview.postMessage({
           type: 'kbInit',
+          vecEnabled: !!vec.enabled,
+          vecProvider: vec.provider || 'ollama',
+          vecBaseurl: vec.baseUrl || '',
+          vecModel: vec.model || '',
+          vecDim: vec.dimensions != null ? vec.dimensions : 0,
+          vecHybrid: vec.hybrid !== false,
+          vecStat: `向量缓存：${vs.entries} 条${vs.sig ? '（' + vs.sig + '）' : ''}`,
           enabled: !!org.enabled,
           source: (org.sourcePaths || []).join(','),
           output: org.outputDir || '',
@@ -578,33 +663,11 @@ function openEnvPanel(context, chatProvider, initialTab) {
         });
       } else if (msg.type === 'setKnowledge') {
         const c = msg.config || {};
-        await writeOrganize(cfg, {
-          enabled: !!c.enabled,
-          sourcePaths: (c.source || '').split(',').map((x) => x.trim()).filter(Boolean),
-          outputDir: (c.output || '').trim(),
-          provider: c.provider || 'llamacpp',
-          baseUrl: (c.baseurl || '').trim(),
-          model: (c.model || '').trim(),
-          autoEnabled: !!c.autoEnabled,
-          autoThreshold: c.autoThreshold,
-          autoKeep: c.autoKeep,
-          autoDir: (c.autoDir || '').trim()
-        });
+        await writeOrganize(cfg, kbPatchFromForm(c));
       } else if (msg.type === 'organize') {
         if (msg.config) {
           const c = msg.config;
-          await writeOrganize(cfg, {
-            enabled: !!c.enabled,
-            sourcePaths: (c.source || '').split(',').map((x) => x.trim()).filter(Boolean),
-            outputDir: (c.output || '').trim(),
-            provider: c.provider || 'llamacpp',
-            baseUrl: (c.baseurl || '').trim(),
-            model: (c.model || '').trim(),
-            autoEnabled: !!c.autoEnabled,
-            autoThreshold: c.autoThreshold,
-            autoKeep: c.autoKeep,
-            autoDir: (c.autoDir || '').trim()
-          });
+          await writeOrganize(cfg, kbPatchFromForm(c));
           if (c.apiKey && c.provider && !['llamacpp','ollama','lmstudio'].includes(c.provider)) {
             // 写入整理 AI 独立 secret 键，避免覆盖主控 agent 的 apiKey 槽
             await foxConfig.setOrganizeApiKey(context, c.provider, c.apiKey);
@@ -622,10 +685,47 @@ function openEnvPanel(context, chatProvider, initialTab) {
           panel.webview.postMessage({ type: 'kbLog', text: '❌ 整理失败：' + String(e.message).split('\n')[0] });
         }
       } else if (msg.type === 'rebuildKb') {
-        kb.invalidate();
+        kb.invalidate(); // 内部会一并作废向量缓存（文本变了旧向量不再对应）
         kb.retrieve('warmup', 1);
         const s = kb.stats();
-        panel.webview.postMessage({ type: 'kbStat', text: `索引已重建：${s.files} 文件 / ${s.chunks} 片段` });
+        panel.webview.postMessage({ type: 'kbStat', text: `索引已重建：${s.files} 文件 / ${s.chunks} 片段（向量缓存已清空）` });
+        panel.webview.postMessage({ type: 'kbVecStat', text: '向量缓存：0 条' });
+      } else if (msg.type === 'buildVectors') {
+        // 先落盘表单（含向量密钥），再构建，避免用户改完没保存就点构建
+        if (msg.config) {
+          const c = msg.config;
+          await writeOrganize(cfg, kbPatchFromForm(c));
+          if (c.vecApiKey && c.vecProvider && !['llamacpp','ollama','lmstudio'].includes(c.vecProvider)) {
+            await foxConfig.setEmbedApiKey(context, c.vecProvider, c.vecApiKey);
+          }
+        }
+        panel.webview.postMessage({ type: 'kbVecStat', text: '正在构建向量索引…' });
+        try {
+          const r = await kb.buildVectors(undefined, {
+            context,
+            onLog: (t) => panel.webview.postMessage({ type: 'kbLog', text: t })
+          });
+          const vs = kb.vectorStats();
+          panel.webview.postMessage({
+            type: 'kbVecStat',
+            text: r.ok
+              ? `向量索引完成：本次新增 ${r.added} 条，候选片段 ${r.total}，缓存共 ${vs.entries} 条`
+              : `未构建：${r.reason || '向量模型未就绪'}`
+          });
+        } catch (e) {
+          const m = String((e && e.message) || e).split('\n')[0];
+          panel.webview.postMessage({ type: 'kbVecStat', text: '❌ 构建失败：' + m });
+          panel.webview.postMessage({ type: 'kbLog', text: '❌ 向量索引构建失败：' + m });
+        }
+      } else if (msg.type === 'clearVectors') {
+        try {
+          kb.clearVectorCache();
+          panel.webview.postMessage({ type: 'kbVecStat', text: '向量缓存已清空（0 条）' });
+          panel.webview.postMessage({ type: 'kbLog', text: '🧹 已清空向量缓存' });
+        } catch (e) {
+          const m = String((e && e.message) || e).split('\n')[0];
+          panel.webview.postMessage({ type: 'kbVecStat', text: '❌ 清空失败：' + m });
+        }
       } else if (msg.type === 'pickKbSource' || msg.type === 'pickKbOutput') {
         try {
           const isSource = msg.type === 'pickKbSource';
@@ -668,8 +768,14 @@ function openEnvPanel(context, chatProvider, initialTab) {
           vscode.window.showErrorMessage(tw('选择目录失败：{0}', e.message));
         }
       } else if (msg.type === 'setKbKey') {
-        await foxConfig.setApiKey(context, msg.provider, msg.value || '');
-        panel.webview.postMessage({ type: 'kbStat', text: '已保存 ' + msg.provider + ' 的 API Key（本地 SecretStorage）' });
+        // scope=embed → 写向量模型独立键；否则沿用整理 AI 的写法（历史行为）
+        if (msg.scope === 'embed') {
+          await foxConfig.setEmbedApiKey(context, msg.provider || 'ollama', msg.value || '');
+          panel.webview.postMessage({ type: 'kbVecStat', text: '已保存 ' + (msg.provider || '') + ' 的向量模型 API Key（独立 SecretStorage）' });
+        } else {
+          await foxConfig.setApiKey(context, msg.provider, msg.value || '');
+          panel.webview.postMessage({ type: 'kbStat', text: '已保存 ' + msg.provider + ' 的 API Key（本地 SecretStorage）' });
+        }
       } else if (msg.type === 'loadTasks') {
         const tm = chatProvider && chatProvider.taskManager;
         if (tm) panel.webview.postMessage({ type: 'taskList', tasks: await tm.listTasks() });

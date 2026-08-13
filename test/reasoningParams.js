@@ -64,8 +64,9 @@ t('openrouter → openrouter', () => {
   assert.strictEqual(rp.pickStrategy({ provider: 'openrouter', model: 'anthropic/claude-sonnet-4' }), 'openrouter');
 });
 
-t('grok-4 不接受 reasoning_effort → none', () => {
-  assert.strictEqual(rp.pickStrategy({ provider: 'grok', model: 'grok-4' }), 'none');
+t('grok-4.x 支持 reasoning_effort → openai_effort', () => {
+  assert.strictEqual(rp.pickStrategy({ provider: 'grok', model: 'grok-4' }), 'openai_effort');
+  assert.strictEqual(rp.pickStrategy({ provider: 'grok', model: 'grok-4.5' }), 'openai_effort');
 });
 
 t('grok-3-mini → openai_effort', () => {
@@ -144,11 +145,11 @@ t('qwen 流式：enable_thinking=true + thinking_budget', () => {
   assert.strictEqual(o.extraBody.thinking_budget, 4096);
 });
 
-t('qwen 非流式：必须 enable_thinking=false，并改走提示词兜底', () => {
+t('qwen 非流式：同样开启思考（官方文档无此限制，靠拒绝重试兜底老模型）', () => {
   const o = rp.buildReasoningParams(mk('dashscope', 'qwen3-max'), { stream: false });
-  assert.strictEqual(o.extraBody.enable_thinking, false);
-  assert.ok(o.promptHint.indexOf('深度思考模式') >= 0);
-  assert.strictEqual(o.native, false);
+  assert.strictEqual(o.extraBody.enable_thinking, true);
+  assert.strictEqual(o.extraBody.thinking_budget, 4096);
+  assert.strictEqual(o.native, true);
 });
 
 t('zhipu 生成 thinking:{type:enabled}', () => {
@@ -172,6 +173,54 @@ t('无原生开关（deepseek-chat）→ 空 body + 提示词兜底', () => {
 t('promptFallback=false 时不注入提示词', () => {
   const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-chat', { deepThinking: { enabled: true, effort: 'medium', promptFallback: false } }));
   assert.strictEqual(o.promptHint, '');
+});
+
+t('DeepSeek V4 原生思考：thinking:{enabled} + reasoning_effort（high→max）', () => {
+  const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: true, effort: 'high' } }));
+  assert.deepStrictEqual(o.extraBody.thinking, { type: 'enabled' });
+  assert.strictEqual(o.extraBody.reasoning_effort, 'max');
+  assert.strictEqual(o.native, true);
+  const med = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: true, effort: 'medium' } }));
+  assert.strictEqual(med.extraBody.reasoning_effort, 'high');
+  const low = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: true, effort: 'low' } }));
+  assert.strictEqual(low.extraBody.reasoning_effort, 'low');
+});
+
+t('DeepSeek Responses：reasoning.effort（high→max），第三方不加 summary', () => {
+  const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { apiMode: 'responses', deepThinking: { enabled: true, effort: 'high' } }));
+  assert.deepStrictEqual(o.extraBody.reasoning, { effort: 'max' });
+});
+
+t('智谱 GLM 原生思考：thinking:{enabled} + reasoning_effort 控制强度', () => {
+  const o = rp.buildReasoningParams(mk('zhipu', 'glm-5.2', { deepThinking: { enabled: true, effort: 'high' } }));
+  assert.deepStrictEqual(o.extraBody.thinking, { type: 'enabled' });
+  assert.strictEqual(o.extraBody.reasoning_effort, 'high');
+  assert.strictEqual(o.native, true);
+});
+
+t('月之暗面 Kimi 原生思考：thinking:{enabled}，强制 temperature=1', () => {
+  const o = rp.buildReasoningParams(mk('moonshot', 'kimi-k2.6', { deepThinking: { enabled: true, effort: 'medium' } }));
+  assert.deepStrictEqual(o.extraBody.thinking, { type: 'enabled' });
+  assert.strictEqual(o.temperature, 1);
+  assert.strictEqual(o.native, true);
+  // k2.7-code 始终思考，enabled 安全（disabled 会报错，但本策略只发 enabled）
+  const code = rp.buildReasoningParams(mk('moonshot', 'kimi-k2.7-code', { deepThinking: { enabled: true, effort: 'medium' } }));
+  assert.deepStrictEqual(code.extraBody.thinking, { type: 'enabled' });
+});
+
+t('grok-4.5 原生思考：reasoning_effort 透传', () => {
+  const o = rp.buildReasoningParams(mk('grok', 'grok-4.5', { deepThinking: { enabled: true, effort: 'high' } }));
+  assert.strictEqual(o.extraBody.reasoning_effort, 'high');
+  assert.strictEqual(o.native, true);
+});
+
+t('关闭态对默认开思考的模型显式下发 disabled', () => {
+  const ds = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: false } }));
+  assert.deepStrictEqual(ds.extraBody.thinking, { type: 'disabled' });
+  const glm = rp.buildReasoningParams(mk('zhipu', 'glm-5.2', { deepThinking: { enabled: false } }));
+  assert.deepStrictEqual(glm.extraBody.thinking, { type: 'disabled' });
+  const kimi = rp.buildReasoningParams(mk('moonshot', 'kimi-k2.6', { deepThinking: { enabled: false } }));
+  assert.deepStrictEqual(kimi.extraBody.thinking, { type: 'disabled' });
 });
 
 // ── 关闭态 ────────────────────────────────────────────────
@@ -208,6 +257,44 @@ t('普通报错不误判', () => {
   assert.strictEqual(rp.looksLikeReasoningRejection(new Error('rate limit exceeded')), false);
   assert.strictEqual(rp.looksLikeReasoningRejection(new Error('invalid api key')), false);
   assert.strictEqual(rp.looksLikeReasoningRejection(null), false);
+});
+
+// ── 提示词声明（让模型自知处于深度思考模式 + 强度感知 + 抗上下文干扰）────────────────
+t('high 强度提示词包含模式声明与抗上下文干扰指令', () => {
+  const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-chat', { deepThinking: { enabled: true, effort: 'high' } }));
+  assert.ok(o.promptHint.indexOf('【深度思考模式 · 强度：high】') >= 0);
+  assert.ok(o.promptHint.indexOf('不要让多轮对话中的无关上下文带偏判断') >= 0);
+});
+
+t('low / medium / high 的提示词强度不同', () => {
+  const low = rp.buildReasoningParams(mk('deepseek', 'deepseek-chat', { deepThinking: { enabled: true, effort: 'low' } })).promptHint;
+  const med = rp.buildReasoningParams(mk('deepseek', 'deepseek-chat', { deepThinking: { enabled: true, effort: 'medium' } })).promptHint;
+  const high = rp.buildReasoningParams(mk('deepseek', 'deepseek-chat', { deepThinking: { enabled: true, effort: 'high' } })).promptHint;
+  assert.ok(low.indexOf('简洁推理') >= 0);
+  assert.ok(med.indexOf('分步推理') >= 0);
+  assert.ok(high.indexOf('充分推理') >= 0);
+  assert.notStrictEqual(low, med);
+  assert.notStrictEqual(med, high);
+});
+
+t('原生支持思考的模型也注入提示词声明（OpenAI/Claude/通义/glm/openrouter）', () => {
+  const openai = rp.buildReasoningParams(mk('openai', 'gpt-5'));
+  assert.ok(openai.promptHint.indexOf('【深度思考模式 · 强度：medium】') >= 0);
+  const claude = rp.buildReasoningParams(mk('claude', 'claude-sonnet-4-5', { transport: 'anthropic' }));
+  assert.ok(claude.promptHint.indexOf('【深度思考模式') >= 0);
+  const qwen = rp.buildReasoningParams(mk('dashscope', 'qwen3-max'), { stream: true });
+  assert.ok(qwen.promptHint.indexOf('【深度思考模式') >= 0);
+  const glm = rp.buildReasoningParams(mk('zhipu', 'glm-4.5'));
+  assert.ok(glm.promptHint.indexOf('【深度思考模式') >= 0);
+  const or_ = rp.buildReasoningParams(mk('openrouter', 'x/y'));
+  assert.ok(or_.promptHint.indexOf('【深度思考模式') >= 0);
+});
+
+t('DeepSeek Responses 非 reasoner 同时拿到模式声明与结构化格式要求', () => {
+  const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { apiMode: 'responses', deepThinking: { enabled: true, effort: 'high' } }));
+  assert.ok(o.promptHint.indexOf('【深度思考模式 · 强度：high】') >= 0);
+  assert.ok(o.promptHint.indexOf('【推理过程格式要求】') >= 0);
+  assert.ok(o.promptHint.indexOf('Markdown 层级标题') >= 0);
 });
 
 if (!process.exitCode) console.log('reasoningParams 全部通过');

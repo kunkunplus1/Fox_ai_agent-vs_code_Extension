@@ -501,10 +501,12 @@ async function listDir(args) {
 /** 将简单 glob 转成匹配相对路径的正则 */
 function globToRegex(glob) {
   let s = glob.replace(/\\/g, '/');
-  s = s.replace(/\*\*/g, '\0');
-  s = s.replace(/\*/g, '[^/\\]*');
-  s = s.replace(/\?/g, '[^/\\]');
-  s = s.replace(/\0/g, '.*');
+  s = s.replace(/\*\*\//g, '__SS__');
+  s = s.replace(/\*\*/g, '__S__');
+  s = s.replace(/\*/g, '[^/]*');
+  s = s.replace(/\?/g, '[^/]');
+  s = s.replace(/__SS__/g, '(?:.*/)?');
+  s = s.replace(/__S__/g, '.*');
   return new RegExp('^' + s + '$', 'i');
 }
 

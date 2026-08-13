@@ -16,6 +16,7 @@ const https = require('https');
 const { URL } = require('url');
 const zlib = require('zlib');
 const { requestJson } = require('./client');
+const nativeSearch = require('./nativeSearch'); // 多厂商原生联网引用收割（纯函数）
 
 const UA = 'fox-ai-vscode/0.2.0';
 
@@ -200,6 +201,21 @@ function toAnthropic(messages) {
   return { system: systemParts.join('\n\n'), messages: out };
 }
 
+/**
+ * 给 system 注入 Anthropic 显式缓存断点（prompt caching 必需）。
+ * 文档要求至少一个 cache_control 块才会缓存前缀；这里标在 system 末尾，
+ * 使庞大的系统提示词被 KV 缓存命中（tools 紧随其后，非首句稳定的前缀不强制缓存）。
+ */
+function applyCacheControl(system) {
+  if (!system) return undefined;
+  const blocks = typeof system === 'string'
+    ? [{ type: 'text', text: system }]
+    : (Array.isArray(system) ? system.slice() : [{ type: 'text', text: String(system) }]);
+  const last = blocks[blocks.length - 1];
+  if (last && typeof last === 'object') last.cache_control = { type: 'ephemeral' };
+  return blocks;
+}
+
 function textOfContent(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -256,6 +272,10 @@ function streamChat(options) {
   const onToolCallStart = guard(options.onToolCallStart, 'onToolCallStart');
   const onDone = guard(options.onDone, 'onDone');
   const onError = guard(options.onError, 'onError');
+  const onUsage = guard(options.onUsage, 'onUsage');
+  // 原生联网（Claude web_search_20250305 server tool）结果含真实 URL：透传给前端 harvest，补全引用角标链接
+  const onSearchResults = guard(options.onSearchResults, 'onSearchResults');
+  const collectedSources = [];
 
   const handle = { aborted: false, abort() { this.aborted = true; try { req && req.destroy(); } catch (_) {} } };
   let req;
@@ -270,12 +290,20 @@ function streamChat(options) {
 
   const { system, messages: antMessages } = toAnthropic(messages);
   const body = { model, max_tokens: maxTokens > 0 ? maxTokens : 4096, stream: true, messages: antMessages };
-  if (system) body.system = system;
+  if (system) body.system = applyCacheControl(system);
   if (temperature != null) body.temperature = temperature;
   const antTools = toAnthropicTools(tools);
   if (antTools) {
     body.tools = antTools;
     body.tool_choice = toAnthropicToolChoice(toolChoice);
+  }
+  // Claude 原生联网（server tool web_search_20250305，服务端自动执行）：注入后 Claude 自动联网，
+  // 结果在 web_search_tool_result block + 文本 citations 里（dispatchEvent 解析）。
+  if (options.nativeSearchProvider === 'claude') {
+    if (!body.tools) body.tools = [];
+    body.tools.push({ type: 'web_search_20250305', name: 'web_search_20250305', max_uses: 5 });
+    body.tool_choice = { type: 'auto' };
+    console.log('[fox-ai anthropic] native web search server tool injected');
   }
   // 深度思考等额外字段（thinking 块等）
   Object.assign(body, extraBody || {});
@@ -301,6 +329,14 @@ function streamChat(options) {
     if (finished) return;
     finished = true;
     if (err && !handle.aborted) { onError && onError(err); return; }
+    // 原生联网：去重后把引用 URL 透传给前端 harvest，补全 [^n] 角标链接
+    if (collectedSources.length && onSearchResults) {
+      const seen = new Set();
+      const dedup = [];
+      for (const s of collectedSources) { if (s.url && !seen.has(s.url)) { seen.add(s.url); dedup.push(s); } }
+      const txt = nativeSearch.sourcesToText(dedup);
+      if (txt) onSearchResults(txt);
+    }
     onDone && onDone({
       content,
       reasoning,
@@ -356,6 +392,11 @@ function streamChat(options) {
       if (!event || handle.aborted) return;
       let data;
       try { data = JSON.parse(dataStr); } catch (_) { return; }
+      // Claude 原生联网：每事件尝试解析 web_search_tool_result block + 文本 citations，收集真实 URL
+      if (nativeSearch && options.nativeSearchProvider === 'claude') {
+        const found = nativeSearch.harvestClaudeSources(data);
+        for (const s of found) collectedSources.push(s);
+      }
       if (event === 'message_start') {
         onStart && onStart();
       } else if (event === 'content_block_start') {
@@ -387,6 +428,7 @@ function streamChat(options) {
         if (sr === 'tool_use') finishReason = 'tool_calls';
         else if (sr === 'max_tokens') finishReason = 'length';
         else if (sr === 'end_turn' || sr === 'stop_sequence') finishReason = 'stop';
+        if (data.usage) { try { onUsage && onUsage(data.usage); } catch (_) {} }
       } else if (event === 'error') {
         const err = new Error((data.error && (data.error.message || data.error.type)) || 'Anthropic stream error');
         err.status = data.error && data.error.status;
@@ -469,17 +511,24 @@ async function chatNonStream(options) {
     maxTokens = 4096,
     timeout = 120000,
     insecureHTTPParser = false,
-    extraBody
+    extraBody,
+    onUsage
   } = options;
 
   const { system, messages: antMessages } = toAnthropic(messages);
   const body = { model, max_tokens: maxTokens > 0 ? maxTokens : 4096, stream: false, messages: antMessages };
-  if (system) body.system = system;
+  if (system) body.system = applyCacheControl(system);
   if (temperature != null) body.temperature = temperature;
   const antTools = toAnthropicTools(tools);
   if (antTools) {
     body.tools = antTools;
     body.tool_choice = toAnthropicToolChoice(toolChoice);
+  }
+  // Claude 原生联网（server tool web_search_20250305）：非流式同样注入
+  if (options.nativeSearchProvider === 'claude') {
+    if (!body.tools) body.tools = [];
+    body.tools.push({ type: 'web_search_20250305', name: 'web_search_20250305', max_uses: 5 });
+    body.tool_choice = { type: 'auto' };
   }
   Object.assign(body, extraBody || {});
   if (body.thinking && body.thinking.type === 'enabled') {
@@ -499,7 +548,19 @@ async function chatNonStream(options) {
     console.log('[fox-ai anthropic] non-stream error:', JSON.stringify(data.error).slice(0, 400));
     throw new Error((data.error.message || data.error.type || JSON.stringify(data.error)));
   }
+  if (data && data.usage) { try { onUsage && onUsage(data.usage); } catch (_) {} }
   const r = fromAnthropic(data);
+  // 原生联网：从响应里解析 web_search_tool_result + citations，去重后透传前端 harvest
+  if (options.onSearchResults && nativeSearch && options.nativeSearchProvider === 'claude') {
+    const found = nativeSearch.harvestClaudeSources(data);
+    if (found.length) {
+      const seen = new Set();
+      const dedup = [];
+      for (const s of found) { if (s.url && !seen.has(s.url)) { seen.add(s.url); dedup.push(s); } }
+      const txt = nativeSearch.sourcesToText(dedup);
+      if (txt) options.onSearchResults(txt);
+    }
+  }
   return Object.assign(r, { aborted: false, empty: !r.content && !r.reasoning && !r.toolCalls.length });
 }
 

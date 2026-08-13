@@ -892,12 +892,14 @@ ${subagents.renderRoleCatalog()}
       '调用专门配置的「生图模型」（foxAi.imageGen.*）根据文字描述生成图片，并把图片直接显示在对话中。' +
       '这是独立于主控聊天模型的第二模型通道——主控 agent 仍用文本模型思考与规划，仅在需要出图时调用本工具，' +
       '两者互不影响。适合需要配图、海报、概念图、示意图、图表等场景。' +
-      '需先在设置里开启 foxAi.imageGen（enabled=true）并填写 provider/baseUrl/apiKey/model（如通义 wan2.1-image）；未配置时本工具会提示如何开启。',
+      '工具会按厂商自动选择协议：阿里百炼/通义万相（wanx*）走原生异步 API，OpenAI DALL·E 走 images 接口，其余走 OpenAI 兼容 chat。' +
+      '需先在设置里开启 foxAi.imageGen（enabled=true）并填写 provider/baseUrl/apiKey/model（如阿里万相 wanx2.1-t2i-turbo）；未配置时本工具会提示如何开启。',
     parameters: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: '对要生成图片的文字描述（越具体越好，可含风格、构图、色调、主体等）' },
-        size: { type: 'string', description: '可选，期望图片尺寸，如 1024x1024 / 1280x720，取决于生图模型支持；不支持时会被当作提示附加到描述里' }
+        size: { type: 'string', description: '可选，期望图片尺寸，如 1024x1024 / 1280x720；阿里万相会转为 1024*1024 格式，不支持时交给模型默认' },
+        negative_prompt: { type: 'string', description: '可选，反向提示词：不希望在画面中出现的内容（如 文字/水印/畸形手指），阿里万相等支持' }
       },
       required: ['prompt']
     },
@@ -1252,21 +1254,32 @@ function _globalTimeoutConfig() {
 /** OpenAI function calling 格式。可选 query/cfg 用于动态子集精简（不传则全量） */
 function toOpenAITools(query, cfg) {
   const vcfg = vscode.workspace.getConfiguration('foxAi');
-  const provider = vcfg.get('provider') || 'llamacpp';
-  const apiMode = vcfg.get('apiMode', 'chat');
-  // DeepSeek Responses API 支持服务端内置联网搜索（免费、免 key）。
-  // 在 deepseek + responses 模式下自动注入原生 web_search，
-  // 不再依赖本地 web_search 开关（webSearch.enabled），避免用户没开开关导致模型看不到联网能力。
-  const useProviderSearch = provider === 'deepseek' && apiMode === 'responses';
-  const list = filterForPrompt(query, cfg) || allTools();
+  const gprovider = vcfg.get('provider') || 'llamacpp';
+  const gapiMode = vcfg.get('apiMode', 'chat');
+  const provider = (cfg && (cfg.provider || cfg.providerId)) || gprovider;
+  const apiMode = (cfg && cfg.apiMode) || gapiMode;
+  // 多厂商原生联网（服务端执行）：仅当 provider/apiMode 命中对应能力才注入原生工具，
+  // 避免给不相关的厂商误加会导致 400。能力判定集中在 src/nativeSearch.js（纯函数、可单测）。
+  let nsProvider = null;
+  let nsTool = null;
+  try {
+    const ns = require('../nativeSearch');
+    nsProvider = ns.nativeSearchProvider({ provider, apiMode });
+    nsTool = ns.nativeSearchTool({ provider, apiMode });
+  } catch (_) {}
+  const useProviderSearch = !!nsProvider;
+  // 云端模型：用固定全集（固化工具列表），保证 tools 字段序列化顺序确定、前缀缓存可命中；
+  // 本地弱模型上下文窄，仍按 query 精简子集省 token（本地模型通常不缓存、且锚点已使前缀变动）。
+  const isLocal = !!(cfg && cfg.meta && cfg.meta.local);
+  const list = isLocal ? (filterForPrompt(query, cfg) || allTools()) : allTools();
   const out = [];
   for (const t of list) {
-    if (useProviderSearch) {
+    if (useProviderSearch && t.name === 'web_search') continue; // 原生联网已接管，移除本地 web_search 避免抢路由
+    if (provider === 'deepseek' && apiMode === 'responses') {
       // DeepSeek Responses API 的 function 名必须匹配 ^[a-zA-Z0-9_-]+$。
       // MCP 工具名形如 mcp__fetch__fetch-url 或含点/斜杠/大写（mcp__io.github...），会触发 400，
       // 必须在官方联网模式下整体排除；同时用官方 {type:'web_search'} 替换本地 web_search，
       // 避免模型调本地而绕开官方搜索、或把非法名字工具发给 DeepSeek 直接 400。
-      if (t.name === 'web_search') continue;
       if (!/^[a-zA-Z0-9_-]+$/.test(t.name)) continue;
     }
     out.push({
@@ -1278,7 +1291,17 @@ function toOpenAITools(query, cfg) {
       }
     });
   }
-  if (useProviderSearch) out.push({ type: 'web_search' });
+  // 云端模型：工具按名排序，固化 tools 字段的序列化顺序，避免发现顺序抖动导致前缀缓存失效
+  if (!isLocal) out.sort((a, b) => String(a.function.name).localeCompare(String(b.function.name)));
+  if (nsProvider === 'responses') {
+    // OpenAI / DeepSeek / 通义百炼 Responses 原生 web_search（由 toResponsesTools 透传）
+    // DeepSeek 官方 web_search 不返回真实 URL，改用新版 web_search_2025_08_26 尝试获取 citations/URL
+    const respSearchType = provider === 'deepseek' ? 'web_search_2025_08_26' : 'web_search';
+    out.push({ type: respSearchType });
+  } else if (nsTool) {
+    // 智谱 GLM web_search / Kimi $web_search（注入原生工具，服务端执行）
+    out.push(nsTool);
+  }
   return out;
 }
 
@@ -1305,7 +1328,10 @@ function toOpenAIToolsFrom(list) {
 
 /** 文本协议用的说明书（给不支持 tools 的模型）。可选 query/cfg 用于动态子集精简 */
 function toTextManual(query, cfg) {
-  const list = filterForPrompt(query, cfg) || allTools();
+  // 非本地模型：用固定全集（固化工具列表），保证文本协议下 system 前缀可缓存；
+  // 本地弱模型上下文窄，仍按 query 精简子集省 token（本地模型通常不支持前缀缓存，且锚点已使前缀变动）。
+  const isLocal = !!(cfg && cfg.meta && cfg.meta.local);
+  const list = isLocal ? (filterForPrompt(query, cfg) || allTools()) : allTools();
   // 本地小模型：完整 schema 会压垮上下文且模型常抄不对结构。
   // 精简为「名称 + 描述 + 必填参数名」即可，让模型用极简 JSON 调用。
   // 弱模型模式（1.1.17）进一步：必填参数 + 有穷选项(Enum)参数都标注取值限制，直接缩小模型选择空间。

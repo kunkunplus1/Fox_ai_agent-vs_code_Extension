@@ -249,6 +249,28 @@
     onChange('kb-auto-dir', saveKb);
     onClick('kb-rebuild', () => post({ type: 'rebuildKb' }));
 
+    /* ---- 向量模型（语义检索）：与整理 AI 完全独立的一组控件 ---- */
+    onChange('kb-vec-enabled', saveKb);
+    onChange('kb-vec-provider', saveKb);
+    onChange('kb-vec-baseurl', saveKb);
+    onChange('kb-vec-model', saveKb);
+    onChange('kb-vec-dim', saveKb);
+    onChange('kb-vec-hybrid', saveKb);
+    onChange('kb-vec-key', (e) => {
+      const provider = document.getElementById('kb-vec-provider');
+      post({ type: 'setKbKey', scope: 'embed', provider: provider ? provider.value : '', value: e.target.value });
+    });
+    onClick('kb-vec-build', () => {
+      const st = document.getElementById('kb-vec-stat');
+      if (st) st.textContent = '正在构建向量索引…';
+      post({ type: 'buildVectors', config: collectKbForm() });
+    });
+    onClick('kb-vec-clear', () => {
+      const st = document.getElementById('kb-vec-stat');
+      if (st) st.textContent = '正在清空向量缓存…';
+      post({ type: 'clearVectors' });
+    });
+
     document.querySelectorAll('.install-btn').forEach(b => b.onclick = () => {
       const card = b.closest('.card');
       if (!card) return;
@@ -312,8 +334,30 @@
       autoEnabled: document.getElementById('kb-auto-enabled').checked,
       autoThreshold: document.getElementById('kb-auto-threshold').value,
       autoKeep: document.getElementById('kb-auto-keep').value,
-      autoDir: document.getElementById('kb-auto-dir').value
+      autoDir: document.getElementById('kb-auto-dir').value,
+      // 向量模型（语义检索）—— 与上面的整理 AI 互不影响
+      vecEnabled: val('kb-vec-enabled', 'checked', false),
+      vecProvider: val('kb-vec-provider', 'value', 'ollama'),
+      vecBaseurl: val('kb-vec-baseurl', 'value', ''),
+      vecModel: val('kb-vec-model', 'value', ''),
+      vecDim: val('kb-vec-dim', 'value', ''),
+      vecHybrid: val('kb-vec-hybrid', 'checked', true),
+      vecApiKey: val('kb-vec-key', 'value', '')
     };
+  }
+
+  /** 安全读取控件（元素缺失时返回默认值，避免旧面板缓存导致整表崩掉） */
+  function val(id, prop, def) {
+    const el = document.getElementById(id);
+    if (!el) return def;
+    const v = el[prop];
+    return v === undefined ? def : v;
+  }
+
+  /** 安全写入控件（元素缺失时静默跳过） */
+  function setVal(id, prop, v) {
+    const el = document.getElementById(id);
+    if (el) el[prop] = v;
   }
 
   // 仅保存知识库/自动压缩设置（不触发整理），用于勾选框与输入即时落盘，
@@ -796,14 +840,23 @@
         document.getElementById('kb-auto-keep').value = (m.autoKeep != null) ? m.autoKeep : '';
         document.getElementById('kb-auto-dir').value = m.autoDir || '';
         document.getElementById('kb-stat').textContent = m.stat || '';
-        document.getElementById('kb-log').textContent = m.defaultOutput ? ('默认输出目录：' + m.defaultOutput + '\\n') : '';
-        if (m.defaultAutoDir) document.getElementById('kb-log').textContent += '默认知识库-2 目录：' + m.defaultAutoDir + '\\n';
+        setVal('kb-vec-enabled', 'checked', !!m.vecEnabled);
+        setVal('kb-vec-provider', 'value', m.vecProvider || 'ollama');
+        setVal('kb-vec-baseurl', 'value', m.vecBaseurl || '');
+        setVal('kb-vec-model', 'value', m.vecModel || '');
+        setVal('kb-vec-dim', 'value', m.vecDim != null ? m.vecDim : 0);
+        setVal('kb-vec-hybrid', 'checked', m.vecHybrid !== false);
+        setVal('kb-vec-stat', 'textContent', m.vecStat || '');
+        document.getElementById('kb-log').textContent = m.defaultOutput ? ('默认输出目录：' + m.defaultOutput + '\n') : '';
+        if (m.defaultAutoDir) document.getElementById('kb-log').textContent += '默认知识库-2 目录：' + m.defaultAutoDir + '\n';
       } else if (m.type === 'kbLog') {
         const box = document.getElementById('kb-log');
         box.textContent += (box.textContent && !box.textContent.endsWith('\\n') ? '\\n' : '') + m.text;
         box.scrollTop = box.scrollHeight;
       } else if (m.type === 'kbStat') {
         document.getElementById('kb-stat').textContent = m.text || '';
+      } else if (m.type === 'kbVecStat') {
+        setVal('kb-vec-stat', 'textContent', m.text || '');
       } else if (m.type === 'audit') {
         document.getElementById('audit-log').textContent = m.text || '（暂无日志）';
       } else if (m.type === 'taskList') {

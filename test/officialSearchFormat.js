@@ -1,9 +1,11 @@
 /**
  * 验证 DeepSeek Responses 官方联网的请求格式：
- *  - 进入「仅官方搜索」模式时，tools 必须是 [{type:'web_search'}]（完整对象，不是字符串占位符）；
- *  - 绝不混入本地 function 工具（否则模型会挑 fetch/MCP 绕圈 → 大陆网络抓不到 → 断掉）；
+ *  - 进入「官方搜索」模式时，tools 必须是「官方 web_search + 除纯联网抓取类以外的全部本地能力工具」混合集
+ *    （完整对象，不是字符串占位符）；1.1.19 起不再只发 web_search，1.1.30 起由写死白名单改为反向过滤，
+ *    保证生图/识图/沙盒/技能/记忆/文件/终端/诊断等一切本地能力永不被剥（新增工具自动保留）。
+ *  - 仅排除与官方 web_search 重复的纯联网抓取类本地工具（mcp__* / web_fetch / fetch-url / browser 等）。
  *  - 首轮强制 tool_choice 触发，后续轮放开（auto）；
- *  - 用户明确要本地工具时解除；非时效性不进入。
+ *  - 用户明确要本地工具时解除；非时效性不进入（1.1.17 起：非时效追问交还完整本地工具集，不再永久粘连）。
  * 纯函数离线测试，不触碰网络 / vscode。
  */
 const assert = require('assert');
@@ -48,29 +50,70 @@ function check(name, cond) {
   pass++;
 }
 
-// 1) 时效性首轮（无助手回复）：只给官方 web_search，强制触发
+// 模拟 toOpenAITools(deepseek+responses) 的输出：含核心本地 file 工具 + 网络类本地工具（应被排除）
+const mockTools = [
+  { type: 'function', function: { name: 'read_file', description: '读', parameters: {} } },
+  { type: 'function', function: { name: 'write_file', description: '写', parameters: {} } },
+  { type: 'function', function: { name: 'run_command', description: '命令', parameters: {} } },
+  { type: 'function', function: { name: 'mcp__fetch__fetch-url', description: '抓', parameters: {} } },
+  { type: 'function', function: { name: 'create_plan_task', description: '计划', parameters: {} } }
+];
+
+// 1) 时效性首轮（无助手回复）：官方 web_search + 核心本地 file 工具，强制触发
 {
   const payload = [{ role: 'user', content: '今天B站热门排行前三是什么？' }];
-  const dec = computeOfficialSearch(payload, false);
+  const dec = computeOfficialSearch(payload, false, mockTools);
   check('timely-first: 进入官方搜索', dec !== null);
-  check('timely-first: tools 仅含 web_search', JSON.stringify(dec.tools) === JSON.stringify([{ type: 'web_search' }]));
+  check('timely-first: tools 含官方 web_search', dec.tools.some((t) => t.type === 'web_search'));
+  check('timely-first: 合并核心本地文件工具 (read_file/write_file)',
+    dec.tools.some((t) => (t.function && t.function.name) === 'read_file') &&
+    dec.tools.some((t) => (t.function && t.function.name) === 'write_file'));
+  check('timely-first: 排除网络类本地工具 (mcp__fetch 不在)',
+    !dec.tools.some((t) => (t.function && t.function.name) === 'mcp__fetch__fetch-url'));
   check('timely-first: 首轮强制 tool_choice', JSON.stringify(dec.toolChoice) === JSON.stringify({ type: 'web_search' }));
   check('timely-first: 标记已启动', dec.started === true);
 }
 
-// 2) 时效性后续轮（已有助手回复）：仍只给 web_search，但放开 tool_choice（=auto）
+// 2) 时效性后续轮（已有助手回复、本次仍时效）：仍含 web_search + 本地 file 工具，但放开 tool_choice（=auto）
 {
   const payload = [
     { role: 'user', content: '今天B站热门排行前三是什么？' },
     { role: 'assistant', content: '根据搜索结果…' },
-    { role: 'user', content: '再帮我确认下第二个' }
+    { role: 'user', content: '再帮我看看今天最新排行有没有变化' }
   ];
-  const dec = computeOfficialSearch(payload, true);
-  check('timely-follow: 仍只给 web_search', JSON.stringify(dec.tools) === JSON.stringify([{ type: 'web_search' }]));
+  const dec = computeOfficialSearch(payload, true, mockTools);
+  check('timely-follow: 含官方 web_search', dec.tools.some((t) => t.type === 'web_search'));
+  check('timely-follow: 仍合并核心本地文件工具 (read_file)',
+    dec.tools.some((t) => (t.function && t.function.name) === 'read_file'));
   check('timely-follow: toolChoice 放开(=auto)', dec.toolChoice === undefined);
 }
 
-// 3) 已启动会话 + 非时效性追问：保持连续（不退回本地工具）
+// 2.5) 时效性首轮：1.1.30 通用防掉工具——除纯联网抓取类外，其余本地能力工具一律保留
+{
+  const payload = [{ role: 'user', content: '今天最新的 AI 绘画趋势是什么，顺便帮我画一张' }];
+  const tools = mockTools.concat([
+    { type: 'function', function: { name: 'generate_image', description: '生图', parameters: {} } },
+    { type: 'function', function: { name: 'identify_image', description: '识图', parameters: {} } },
+    { type: 'function', function: { name: 'run_in_sandbox', description: '沙盒', parameters: {} } },
+    { type: 'function', function: { name: 'future_capability_x', description: '未来新增能力', parameters: {} } }
+  ]);
+  const dec = computeOfficialSearch(payload, false, tools);
+  check('genfix: 进入官方搜索', dec !== null);
+  check('genfix: 生图工具 generate_image 不再被剥',
+    dec.tools.some((t) => (t.function && t.function.name) === 'generate_image'));
+  check('genfix: 识图工具 identify_image 保留',
+    dec.tools.some((t) => (t.function && t.function.name) === 'identify_image'));
+  check('genfix: 沙盒工具 run_in_sandbox 保留',
+    dec.tools.some((t) => (t.function && t.function.name) === 'run_in_sandbox'));
+  check('genfix: 未来新增的本地能力工具自动保留（不再依赖白名单）',
+    dec.tools.some((t) => (t.function && t.function.name) === 'future_capability_x'));
+  check('genfix: 仍排除网络类本地工具 (mcp__fetch 不在)',
+    !dec.tools.some((t) => (t.function && t.function.name) === 'mcp__fetch__fetch-url'));
+  check('genfix: 原生 web_search 仅注入一次（无重复）',
+    dec.tools.filter((t) => t.type === 'web_search').length === 1);
+}
+
+// 3) 已启动会话 + 非时效性追问：1.1.17 修复后「解除官方搜索」，交还完整本地工具集（返回 null）
 {
   const payload = [
     { role: 'user', content: '今天B站热门排行前三是什么？' },
@@ -78,7 +121,7 @@ function check(name, cond) {
     { role: 'user', content: '帮我写一段总结文案' }
   ];
   const dec = computeOfficialSearch(payload, true);
-  check('continuity: 非时效追问仍保持 web_search', dec !== null && JSON.stringify(dec.tools) === JSON.stringify([{ type: 'web_search' }]));
+  check('continuity-release: 非时效追问恢复本地工具（返回 null）', dec === null);
 }
 
 // 4) 用户明确要本地工具：解除官方搜索（恢复本地工具，本函数返回 null 表示交给普通工具集）

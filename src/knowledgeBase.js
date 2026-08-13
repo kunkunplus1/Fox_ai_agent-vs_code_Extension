@@ -4,7 +4,21 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const org = require('./knowledgeOrganizer');
+const emb = require('./embedding');
+const { appendLog } = require('./log');
+
+// 向量层统一日志前缀：所有向量相关打点都带 [vec]，落盘 ~/.fox-ai/logs/kb.log
+function vlog(s) {
+  try { appendLog('kb', '[vec] ' + s); } catch (_) {}
+}
+function vlogErr(where, err) {
+  try {
+    const msg = err && err.stack ? String(err.stack).split('\n').slice(0, 4).join('\n') : String((err && err.message) || err);
+    appendLog('kb', '[vec][ERR] ' + where + ' :: ' + msg);
+  } catch (_) {}
+}
 
 const SUPPORTED_EXTS = new Set(['.md', '.txt', '.jsonl']);
 
@@ -20,6 +34,8 @@ function isEnabled() {
   if (cfg.enabled) return true;
   if (cfg.organize && cfg.organize.enabled) return true;
   if (cfg.autoSummarize && cfg.autoSummarize.enabled) return true;
+  // 只开了向量模型（语义检索）也算知识库启用
+  if (cfg.embedding && cfg.embedding.enabled) return true;
   return false;
 }
 
@@ -161,7 +177,8 @@ function pruneFileIndex() {
 
 /** 短时内存缓存：避免 retrieve 被频繁调用时反复遍历目录 */
 let lastCollect = { key: '', fileSigs: '', all: [], at: 0 };
-const COLLECT_CACHE_MS = 5000;
+// 知识库片段扫描不做长时缓存：用户删除源文件后必须立即在检索中生效，否则旧内容会被 BM25/向量残留注入（0=每次实时扫盘）
+const COLLECT_CACHE_MS = 0;
 
 function fileSignature(filePath) {
   try {
@@ -267,18 +284,33 @@ function collectChunks(sessionId) {
   const cfg = config();
   const organize = cfg.organize || {};
   let paths = [];
-  if (organize.enabled) {
-    const out = org.defaultOutputDir(organize.outputDir);
-    if (fs.existsSync(out)) paths.push(out);
-  } else if (Array.isArray(cfg.paths) && cfg.paths.length) {
+  // 整理产物目录：只要存在就纳入（无论「AI 整理」开关是否开启）。
+  // 关键修复：关掉整理后，残留的历史笔记仍在产物目录里，不应让向量检索突然失明
+  // ——否则会出现「没有整理模型情况下，向量内容没识别到」。
+  const out = org.defaultOutputDir(organize.outputDir);
+  if (fs.existsSync(out)) paths.push(out);
+  // 用户显式配置的源目录：始终纳入，是向量/BM25 的独立内容来源，不依赖整理开关。
+  if (Array.isArray(cfg.paths) && cfg.paths.length) {
     for (const p of cfg.paths.map(expandHome).filter((p) => p && fs.existsSync(p))) paths.push(p);
+  }
+  // 自定义向量检索路径（额外检索源）：关键词检索（BM25）与向量语义检索同时纳入；
+  // 留空则沿用默认位置（整理产物目录 + 已配置知识库目录 + 知识库-2），不影响「AI 整理」那部分。
+  if (cfg.vectorRetrievalPath && typeof cfg.vectorRetrievalPath === 'string') {
+    const vp = expandHome(cfg.vectorRetrievalPath.trim());
+    if (vp && fs.existsSync(vp)) paths.push(vp);
   }
   const as = cfg.autoSummarize || {};
   if (as.enabled) {
     const dir = org.defaultAutoSummaryDir(as.dir);
     if (fs.existsSync(dir)) paths.push(dir);
   }
-  if (!paths.length) return [];
+  if (!paths.length) {
+    vlog(
+      'collectChunks：无任何检索来源（未启用整理、未配置知识库源目录 paths、也无整理产物残留）→ 向量/BM25 均无内容可检索；' +
+        '请在「知识库」设置里配置源目录 paths，或保留整理产物目录'
+    );
+    return [];
+  }
 
   const chunkSize = Math.max(200, cfg.chunkSize || 800);
   const overlap = Math.min(chunkSize - 1, Math.floor(chunkSize * 0.1));
@@ -380,6 +412,10 @@ function invalidate() {
     const p = cachePath();
     if (fs.existsSync(p)) fs.unlinkSync(p);
   } catch (_) {}
+  // 重建索引时向量缓存一并作废（文本变了，旧向量不再对应）
+  try {
+    invalidateVectors();
+  } catch (_) {}
 }
 
 /**
@@ -457,18 +493,31 @@ function listKnowledgeFiles(sessionId) {
   const organize = cfg.organize || {};
   const as = cfg.autoSummarize || {};
   const files = [];
-  if (organize.enabled) {
-    const out = org.defaultOutputDir(organize.outputDir);
-    if (fs.existsSync(out)) {
-      for (const f of walkDir(out)) files.push({ file: f, source: path.basename(f), kb2: false });
-    }
-  } else if (Array.isArray(cfg.paths) && cfg.paths.length) {
+  // 整理产物目录：只要存在就纳入（无论「AI 整理」开关状态），避免「关整理后残留笔记从文件列表消失」
+  const out = org.defaultOutputDir(organize.outputDir);
+  if (fs.existsSync(out)) {
+    for (const f of walkDir(out)) files.push({ file: f, source: path.basename(f), kb2: false });
+  }
+  // 显式源目录：始终纳入，是独立于整理开关的知识库内容来源
+  if (Array.isArray(cfg.paths) && cfg.paths.length) {
     for (const p of cfg.paths.map(expandHome).filter((p) => p && fs.existsSync(p))) {
       const stat = fs.statSync(p);
       if (stat.isDirectory()) {
         for (const f of walkDir(p)) files.push({ file: f, source: path.relative(p, f), kb2: false });
       } else {
         files.push({ file: p, source: path.basename(p), kb2: false });
+      }
+    }
+  }
+  // 自定义向量检索路径（额外检索源）：与显式源目录同样处理，关键词与向量检索同时可用。
+  if (cfg.vectorRetrievalPath && typeof cfg.vectorRetrievalPath === 'string') {
+    const vp = expandHome(cfg.vectorRetrievalPath.trim());
+    if (vp && fs.existsSync(vp)) {
+      const stat = fs.statSync(vp);
+      if (stat.isDirectory()) {
+        for (const f of walkDir(vp)) files.push({ file: f, source: path.relative(vp, f), kb2: false });
+      } else {
+        files.push({ file: vp, source: path.basename(vp), kb2: false });
       }
     }
   }
@@ -489,7 +538,7 @@ function listKnowledgeFiles(sessionId) {
  * 整理模式下优先全量注入整理后目录；非整理模式用 BM25 打分取 Top-K。
  * @param {string} [sessionId] 当前会话 ID；自动摘要按会话隔离。
  */
-function retrieve(query, maxChars, sessionId) {
+function retrieve(query, maxChars, sessionId, opts) {
   const cfg = config();
   const organize = cfg.organize || {};
   const chunks = collectChunks(sessionId);
@@ -498,6 +547,21 @@ function retrieve(query, maxChars, sessionId) {
   const limit = Math.max(0, maxChars || 8000);
   const bm25Enabled = cfg.bm25Enabled !== false;
   const topK = Math.max(3, Math.min(30, cfg.topK || 10));
+  // 收集本次注入的知识来源（label + 绝对文件路径），供角标点击定位文件
+  const srcs = [];
+  const pushSrc = (c) => srcs.push({ label: c.source, file: c.file });
+  const flushSrcs = () => {
+    if (opts && typeof opts.onSources === 'function') {
+      const seen = new Set();
+      const uniq = [];
+      for (const s of srcs) {
+        if (seen.has(s.file)) continue;
+        seen.add(s.file);
+        uniq.push(s);
+      }
+      opts.onSources(uniq);
+    }
+  };
 
   // 整理模式：整理后的文件数量通常可控，直接按文件排序全量注入
   if (organize.enabled) {
@@ -509,6 +573,7 @@ function retrieve(query, maxChars, sessionId) {
       if (used + c.text.length > limit) break;
       out.push(`【来源：${c.source}】\n${c.text.trim()}`);
       used += c.text.length + 30;
+      pushSrc(c);
     }
     const as = cfg.autoSummarize || {};
     const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
@@ -519,8 +584,10 @@ function retrieve(query, maxChars, sessionId) {
         if (used + c.text.length > limit) break;
         out.push(`【来源：${c.source}（知识库-2）】\n${c.text.trim()}`);
         used += c.text.length + 30;
+        pushSrc(c);
       }
     }
+    flushSrcs();
     return out.join('\n\n---\n\n');
   }
 
@@ -532,6 +599,7 @@ function retrieve(query, maxChars, sessionId) {
     if (used + c.text.length > limit) break;
     out.push(`【来源：${c.source} · 相关度 ${c.score.toFixed(2)}】\n${c.text.trim()}`);
     used += c.text.length + 30;
+    pushSrc(c);
   }
   return out.join('\n\n---\n\n');
 }
@@ -582,13 +650,459 @@ function scoreLegacy(chunk, keywords) {
   return score;
 }
 
-function augmentSystemPrompt(basePrompt, query, sessionId) {
+/* ==========================================================================
+ * 向量检索层（1.1.33）
+ *
+ * 与「整理模型」彻底解耦，行为按用户约定的两种情况：
+ *   情况一 只配整理模型 → 本层完全不介入，检索与旧版一致（BM25 关键词 / 整理模式全量注入）。
+ *   情况二 整理 + 向量都配 → 向量模型先做语义召回（前置），排序结果再交给上层注入；
+ *          整理模型依旧负责产出笔记（在后），向量只是「读」它的产物，不改内容。
+ * 无论是否配置，UI 都有 foxAi.knowledgeBase.embedding.enabled 开关随时启停。
+ *
+ * 缓存策略：向量按「文本内容哈希」存于独立文件 kb-vector-store.json，每条带来源文件与签名；
+ *   换模型 / 换维度 → 签名变化 → 整体作废重建；来源文件被删/改动 → 该条向量自动作废（防复活），落盘有界（LRU 淘汰）。
+ * 失败策略：任何一步抛错都优雅回退到 BM25，绝不让知识库整体失效。
+ * ========================================================================== */
+
+const vecStore = new Map(); // textHash -> { vec:number[], text:string, file:string, sig:string, at:number }
+let vecSig = '';            // 当前向量签名（provider|model|dims|kind）
+let vecLoaded = false;
+const MAX_VEC_ENTRIES = 4000;         // 内存/磁盘最多缓存多少条向量
+const MAX_EMBED_PER_RETRIEVE = 300;   // 单次检索最多补算多少条，避免首次卡住
+
+function vecCachePath() {
+  // 向量模型的专属独立文件（自包含 text/file/sig，不依赖整理产物目录）
+  return path.join(getCacheDir(), 'kb-vector-store.json');
+}
+
+/** 安全取文件签名：文件不存在/异常返回空串（用于来源失效判定） */
+function fileSigOf(file) {
+  if (!file) return '';
+  try {
+    return fs.existsSync(file) ? fileSignature(file) : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/** 判断向量条目来源是否仍有效（文件存在且签名未变）；源被删或改动即失效 */
+function isSourceFresh(entry) {
+  if (!entry || !entry.file) return false;
+  const sig = fileSigOf(entry.file);
+  return !!sig && sig === entry.sig;
+}
+
+function textHash(text) {
+  return crypto.createHash('sha1').update(String(text), 'utf8').digest('hex').slice(0, 24);
+}
+
+function embedSignature(e) {
+  return [e.pid || '', e.model || '', e.dimensions || 0, e.kind || ''].join('|');
+}
+
+function loadVecCache(sig) {
+  if (vecLoaded && vecSig === sig) return;
+  vecStore.clear();
+  vecSig = sig;
+  vecLoaded = true;
+  try {
+    const p = vecCachePath();
+    if (!fs.existsSync(p)) return;
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!data || data.sig !== sig || !Array.isArray(data.items)) {
+      // 换了模型/维度/损坏 → 整体作废旧缓存文件
+      try { fs.unlinkSync(p); } catch (_) {}
+      return;
+    }
+    for (const it of data.items) {
+      if (!it || !it.k || !Array.isArray(it.v) || !it.v.length) continue;
+      vecStore.set(it.k, { vec: it.v, text: it.t || '', file: it.f || '', sig: it.s || '', at: it.at || 0 });
+      if (vecStore.size >= MAX_VEC_ENTRIES) break;
+    }
+    // 加载后立即剔除「来源已删除/变更」的脏向量（如旧版遗留的 file 空条目），防止复活旧内容
+    pruneStaleVectors();
+  } catch (_) {}
+}
+
+function saveVecCache() {
+  try {
+    fs.mkdirSync(getCacheDir(), { recursive: true });
+    const items = Array.from(vecStore.entries())
+      .map(([k, v]) => ({ k, v: v.vec, t: v.text || '', f: v.file || '', s: v.sig || '', at: v.at || 0 }))
+      .sort((a, b) => b.at - a.at)
+      .slice(0, MAX_VEC_ENTRIES);
+    fs.writeFileSync(vecCachePath(), JSON.stringify({ sig: vecSig, items }), 'utf8');
+  } catch (_) {}
+}
+
+function pruneVecStore() {
+  if (vecStore.size <= MAX_VEC_ENTRIES) return;
+  const sorted = Array.from(vecStore.entries()).sort((a, b) => (a[1].at || 0) - (b[1].at || 0));
+  const target = Math.floor(MAX_VEC_ENTRIES * 0.8);
+  for (let i = 0; i < sorted.length - target; i++) vecStore.delete(sorted[i][0]);
+}
+
+/** 剔除「来源文件已删除 / 已变更」的向量条目：防止删了知识库内容后旧向量被复活注入 */
+function pruneStaleVectors() {
+  let removed = 0;
+  for (const [k, v] of vecStore) {
+    if (!isSourceFresh(v)) {
+      vecStore.delete(k);
+      removed++;
+    }
+  }
+  if (removed) {
+    vlog(`pruneStaleVectors：剔除 ${removed} 条来源已失效（文件删除/变更）的向量`);
+    try {
+      fs.unlinkSync(vecCachePath());
+    } catch (_) {}
+  }
+  return removed;
+}
+
+function invalidateVectors() {
+  vecStore.clear();
+  vecSig = '';
+  vecLoaded = false;
+  try {
+    const p = vecCachePath();
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+    // 兼容旧文件名
+    const old = path.join(getCacheDir(), 'kb-vec.json');
+    if (fs.existsSync(old)) fs.unlinkSync(old);
+  } catch (_) {}
+}
+
+/** 手动清空向量缓存（UI 按钮/命令触发）：删除知识库内容后用于强制重置任何顽固残留 */
+function clearVectorCache() {
+  vecStore.clear();
+  vecSig = '';
+  vecLoaded = false;
+  try {
+    const p = vecCachePath();
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+    const old = path.join(getCacheDir(), 'kb-vec.json');
+    if (fs.existsSync(old)) fs.unlinkSync(old);
+  } catch (_) {}
+  vlog('clearVectorCache：已清空向量缓存文件');
+  return { ok: true };
+}
+
+/** 解析向量模型配置；未启用 / 配不全返回 null（上层直接走 BM25） */
+async function resolveVectorConfig(context) {
+  try {
+    const e = await emb.resolveEmbeddingConfig(context);
+    if (!e.enabled) {
+      vlog('resolveVectorConfig：向量检索开关未开启（embedding.enabled=false）→ 走 BM25');
+      return null;
+    }
+    if (e.multimodal) {
+      vlog(
+        'resolveVectorConfig：⚠️ 模型 ' + e.model + ' 是多模态/视觉语言向量模型，不支持 OpenAI 兼容 /v1/embeddings' +
+          '（会返回 400 url error）；纯文本知识库请改用 text-embedding-v4 或 qwen3-embedding → 回退 BM25'
+      );
+      return null;
+    }
+    if (!emb.isEmbedUsable(e)) {
+      vlog(
+        'resolveVectorConfig：向量配置不可用 → 走 BM25。' +
+          `enabled=${e.enabled} kind=${e.kind} baseUrl=${e.baseUrl || '(空)'} model=${e.model || '(空)'} provider=${e.pid}` +
+          (e.noOfficialApi ? ' [该厂商官方暂无 embedding 接口，需自填兼容端点]' : '')
+      );
+      return null;
+    }
+    vlog(
+      `resolveVectorConfig：向量配置可用 → ${e.label}/${e.model}（${e.kind === 'ollama' ? 'Ollama 原生' : 'OpenAI 兼容'}）` +
+        ` baseUrl=${e.baseUrl} dims=${e.dimensions || '默认'} batch=${e.batchSize} hybrid=${e.hybrid}`
+    );
+    return e;
+  } catch (err) {
+    vlogErr('resolveVectorConfig 解析异常', err);
+    return null;
+  }
+}
+
+/** 把缺失向量的片段补算出来（受预算限制），返回本次实际补算条数 */
+async function ensureVectors(chunks, e, opts) {
+  const o = opts || {};
+  const budget = Math.max(0, o.budget == null ? MAX_EMBED_PER_RETRIEVE : o.budget);
+  if (!budget) return 0;
+  pruneStaleVectors(); // 先清掉已删/已改动来源的旧向量，避免复活
+  const missing = [];
+  const seen = new Set();
+  for (const c of chunks) {
+    const text = String(c.text || '').trim();
+    if (!text) continue;
+    const k = textHash(text);
+    if (vecStore.has(k) || seen.has(k)) continue;
+    seen.add(k);
+    missing.push({ k, text, file: c.file || '', sig: fileSigOf(c.file) });
+    if (missing.length >= budget) break;
+  }
+  if (!missing.length) return 0;
+  vlog(`ensureVectors：需补算 ${missing.length} 条向量（预算 ${budget}）；签名=${embedSignature(e)}`);
+  let vecs;
+  try {
+    vecs = await emb.embedTexts(missing.map((m) => m.text), e, o);
+  } catch (err) {
+    vlogErr('ensureVectors 向量化失败', err);
+    throw err;
+  }
+  const now = Date.now();
+  for (let i = 0; i < missing.length && i < vecs.length; i++) {
+    vecStore.set(missing[i].k, { vec: vecs[i], text: missing[i].text, file: missing[i].file, sig: missing[i].sig, at: now });
+  }
+  pruneVecStore();
+  saveVecCache();
+  vlog(`ensureVectors：实际补算 ${Math.min(missing.length, vecs.length)} 条（维度 ${vecs[0] ? vecs[0].length : '?'}，缓存落盘 ${vecStore.size} 条）`);
+  return Math.min(missing.length, vecs.length);
+}
+
+/**
+ * 语义排序（可与 BM25 做 RRF 混排）。
+ * @returns {Promise<{list:Array, covered:number, total:number}>}
+ */
+async function rankChunksSemantic(chunks, query, e, topK, hybrid, opts) {
+  vlog(`rankChunksSemantic：入参 chunks=${chunks.length} topK=${topK} hybrid=${hybrid} queryLen=${String(query || '').length}`);
+  const qVecs = await emb.embedTexts([String(query || '').slice(0, 4000)], e, opts);
+  const qVec = qVecs && qVecs[0];
+  if (!qVec) throw new Error('查询向量为空');
+  vlog(`rankChunksSemantic：查询向量维度=${qVec.length}`);
+
+  await ensureVectors(chunks, e, opts);
+
+  const semantic = [];
+  let covered = 0;
+  const stale = [];
+  for (const c of chunks) {
+    const k = textHash(String(c.text || '').trim());
+    const entry = vecStore.get(k);
+    if (!entry) continue;
+    // 来源失效（文件已删/已改动）：该向量作废，绝不把旧内容注入主控
+    if (!isSourceFresh(entry)) {
+      stale.push(k);
+      continue;
+    }
+    covered++;
+    entry.at = Date.now();
+    semantic.push({ text: c.text, source: c.source, file: c.file, score: emb.cosineSimilarity(qVec, entry.vec) });
+  }
+  if (stale.length) {
+    for (const k of stale) vecStore.delete(k);
+    saveVecCache();
+    vlog(`rankChunksSemantic：剔除 ${stale.length} 条来源失效的向量（源内容已被删除/修改）`);
+  }
+  semantic.sort((a, b) => b.score - a.score);
+
+  if (!hybrid) {
+    return { list: dedupTop(semantic, topK), covered, total: chunks.length };
+  }
+
+  // RRF（Reciprocal Rank Fusion）：只按排名融合，无需为两路打分做量纲对齐
+  const K = 60;
+  const fused = new Map();
+  const keyOf = (c) => c.file + '#' + textHash(String(c.text || '').trim());
+  semantic.forEach((c, i) => {
+    const k = keyOf(c);
+    fused.set(k, { text: c.text, source: c.source, file: c.file, score: 1 / (K + i + 1), sem: c.score });
+  });
+  let lexical = [];
+  try {
+    lexical = rankChunks(chunks, query, config().bm25Enabled !== false, Math.max(topK, 20));
+  } catch (_) {
+    lexical = [];
+  }
+  lexical.forEach((c, i) => {
+    const k = keyOf(c);
+    const prev = fused.get(k);
+    if (prev) prev.score += 1 / (K + i + 1);
+    else fused.set(k, { text: c.text, source: c.source, file: c.file, score: 1 / (K + i + 1), sem: 0 });
+  });
+  const merged = Array.from(fused.values()).sort((a, b) => b.score - a.score);
+  return { list: dedupTop(merged, topK), covered, total: chunks.length };
+}
+
+function dedupTop(list, topK) {
+  const seen = new Set();
+  const out = [];
+  for (const c of list) {
+    if (out.length >= topK) break;
+    const key = c.file + ':' + String(c.text || '').slice(0, 80);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * 异步检索：向量模型可用时走语义召回（前置），否则完全等价于同步 retrieve。
+ * @param {string} query 用户提问
+ * @param {number} maxChars 注入上限
+ * @param {string} [sessionId]
+ * @param {{context?:object, signal?:AbortSignal, onLog?:Function}} [opts]
+ */
+async function retrieveAsync(query, maxChars, sessionId, opts) {
+  const o = opts || {};
+  // 收集本次注入的知识来源（label + 绝对文件路径），供角标点击定位文件
+  const srcs = [];
+  const pushSrc = (c) => srcs.push({ label: c.source, file: c.file });
+  const flushSrcs = () => {
+    if (o && typeof o.onSources === 'function') {
+      const seen = new Set();
+      const uniq = [];
+      for (const s of srcs) {
+        if (seen.has(s.file)) continue;
+        seen.add(s.file);
+        uniq.push(s);
+      }
+      o.onSources(uniq);
+    }
+  };
+  vlog(`retrieveAsync：入口 query="${String(query || '').slice(0, 60)}" maxChars=${maxChars} sessionId=${sessionId || '(无)'} context=${o.context ? '有' : '无'}`);
+  const e = await resolveVectorConfig(o.context);
+  if (!e) {
+    vlog('retrieveAsync：向量配置不可用 → 走同步 BM25 retrieve');
+    return retrieve(query, maxChars, sessionId, o);
+  }
+
+  const cfg = config();
+  const organize = cfg.organize || {};
+  const chunks = collectChunks(sessionId);
+  if (!chunks.length) {
+    vlog('retrieveAsync：无知识库片段 → 返回空');
+    return '';
+  }
+
+  const limit = Math.max(0, maxChars || 8000);
+  const topK = Math.max(3, Math.min(30, cfg.topK || 10));
+
+  // 候选池：整理模式只看「整理后的产物」+ 知识库-2；否则全部片段
+  let pool = chunks;
+  if (organize.enabled) {
+    const outDir = org.defaultOutputDir(organize.outputDir);
+    const as = cfg.autoSummarize || {};
+    const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
+    pool = chunks.filter(
+      (c) => c.file.startsWith(outDir + path.sep) || (kb2Dir && c.file.startsWith(kb2Dir + path.sep))
+    );
+    if (!pool.length) pool = chunks;
+  }
+  vlog(`retrieveAsync：候选池 ${pool.length}/${chunks.length} 片段（整理模式=${!!organize.enabled}）`);
+
+  loadVecCache(embedSignature(e));
+
+  try {
+    const started = Date.now();
+    const { list, covered, total } = await rankChunksSemantic(pool, query, e, topK, e.hybrid !== false, o);
+    if (!list.length) {
+      vlog('retrieveAsync：语义召回为空 → 回退 BM25');
+      return retrieve(query, maxChars, sessionId, o);
+    }
+    const out = [];
+    let used = 0;
+    for (const c of list) {
+      if (used + c.text.length > limit) break;
+      const rel = typeof c.sem === 'number' && c.sem ? c.sem : c.score;
+      out.push(`【来源：${c.source} · 语义相关度 ${Number(rel).toFixed(2)}】\n${c.text.trim()}`);
+      used += c.text.length + 30;
+      pushSrc(c);
+    }
+    const stat =
+      `🧭 向量检索：${e.label} / ${e.model}（${e.kind === 'ollama' ? 'Ollama 原生' : 'OpenAI 兼容'}）` +
+      `，候选 ${total} 片段、已向量化 ${covered}，命中 ${out.length} 段，耗时 ${Date.now() - started}ms` +
+      (e.hybrid !== false ? '，混排 BM25' : '');
+    vlog(stat);
+    if (o.onLog) o.onLog(stat);
+    if (!out.length) return retrieve(query, maxChars, sessionId, o);
+    flushSrcs();
+    return out.join('\n\n---\n\n');
+  } catch (err) {
+    const msg = String((err && err.message) || err).split('\n')[0];
+    const full = err && err.stack ? String(err.stack).split('\n').slice(0, 5).join('\n') : msg;
+    console.warn('[fox-ai] 向量检索失败，已回退关键词检索：' + msg);
+    vlog('retrieveAsync 失败已回退 BM25：' + full);
+    if (o.onLog) o.onLog(`⚠️ 向量检索失败，已回退关键词检索：${msg}`);
+    return retrieve(query, maxChars, sessionId, o);
+  }
+}
+
+/**
+ * 主动构建全量向量索引（UI「构建向量索引」按钮用）。
+ * @returns {Promise<{ok:boolean, added:number, total:number, reason?:string}>}
+ */
+async function buildVectors(sessionId, opts) {
+  const o = opts || {};
+  vlog(`buildVectors：入口 sessionId=${sessionId || '(无)'} context=${o.context ? '有' : '无'}`);
+  const e = await resolveVectorConfig(o.context);
+  if (!e) {
+    let reason = '向量模型未启用或未配置完整（需 baseUrl + 模型名）';
+    try {
+      const raw = await emb.resolveEmbeddingConfig(o.context);
+      if (raw && raw.multimodal) {
+        reason =
+          `模型 ${raw.model} 是多模态(视觉语言)向量模型，不支持 OpenAI 兼容 /v1/embeddings（会 400 url error）；` +
+          '纯文本知识库请改用 text-embedding-v4 或 qwen3-embedding';
+      }
+    } catch (_) {}
+    vlog('buildVectors：配置不可用 → ' + reason);
+    return { ok: false, added: 0, total: 0, reason };
+  }
+  const chunks = collectChunks(sessionId);
+  if (!chunks.length) {
+    vlog('buildVectors：知识库暂无可索引内容');
+    return { ok: false, added: 0, total: 0, reason: '知识库暂无可索引内容' };
+  }
+  vlog(`buildVectors：开始全量构建，候选 ${chunks.length} 片段，模型 ${e.label}/${e.model}`);
+  loadVecCache(embedSignature(e));
+  try {
+    const added = await ensureVectors(chunks, e, Object.assign({}, o, { budget: MAX_VEC_ENTRIES }));
+    vlog(`buildVectors：完成，新增 ${added}/${chunks.length} 条向量`);
+    if (o.onLog) o.onLog(`✅ 向量索引构建完成：新增 ${added}/${chunks.length} 条`);
+    return { ok: true, added, total: chunks.length };
+  } catch (err) {
+    vlogErr('buildVectors 构建失败', err);
+    if (o.onLog) o.onLog(`⚠️ 向量索引构建失败：${String((err && err.message) || err).split('\n')[0]}`);
+    return { ok: false, added: 0, total: chunks.length, reason: String((err && err.message) || err).split('\n')[0] };
+  }
+}
+
+/** 向量索引状态（供 UI 展示） */
+function vectorStats() {
+  return { entries: vecStore.size, sig: vecSig, loaded: vecLoaded };
+}
+
+/**
+ * 异步版系统提示词增强：向量模型启用时走语义召回，否则与同步版行为一致。
+ */
+async function augmentSystemPromptAsync(basePrompt, query, sessionId, opts) {
+  if (!isEnabled()) return basePrompt;
+  vlog(`augmentSystemPromptAsync：入口（${opts && opts.context ? '有 context' : '无 context'}）query="${String(query || '').slice(0, 50)}"`);
+  const cfg = config();
+  let context = '';
+  try {
+    context = await retrieveAsync(query, cfg.maxChars || 8000, sessionId, opts);
+  } catch (err) {
+    vlogErr('augmentSystemPromptAsync 向量检索异常，回退同步', err);
+    context = retrieve(query, cfg.maxChars || 8000, sessionId, opts);
+  }
+  const files = listKnowledgeFiles(sessionId);
+  vlog(`augmentSystemPromptAsync：注入上下文长度 ${context.length}，文件数 ${files.length}`);
+  if (!context.trim() && !files.length) return basePrompt;
+  return renderInjected(basePrompt, context, files);
+}
+
+function augmentSystemPrompt(basePrompt, query, sessionId, opts) {
   if (!isEnabled()) return basePrompt;
   const cfg = config();
-  const context = retrieve(query, cfg.maxChars || 8000, sessionId);
+  const context = retrieve(query, cfg.maxChars || 8000, sessionId, opts);
   const files = listKnowledgeFiles(sessionId);
   if (!context.trim() && !files.length) return basePrompt;
+  return renderInjected(basePrompt, context, files);
+}
 
+/** 拼装注入文本（同步 / 异步两条路径共用，保证格式完全一致） */
+function renderInjected(basePrompt, context, files) {
   const fileList = files.map((f) => (f.kb2 ? `${f.source}(知识库-2)` : f.source)).join('、');
   let injected = `${basePrompt}\n\n【本地知识库参考】\n`;
   injected += `当前可用的知识库文件：${fileList}\n\n`;
@@ -599,5 +1113,9 @@ function augmentSystemPrompt(basePrompt, query, sessionId) {
 
 module.exports = {
   isEnabled, retrieve, augmentSystemPrompt, invalidate, stats, listKnowledgeFiles,
-  listOtherSessionSummaries, requestSessionAccess, clearSessionAccess
+  listOtherSessionSummaries, requestSessionAccess, clearSessionAccess,
+  // 向量检索（1.1.33）
+  retrieveAsync, augmentSystemPromptAsync, buildVectors, vectorStats, invalidateVectors, clearVectorCache,
+  // 纯函数导出，供单测
+  embedSignature, textHash, dedupTop
 };

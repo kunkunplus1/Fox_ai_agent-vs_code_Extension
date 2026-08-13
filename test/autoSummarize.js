@@ -118,12 +118,18 @@ function makeMessages(n, contentLen) {
       systemPrompt: ''
     };
     let usageAfter = null;
-    const agent = new AgentSession({ context, cfg, messages, ui: { contextUsage: (d) => { usageAfter = d; } } });
+    const steps = [];
+    const agent = new AgentSession({ context, cfg, messages, ui: { contextUsage: (d) => { usageAfter = d; }, step: (s) => steps.push(s) } });
     await agent._maybeAutoCompress('test', '');
     check('usage 超阈值时，即使可压缩消息少于 4 条也触发压缩', () => assert.ok(summarized !== null && summarized.length === 2));
     check('压缩后 invalidate 知识库缓存', () => assert.strictEqual(invalidated, true));
     check('messages 被就地裁剪为 6 条', () => assert.strictEqual(messages.length, 6));
     check('压缩后 emit contextUsage 刷新面板', () => assert.ok(usageAfter && usageAfter.raw && usageAfter.raw.historyLength === 6));
+    check('压缩提示以 system_status 步骤 emit（不进 notice）', () => {
+      const sys = steps.filter(s => s.kind === 'system_status');
+      assert.ok(sys.length >= 2, '应至少包含开始+完成两个状态步骤，实际 ' + sys.length);
+      assert.ok(sys.every(s => s.stepType === 'system_status' && s.group === 'info' && s.id && s.title && s.detail), 'system_status 步骤字段完整');
+    });
   }
 
   // 2) 未超阈值时不触发压缩
@@ -224,6 +230,38 @@ function makeMessages(n, contentLen) {
     const agent = new AgentSession({ context, cfg, messages: messages.slice(), ui: {} });
     await agent._maybeAutoCompress('test', '');
     check('autoSummarize 关闭时不触发', () => assert.strictEqual(summarized, null));
+  }
+
+  // 6) 已超阈值但无可压缩消息时，emit system_status 步骤提示（不再进 notice）
+  {
+    summarized = null;
+    invalidated = false;
+    const messages = makeMessages(8, 6000);
+    const cfg = {
+      contextWindow: 1000,
+      autoSummarize: { enabled: true, threshold: 0.6, keepRecent: 8 },
+      agentEnabled: true,
+      planAndExecute: { enabled: false },
+      toolProtocol: 'native',
+      maxSteps: 25,
+      temperature: 0.3,
+      maxTokens: 2048,
+      timeout: 30000,
+      maxHistory: 20,
+      maxToolOutput: 8000,
+      maxMessageBytes: 1024 * 1024,
+      systemPrompt: ''
+    };
+    const steps = [];
+    const notices = [];
+    const agent = new AgentSession({ context, cfg, messages: messages.slice(), ui: { step: (s) => steps.push(s), notice: (n) => notices.push(n) } });
+    await agent._maybeAutoCompress('test', '');
+    check('无可压缩消息时以 system_status 步骤提示', () => {
+      const sys = steps.filter(s => s.kind === 'system_status');
+      assert.strictEqual(sys.length, 1, '应产生 1 个 system_status 步骤');
+      assert.ok(sys[0].detail.includes('固定开销'), '详情说明固定开销');
+    });
+    check('压缩提示不再走 notice 通道', () => assert.strictEqual(notices.filter(n => n.kind === 'compress' || /上下文/.test(n.text || '')).length, 0));
   }
 
   console.log(`\n结果：通过 ${pass} / 失败 ${fail}`);
