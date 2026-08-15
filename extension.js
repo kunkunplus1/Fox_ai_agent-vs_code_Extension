@@ -15,6 +15,7 @@ const term = require('./src/tools/terminal');
 const undo = require('./src/undo');
 const { SessionManager } = require('./src/sessions');
 const { openEnvPanel } = require('./src/envView');
+const { openWorkchainPanel } = require('./src/workchainView');
 const extBridge = require('./src/extensionBridge');
 const runtimes = require('./src/runtimes');
 const knowledgeOrganizer = require('./src/knowledgeOrganizer');
@@ -1095,6 +1096,7 @@ function activate(context) {
   /* ---------------- 运行环境与插件管理 ---------------- */
   reg('foxAi.openEnvManager', () => openEnvPanel(context, chatProvider));
   reg('foxAi.openTaskManager', () => openEnvPanel(context, chatProvider, 'tasks'));
+  reg('foxAi.openWorkchain', () => openWorkchainPanel(context, chatProvider));
   reg('foxAi.callExtensionCommand', async () => {
     const items = extBridge.commandCatalog()
       .filter((c) => !c.builtin)

@@ -153,9 +153,11 @@ async function resolve(context) {
       contextLines: c.get('inlineCompletion.contextLines', 60),
       suffixLines: c.get('inlineCompletion.suffixLines', 30),
       fimStrategy: c.get('inlineCompletion.fimStrategy', 'auto'),
+      fimEndpoint: c.get('inlineCompletion.fimEndpoint', false),
       useProjectContext: c.get('inlineCompletion.useProjectContext', true),
       projectContextChars: c.get('inlineCompletion.projectContextChars', 1000),
       maxFileLines: c.get('inlineCompletion.maxFileLines', 8000),
+      maxContextChars: c.get('inlineCompletion.maxContextChars', 6000),
       debounce: c.get('inlineCompletion.debounce', 350)
     },
     visionMode: c.get('visionMode', 'auto'),

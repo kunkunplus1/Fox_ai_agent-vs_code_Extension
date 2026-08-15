@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -33,7 +33,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js && node test/staticPrefix.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -272,6 +272,12 @@
         "icon": "$(tasklist)"
       },
       {
+        "command": "foxAi.openWorkchain",
+        "title": "打开工作链",
+        "category": "狐狸 AI",
+        "icon": "$(list-tree)"
+      },
+      {
         "command": "foxAi.listMcpConnectors",
         "title": "%foxai.n82%",
         "category": "%foxai.n83%"
@@ -439,6 +445,11 @@
           "command": "foxAi.openEnvManager",
           "when": "view == foxAi.sessions",
           "group": "navigation@3"
+        },
+        {
+          "command": "foxAi.openWorkchain",
+          "when": "view == foxAi.sessions",
+          "group": "navigation@3.5"
         },
         {
           "command": "foxAi.setSessionStorage",
@@ -1531,6 +1542,18 @@
             "default": true,
             "order": 1,
             "markdownDescription": "缓存预热（默认开启）：新会话首轮先发一个只含系统提示词+工具定义、max_tokens=1 的请求，把「铁打前缀」提前灌进服务商缓存，使随后的真实请求直接命中前缀缓存。首轮会产生一次额外小额调用，但后续长上下文请求可显著降低费用。"
+          },
+          "foxAi.cacheDedup.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 2,
+            "markdownDescription": "只读工具结果会话内去重（默认开启）：同一会话里如果模型重复 read_file / view 同一个未改动的文件，第二次起不再把完整内容重新塞进上下文，而是回一个极短的「已在上方读过，见第 N 次」占位，从而缩小每轮不可缓存的增量、拉高前缀缓存命中率。文件被改动（mtime/size 变化）会视为新调用、绝不返回旧内容。关闭则退化为原行为。"
+          },
+          "foxAi.stableContext.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 3,
+            "markdownDescription": "稳定上下文首轮注入（默认开启）：把【用户技能】【项目根规则】【项目结构】【项目任务】【模式人格】【长期记忆】这些跨轮字节稳定的内容，只在首轮注入一次并烤回源历史，之后随历史沉淀进 KV 缓存、每轮命中，不再每轮重烤成 miss（这正是把稳定块前移到 system 前缀想解决的痛点，但前移会放大系统前缀、在缓存预算压力下挤占历史单元导致命中率回退，故改回此方案）。用独立哨兵【狐狸AI·稳定上下文】包裹防重复。关闭则退化为每轮注入（旧行为），功能不丢。"
           }
         }
       },
@@ -1845,7 +1868,7 @@
           },
           "foxAi.agent.maxToolOutput": {
             "type": "number",
-            "default": 8000,
+            "default": 4000,
             "description": "%foxai.n244%"
           },
           "foxAi.agent.maxMessageBytes": {
@@ -1964,6 +1987,12 @@
             ],
             "description": "%foxai.n270%"
           },
+          "foxAi.inlineCompletion.fimEndpoint": {
+            "type": "boolean",
+            "default": false,
+            "order": 6.5,
+            "description": "%foxai.n296%"
+          },
           "foxAi.inlineCompletion.useProjectContext": {
             "type": "boolean",
             "default": true,
@@ -1981,6 +2010,12 @@
             "default": 8000,
             "order": 9,
             "description": "超过此行数的大文件将跳过行内补全（Copilot 也会对超大文件限流），避免无意义的高频请求与 token 消耗。"
+          },
+          "foxAi.inlineCompletion.maxContextChars": {
+            "type": "number",
+            "default": 6000,
+            "order": 9.5,
+            "description": "补全时前后文（不含项目上下文）的最大字符数，超出时前文优先保留、后文裁剪，用于控制每次补全请求的 token 消耗。"
           },
           "foxAi.inlineCompletion.debounce": {
             "type": "number",

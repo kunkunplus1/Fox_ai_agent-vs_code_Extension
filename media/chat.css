@@ -792,6 +792,26 @@ body[data-vscode-theme-kind="vscode-dark"] .msg.assistant .bubble {
   font-style: italic;
 }
 
+.artifact-card { border-left-color: var(--vscode-charts-green, #388a34); border-color: var(--vscode-charts-green, #388a34); background: linear-gradient(180deg, rgba(56, 138, 52, .06), transparent); }
+.artifact-card .review-head { color: var(--vscode-charts-green, #388a34); }
+.artifact-files { display: flex; flex-direction: column; gap: 6px; }
+.artifact-file {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 9px; border-radius: var(--fox-rad-sm);
+  background: rgba(128, 128, 128, .08);
+  cursor: pointer; transition: background .12s;
+}
+.artifact-file:hover, .artifact-file:focus { background: rgba(128, 128, 128, .16); outline: none; }
+.artifact-op { flex: 0 0 auto; font-size: 11.5px; opacity: .85; }
+.artifact-file code {
+  font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: transparent; padding: 0; color: var(--vscode-textLink-foreground, #3794ff);
+}
+.artifact-diff { flex: 0 0 auto; margin-left: auto; font-size: 11px; opacity: .7; font-variant-numeric: tabular-nums; }
+.artifact-stats { margin-top: 8px; font-size: 11.5px; opacity: .78; }
+.artifact-actions { margin-top: 10px; display: flex; gap: 9px; align-items: center; }
+.artifact-actions button:disabled { opacity: .6; cursor: not-allowed; filter: grayscale(.3); }
+
 .plan-pending {
   border: 1px solid var(--fox-accent);
   border-radius: var(--fox-rad);
@@ -1275,5 +1295,13 @@ body[data-vscode-theme-kind="vscode-dark"] .reasoning-body { background: rgba(12
   }
   .welcome::before { animation: none; }
   .welcome .fox { animation: none; }
+}
+
+/* ================= 主对话不再内嵌工作链面板 =================
+   工作链已独立成「狐狸 AI · 工作链」页面（workchain.html / body.workchain-only）。
+   主对话（body.main-chat）里把右侧工作链面板隐藏，避免与独立页面重复显示。
+   独立页面用 body.workchain-only，不受此规则影响。 */
+body.main-chat #workchainPanel {
+  display: none !important;
 }
 

@@ -4,7 +4,7 @@
  * 本地弱模型辅助模式 · 单元/集成测试（1.1.17）：
  *  - weakModel.validateToolArgs：类型/必填/枚举/未知参数 校验
  *  - weakModel.buildAnchor：核心任务锚点截断
- *  - buildSystemPrompt：弱模型文本分支注入「⚓ 核心任务」头尾锚点
+ *  - buildSystemPrompt：弱模型文本分支【不再】注入「⚓ 核心任务」锚点（已移入动态附录，保 system 静态以最大化前缀缓存命中率）
  *  - toTextManual 本地分支：Enum 取值限制标注
  *  - TEXT_TOOL_GRAMMAR：约束解码语法结构正确
  */
@@ -78,11 +78,15 @@ const longQ = 'a'.repeat(500);
 check('超长 query 被截断到 ≤200', weakModel.buildAnchor(longQ).length <= 200);
 check('空白被压缩', weakModel.buildAnchor('  读 取  文件  ') === '读 取 文件');
 
-console.log('[weakModelMode] 3) buildSystemPrompt 锚点注入（弱模型文本分支）');
+console.log('[weakModelMode] 3) buildSystemPrompt 锚点不进 system（缓存不变量）');
 const prompt = agent.buildSystemPrompt({ meta: { local: true }, systemPrompt: '' }, 'ENV', 'text', '请帮我读取 a.txt 这个文件');
-check('本地文本分支含 ⚓ 头锚点', prompt.includes('⚓ 核心任务'));
-check('锚点重复出现在尾部', (prompt.match(/⚓/g) || []).length >= 2);
-check('锚点含用户原始诉求', prompt.includes('读取 a.txt'));
+// 锚点由 queryText 派生，若写进 system 前缀会让 system 每轮都变 → 前缀缓存全失效。
+// 1.1.16 起锚点改为注入动态附录（最后一条 user 消息头部），system 必须 100% 静态。
+check('本地文本分支不含 ⚓ 锚点（已移出 system）', !prompt.includes('⚓ 核心任务'));
+check('system 不含用户原始诉求（避免前缀随 query 变）', !prompt.includes('读取 a.txt'));
+// 锚点文本本身仍由 weakModel.buildAnchor 产出，供主循环注入动态附录使用
+const anchor = weakModel.buildAnchor('请帮我读取 a.txt 这个文件');
+check('buildAnchor 产出核心任务锚点', !!anchor && anchor.includes('读取 a.txt'));
 
 console.log('[weakModelMode] 4) toTextManual 本地分支 Enum 标注');
 const manual = tools.toTextManual('', { meta: { local: true } });

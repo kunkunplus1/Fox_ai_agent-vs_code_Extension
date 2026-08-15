@@ -2,7 +2,7 @@
 
 const vscode = require('vscode');
 const config = require('./config');
-const { chatOnce } = require('./client');
+const { chatOnce, fimCompleteOnce } = require('./client');
 const projectScan = require('./projectScan');
 
 const outputChannel = vscode.window.createOutputChannel('狐狸 AI·行内补全');
@@ -187,13 +187,30 @@ function createInlineProvider(context) {
       const lineBefore = currentLine.slice(0, position.character);
       const lineAfter = currentLine.slice(position.character);
       const before = document.getText(new vscode.Range(startLine, 0, position.line, 0));
-      const after = document.getText(
-        new vscode.Range(position.line + 1, 0, suffixEndLine, Number.MAX_SAFE_INTEGER)
-      );
+      // 光标在最后一行（或 suffixLines=0）时 position.line+1 > suffixEndLine，Range 非法会抛错
+      // 导致补全静默失败。加保护：无后文时 after 为空串。
+      const after = (position.line + 1 <= suffixEndLine)
+        ? document.getText(new vscode.Range(position.line + 1, 0, suffixEndLine, Number.MAX_SAFE_INTEGER))
+        : '';
       if (!before.trim() && !after.trim() && !lineBefore.trim() && !lineAfter.trim()) {
         log('跳过：上下文为空');
         return null;
       }
+
+      // 上下文长度上限：超长行/大文件下避免把过量字符塞进补全请求（省 token + 降延迟）。
+      // 前文（更相关）优先保留，后文裁剪。
+      const maxContextChars = Math.max(800, cfg.get('inlineCompletion.maxContextChars', 6000));
+      let beforeCtx = before;
+      let afterCtx = after;
+      if (beforeCtx.length + afterCtx.length > maxContextChars) {
+        const budget = Math.floor(maxContextChars * 0.7);
+        if (beforeCtx.length > budget) beforeCtx = beforeCtx.slice(-budget);
+        const remaining = maxContextChars - beforeCtx.length;
+        if (afterCtx.length > remaining) afterCtx = afterCtx.slice(0, remaining);
+        log('上下文截断', before.length, '+', after.length, '→', beforeCtx.length, '+', afterCtx.length);
+      }
+      // 当前行缩进：帮助模型生成正确缩进的代码
+      const indent = (currentLine.match(/^[ \t]*/) || [''])[0];
 
       // 与对话 AI 共用同一套项目上下文，避免补全“牛头不对马嘴”
       let projectContext = '';
@@ -219,15 +236,22 @@ function createInlineProvider(context) {
         }
       }
 
+      const completionModel = pickCompletionModel(cfg, resolved);
+      log('请求', document.fileName, 'model=', completionModel, 'provider=', ic.provider || '(main)');
+
+      const isFimEndpoint = !!ic.fimEndpoint;
       const fimStrategy = detectFimStrategy(ic.fimStrategy, completionModel);
-      const useFim = fimStrategy !== 'none';
+      const useFim = fimStrategy !== 'none' && !isFimEndpoint;
 
       let prompt;
       let systemPrompt = SYSTEM;
-      if (useFim) {
+      if (isFimEndpoint) {
+        // 专用 FIM 端点（DeepSeek Beta /completions）：前缀/后缀作为原生参数提交，不包 token
+        log('使用专用 FIM 端点 /completions', 'prefixLen=', (beforeCtx + lineBefore).length, 'suffixLen=', (lineAfter + afterCtx).length);
+      } else if (useFim) {
         // Fill-in-the-Middle：把 prefix + suffix 用专用 token 包裹，让模型知道自己在填空
-        const prefix = before + lineBefore;
-        const suffix = lineAfter + after;
+        const prefix = beforeCtx + lineBefore;
+        const suffix = lineAfter + afterCtx;
         prompt = buildFimPrompt(prefix, suffix, fimStrategy);
         systemPrompt = SYSTEM_FIM;
         log('使用 FIM 策略', fimStrategy, 'prefixLen=', prefix.length, 'suffixLen=', suffix.length);
@@ -235,18 +259,44 @@ function createInlineProvider(context) {
         const promptParts = [];
         if (projectContext) promptParts.push('【项目上下文】\n' + projectContext);
         promptParts.push(
-          `文件：${document.fileName}\n语言：${document.languageId}\n\n` +
+          `文件：${document.fileName}\n语言：${document.languageId}\n` +
+          `当前行缩进：${JSON.stringify(indent)}\n\n` +
           `当前行光标前：${lineBefore}\n` +
           `当前行光标后：${lineAfter}\n\n` +
-          `前文多行：\n${before}\n\n` +
-          `后文多行：\n${after}\n\n` +
-          `只输出光标位置需要插入的代码。绝对不要重复「当前行光标前」或「当前行光标后」的已有文本。`
+          `前文多行：\n${beforeCtx}\n\n` +
+          `后文多行：\n${afterCtx}\n\n` +
+          `只输出光标位置需要插入的代码，保持上述缩进。绝对不要重复「当前行光标前」或「当前行光标后」的已有文本。`
         );
         prompt = promptParts.join('\n\n');
       }
-      const completionModel = pickCompletionModel(cfg, resolved);
-      log('请求', document.fileName, 'model=', completionModel, 'provider=', ic.provider || '(main)');
 
+      const inlineMaxTokens = Math.max(16, cfg.get('inlineCompletion.maxTokens', 128));
+      let result;
+      if (isFimEndpoint) {
+        const { promise, handle } = fimCompleteOnce({
+          baseUrl: ic.baseUrl,
+          apiKey: ic.apiKey,
+          model: completionModel,
+          prompt: beforeCtx + lineBefore,
+          suffix: (lineAfter + afterCtx) || undefined,
+          maxTokens: inlineMaxTokens,
+          temperature: 0.1,
+          stop: ['\n\n'],
+          timeout: 20000
+        });
+        inflight = handle;
+        token.onCancellationRequested(() => {
+          try { handle.abort(); } catch (_) {}
+        });
+        try {
+          result = await promise;
+        } catch (e) {
+          log('FIM 端点请求失败：', e && e.message);
+          return null;
+        } finally {
+          if (inflight === handle) inflight = null;
+        }
+      } else {
       const { promise, handle } = chatOnce({
         baseUrl: ic.baseUrl,
         apiKey: ic.apiKey,
@@ -256,25 +306,23 @@ function createInlineProvider(context) {
           { role: 'user', content: prompt }
         ],
         temperature: 0.1,
-        maxTokens: Math.max(16, cfg.get('inlineCompletion.maxTokens', 128)),
+        maxTokens: inlineMaxTokens,
         timeout: 20000,
-        stop: ['\n\n\n']
+        stop: ['\n\n']
       });
       inflight = handle;
       token.onCancellationRequested(() => {
-        try {
-          handle.abort();
-        } catch (_) {}
+        try { handle.abort(); } catch (_) {}
       });
 
-      let result;
-      try {
-        result = await promise;
-      } catch (e) {
-        log('模型请求失败：', e && e.message);
-        return null;
-      } finally {
-        if (inflight === handle) inflight = null;
+        try {
+          result = await promise;
+        } catch (e) {
+          log('模型请求失败：', e && e.message);
+          return null;
+        } finally {
+          if (inflight === handle) inflight = null;
+        }
       }
       if (token.isCancellationRequested) {
         log('请求完成后被取消');

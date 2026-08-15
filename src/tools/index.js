@@ -467,19 +467,19 @@ const TOOLS = [
     kind: 'edit',
     title: (a) => `编写 MCP 服务器 ${a.name || ''}`,
     description:
-      '为自己编写一个 MCP 服务器并登记/热加载，使狐狸 AI 能识别并使用你写的工具。三种用法三选一：① 传 tools（结构化工具数组，自动生成标准协议脚本，最稳）；② 传 script（完整服务器源码）；③ 传 script_path（你已用 write_file 写好的脚本绝对路径）。写好后可用 /mcp <id> <toolName> [参数] 调用；把 foxAi.mcp.autoInject 设为 true 后工具会自动进入可用列表。',
+      '为自己编写一个 MCP 服务器并登记/热加载。三种用法三选一：① tools（结构化工具数组，自动生成协议脚本，最稳）；② script（完整服务器源码）；③ script_path（已用 write_file 写好的脚本绝对路径）。写好后可用 /mcp <id> <工具名> [参数] 调用；设 foxAi.mcp.autoInject=true 后自动进入可用工具列表。',
     parameters: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: '服务器 id，字母/数字/-/_，如 my-tools' },
-        description: { type: 'string', description: '一句话描述这个服务器做什么' },
+        name: { type: 'string', description: '服务器 id（字母/数字/-/_）' },
+        description: { type: 'string', description: '一句话描述这个服务器' },
         tools: {
           type: 'array',
           description:
-            '结构化工具列表（推荐）。每项：{ name, description, input_schema(JS 对象或 JSON 字符串), handler(完整函数表达式，如 async (args)=>{ return String(args.q); }) }'
+            '结构化工具列表（推荐）。每项：{ name, description, input_schema, handler(函数表达式) }'
         },
-        script: { type: 'string', description: '完整服务器源码（纯 Node，实现 MCP stdio 协议）。提供它则忽略 tools' },
-        script_path: { type: 'string', description: '已用 write_file 写好的脚本绝对路径；提供它则直接登记该文件' },
+        script: { type: 'string', description: '完整服务器源码（纯 Node，实现 MCP stdio）。提供则忽略 tools' },
+        script_path: { type: 'string', description: '已写好的脚本绝对路径' },
         enabled: { type: 'boolean', description: '是否启用，默认 true' }
       },
       required: ['name']
@@ -666,7 +666,7 @@ const TOOLS = [
     name: 'security_audit',
     kind: 'read',
     title: (a) => `安全自检 ${a.path || '(工作区)'}`,
-    description: '在授权工作区内做**只读 · 脱敏 · 网络隔离**的代码安全自检（自检 Agent）：用规则扫描危险模式（硬编码密钥、eval/动态代码执行、命令执行、SQL/命令注入、路径穿越、XSS 注入点、TLS 校验禁用等），并可选跑 npm audit 检查依赖漏洞。绝不修改文件、不读取凭据文件内容、不向外发起请求；命中密钥一律打码。结果需人工复核，且**禁止作为修复唯一依据**（双盲）。可选 path 指定扫描目录，checkDeps=false 关闭依赖检查。',
+    description: '在授权工作区内做只读·脱敏·网络隔离的代码安全自检：规则扫描危险模式（硬编码密钥、eval/动态执行、命令执行、SQL/命令注入、路径穿越、XSS、TLS 校验禁用等），可选跑 npm audit。绝不改文件、不读凭据、不外发请求，命中密钥打码。结果需人工复核，且禁止作为修复唯一依据（双盲）。path 指定目录，checkDeps=false 关闭依赖检查。',
     parameters: {
       type: 'object',
       properties: {
@@ -680,7 +680,7 @@ const TOOLS = [
     name: 'referee_review',
     kind: 'read',
     title: (a) => `裁判校验 ${a.path || '(全部改动)'}`,
-    description: '**只读的第三方「裁判」Agent（双盲交叉验证）**：对比「修复前（git HEAD 原版）」与「修复后（工作区当前版）」的语义差异。若某文件修复前后逻辑完全等价（仅格式/重排/注释/变量重命名差异），说明这次「修复」什么也没改——极可能是自检 Agent 的误报被当真修了，此时该文件判为 SUSPEND；当所有改动文件都等价时整体强制挂起转人工。不依赖自检 Agent 的输出，独立判断。可选 path 指定单文件，不传则校验全部相对 HEAD 的改动。',
+    description: '只读的第三方「裁判」Agent（双盲交叉验证）：对比修复前（git HEAD）与修复后（工作区）的语义差异。若某文件修复前后逻辑等价（仅格式/注释/变量重命名），说明这次修复没改实质，判为 SUSPEND；全部等价时强制挂起转人工。不依赖自检输出，独立判断。path 指定单文件，不传校验全部相对 HEAD 的改动。',
     parameters: {
       type: 'object',
       properties: {
@@ -709,13 +709,7 @@ const TOOLS = [
     name: 'search_codebase',
     kind: 'read',
     title: (a) => `语义检索「${String((a && a.query) || '').slice(0, 24)}」`,
-    description: `**全仓库语义检索**（TF-IDF 余弦 + BM25 混合打分）。用自然语言描述「你想找什么功能/逻辑」，它会返回最相关的代码片段（文件 + 行号 + 原文）。索引未建立或过期时会自动建立。
-
-# 什么时候用它 vs search_text
-- 知道确切的标识符、字符串、正则 → 用 \`search_text\`（精确、快）
-- 只知道「大概想干什么」，不知道叫什么名字 → 用 \`search_codebase\`
-  例：「用户登录后 token 是在哪里刷新的」「哪里处理了文件上传的分片」「配置是怎么热更新的」
-- 刚进入一个陌生项目、要快速定位相关模块 → 优先 \`search_codebase\``,
+    description: '全仓库语义检索（TF-IDF 余弦 + BM25 混合打分）。用自然语言描述想找的功能/逻辑，返回最相关代码片段（文件+行号+原文）。索引缺失或过期会自动建立。知道确切标识符/正则时用 search_text（精确快），只知道「大概想干什么」时用本工具（例：登录 token 在哪刷新、文件上传分片在哪处理）。',
     parameters: {
       type: 'object',
       properties: {
@@ -748,35 +742,27 @@ const TOOLS = [
       const n = Array.isArray(a && a.agents) ? a.agents.length : 0;
       return n > 1 ? `派生 ${n} 个子代理` : '派生子代理';
     },
-    description: `派生**隔离上下文的子代理**替你干活，可并行、可组队。适合：①需要同时推进多条互不相干的支线（如「查 A 模块」+「查 B 模块」+「查依赖版本」）；②某个子任务会产生大量中间过程（翻十几个文件），你不想让它污染主上下文——子代理的探索过程**不会**进入你的上下文，你只会收到它的最终结论。
-
-# 角色（role）与权限
+    description: `派生**隔离上下文的子代理**替你干活，可并行、可按依赖组队。适合：①多条互不相干的支线同时推进；②某子任务会产生大量中间过程（翻十几个文件），不想污染主上下文——子代理探索过程不进主上下文，你只收到最终结论。
+# 角色与权限
 ${subagents.renderRoleCatalog()}
-
-# 用法
-- 并行：给多个无 depends_on 的 agents，它们同时跑。
-- 组队：给 depends_on 声明依赖，会按依赖拓扑分批（批内并行、批间串行），前置成员的结论自动注入后置成员上下文。
-
 # 纪律
-- 每个子代理的 task 必须**具体、自包含、可独立完成**，别写「帮我看看」这种没头没尾的。
-- 需要背景信息就写进 context，子代理看不到你和用户的对话。
-- 子代理不能再派生子代理，也不能建技能/建 MCP。
-- 一次最多 8 个。别为了一件小事派代理——你自己一次工具调用能搞定的，就别派。`,
+- 每个 task 必须具体、自包含；需要背景写进 context（子代理看不到你和用户的对话）。
+- 子代理不能再派生子代理，也不能建技能/建 MCP。一次最多 8 个。自己一次工具调用能搞定的就别派。`,
     parameters: {
       type: 'object',
       properties: {
-        goal: { type: 'string', description: '这批子代理共同服务的总目标，一句话' },
+        goal: { type: 'string', description: '这批子代理共同服务的总目标' },
         agents: {
           type: 'array',
           description: '要派生的子代理列表（1~8 个）',
           items: {
             type: 'object',
             properties: {
-              name: { type: 'string', description: '简短标识，如 find-auth、fix-login；用于 depends_on 引用' },
-              role: { type: 'string', enum: ['explorer', 'coder', 'reviewer', 'tester', 'researcher', 'planner', 'generalist'], description: '角色，决定它能用哪些工具' },
-              task: { type: 'string', description: '具体、自包含的任务描述（必填）' },
-              context: { type: 'string', description: '子代理需要知道的背景信息（它看不到你和用户的对话）' },
-              depends_on: { type: 'array', items: { type: 'string' }, description: '依赖的其它子代理 name；有依赖则等前置跑完并继承其结论' }
+              name: { type: 'string', description: '简短标识，供 depends_on 引用' },
+              role: { type: 'string', enum: ['explorer', 'coder', 'reviewer', 'tester', 'researcher', 'planner', 'generalist'], description: '角色决定它能用哪些工具' },
+              task: { type: 'string', description: '具体、自包含的任务（必填）' },
+              context: { type: 'string', description: '子代理需要的背景（它看不到你的对话）' },
+              depends_on: { type: 'array', items: { type: 'string' }, description: '依赖的子代理 name，等前置跑完再执行' }
             },
             required: ['task']
           }
@@ -795,36 +781,25 @@ ${subagents.renderRoleCatalog()}
     name: 'run_background_agent',
     kind: 'exec',
     title: (a) => `后台任务：${String((a && (a.title || a.task)) || '').slice(0, 30)}`,
-    description: `把一件**耗时的活儿丢到后台跑**，立刻返回、不占用当前对话。用户可以继续和你聊别的，任务在后台独立推进。
-
+    description: `把一件**耗时的活儿丢到后台跑**，立刻返回、不占当前对话，用户在等结果时继续聊别的。
 # 什么时候用
-- 用户说「你先在后台帮我把 X 做了」「顺便把测试补上，我先干别的」这类**明确要求异步**的。
-- 一件活儿明显要跑很久（全项目补测试、大范围重构、批量整理文档），同步做会让用户干等。
-
-# 什么时候**不要**用
-- 用户在等这个结果 —— 那就当场做，别丢后台。
-- 一两次工具调用就能搞定的小事。
-- 需要中途问用户的活儿 —— 后台没有交互通道。
-
-# 运行环境（重要）
-- 在 git 仓库里，后台任务会自动开一份 **独立 worktree + 独立分支**，改动**不会碰用户正在编辑的文件**；结束后产出补丁与分支供 review。
-- 不是 git 仓库（或仓库还没有任何提交）时，后台任务自动降级为**只读调研**，只给结论不改文件。
-- 后台任务没法弹窗确认，需要人工确认的高危操作会被直接拒绝。
-
-# 纪律
-- task 必须自包含：后台任务看不到你和用户的对话，背景信息要写全。
-- 提交后**立刻**回复用户「已在后台开始」，然后继续处理别的事，**不要**在原地反复查询等它跑完。`,
+- 用户明确要求异步（「你先在后台帮我做 X」「顺便把测试补了，我先干别的」）；或活儿明显要跑很久（全项目补测试、大范围重构）。
+# 什么时候不要用
+- 用户在等这个结果、一两次工具调用能搞定、需要中途问用户（后台没有交互通道）。
+# 运行环境
+- git 仓库会自动开独立 worktree + 分支，不碰用户正在编辑的文件；结束后产出补丁/分支供 review。非 git 仓库自动降级为只读调研。
+- 后台任务没法弹窗确认，高危操作会被直接拒绝。task 必须自包含（看不到你和用户对话）。提交后立刻回复「已在后台开始」，不要原地反复查询。`,
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '具体、自包含的任务描述（必填）。要写清目标、涉及范围、完成标准。' },
-        title: { type: 'string', description: '简短标题，如「补全 auth 模块测试」，用于列表展示与分支命名' },
+        task: { type: 'string', description: '具体、自包含的任务（必填），写清目标/范围/完成标准' },
+        title: { type: 'string', description: '简短标题，用于列表展示与分支命名' },
         role: {
           type: 'string',
           enum: ['explorer', 'coder', 'reviewer', 'tester', 'researcher', 'planner', 'generalist'],
-          description: '执行角色，决定它能用哪些工具。只读调研用 explorer/researcher，改代码用 coder，补测试用 tester。'
+          description: '执行角色：explorer/researcher 只读，coder 改代码，tester 补测试'
         },
-        create_pr: { type: 'boolean', description: '完成且有改动时，是否推送分支并尝试创建 PR（需要远端与 gh CLI）。默认 false。' },
+        create_pr: { type: 'boolean', description: '完成后是否推送分支并尝试创建 PR，默认 false' },
         timeout_minutes: { type: 'number', description: '超时分钟数，默认 15，最长 60' }
       },
       required: ['task']
@@ -982,23 +957,19 @@ ${subagents.renderRoleCatalog()}
     kind: 'read',
     title: (a) => `Best-of-N 多模型对比：${String((a && a.prompt) || '').slice(0, 24)}`,
     description:
-      '**Best-of-N 多模型对比**：把同一个 prompt 同时发给 N 个候选模型（可来自不同 provider），并发跑完后按评委策略挑出“最准确、最完整、最贴合要求”的那一份作为最终回答，其余作为参考摘要附带。' +
-      '适合：①同一个问题你拿不准哪个模型答得更好，想择优；②关键内容（如对外文案、重要解释）希望多模型交叉验证后再定稿；③想横向比较几个模型在同一任务上的差异。' +
-      '默认评委为 length（按有效内容长度挑最长且非空者），可在调用或设置里改 judge=llm（用主模型当评委挑最优，更准但多一次 LLM 调用）。' +
-      '候选模型来自 foxAi.bestOfN.candidates（配置 N 个 {provider,model,baseUrl,apiKey}，anthropic 类可加 transport:"anthropic"），也可在调用时直接传 candidates 覆盖。' +
-      '未开启 foxAi.bestOfN 且未传 candidates 时，本工具会提示如何配置。',
+      'Best-of-N 多模型对比：同一 prompt 并发发给 N 个候选模型，按评委策略挑最优一份作为最终回答，其余附摘要。适合拿不准哪个模型更好、或关键内容想多模型交叉验证。judge=length（挑最长非空）/ llm（主模型当评委，更准但多一次调用）。候选来自 foxAi.bestOfN.candidates 或调用时传 candidates；未开启且未传时提示如何配置。',
     parameters: {
       type: 'object',
       properties: {
-        prompt: { type: 'string', description: '要发给所有候选模型的同一个问题/任务描述（必填）' },
-        system: { type: 'string', description: '可选，统一的 system 指令，会加在每个候选请求前' },
+        prompt: { type: 'string', description: '发给所有候选模型的同一问题/任务（必填）' },
+        system: { type: 'string', description: '可选，统一 system 指令' },
         candidates: {
           type: 'array',
-          description: '可选，覆盖默认候选模型列表；每项 {provider,model,baseUrl,apiKey,transport?}',
+          description: '可选，覆盖默认候选列表；每项 {provider,model,baseUrl,apiKey,transport?}',
           items: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' }, baseUrl: { type: 'string' }, apiKey: { type: 'string' }, transport: { type: 'string' } } }
         },
-        judge: { type: 'string', enum: ['length', 'llm', 'first'], description: '挑选策略，默认 length；llm 用主模型当评委（更准但多一次调用）' },
-        temperature: { type: 'number', description: '可选，覆盖候选调用的温度' }
+        judge: { type: 'string', enum: ['length', 'llm', 'first'], description: '挑选策略，默认 length；llm 用主模型当评委' },
+        temperature: { type: 'number', description: '可选，覆盖候选温度' }
       },
       required: ['prompt']
     },
@@ -1273,8 +1244,13 @@ function toOpenAITools(query, cfg) {
   const isLocal = !!(cfg && cfg.meta && cfg.meta.local);
   const list = isLocal ? (filterForPrompt(query, cfg) || allTools()) : allTools();
   const out = [];
+  // 纯联网抓取类本地工具（与官方 web_search 能力重复）。当 provider 具备原生联网时，
+  // 无论本轮是否「时效性」，都在这里统一剔除：既杜绝模型用 fetch/MCP 绕过官方联网，
+  // 又保证 tools 字段跨轮字节稳定（不再随「时效性」在 callModel 里做二次子集替换 → 前缀漂移）。
+  // mcp__* 是前缀匹配（所有 MCP 工具），其余是精确名匹配。
+  const NETWORK_ONLY_EXACT = /^(web_fetch|fetch[_-]?url|browser|scrape|crawl|open_page|find_in_page|web_search)$/i;
   for (const t of list) {
-    if (useProviderSearch && t.name === 'web_search') continue; // 原生联网已接管，移除本地 web_search 避免抢路由
+    if (useProviderSearch && (/^mcp__/i.test(t.name) || NETWORK_ONLY_EXACT.test(t.name))) continue; // 原生联网已接管，移除本地联网抓取类工具
     if (provider === 'deepseek' && apiMode === 'responses') {
       // DeepSeek Responses API 的 function 名必须匹配 ^[a-zA-Z0-9_-]+$。
       // MCP 工具名形如 mcp__fetch__fetch-url 或含点/斜杠/大写（mcp__io.github...），会触发 400，
@@ -1384,6 +1360,73 @@ function kindOf(name) {
   return t ? t.kind : 'read';
 }
 
+// ---- 只读工具结果会话内去重（前缀缓存优化）----
+// 思路借鉴社区「Append-Only Agent + 缓存友好的工具结果去重」公开实践（如 Reasonix 等），
+// 但为 fox-ai 独立实现、未复制任何第三方源码。fox-ai 自身以 GPL-3.0 发布。
+// 背景：同一会话里模型常反复 read_file 同一个未改动的文件，每读一次都完整内容重新塞进上下文，
+// 这部分是「每轮必 miss 的不可缓存增量」，正是前缀缓存命中率卡在 80%+ 难上 98% 的主因之一。
+// 做法：对只读文件工具（read_file / view），按「工具名 + 路径」维护本会话一份内容指纹；
+// 若本次返回内容与上次完全一致，只回一个极短占位，让模型去上方上下文引用，从而缩小每轮增量、拉高命中率。
+// 安全：指纹基于「实际返回内容」而非文件 mtime，文件被改（返回内容不同）必当新调用、绝不返回旧内容；
+// 首读永远返回完整内容；任何异常都退化为原行为（返回完整文本）。
+const _DEDUP_TOOLS = (() => {
+  const s = new Set(['read_file']);
+  try { if (BY_NAME.has('view')) s.add('view'); } catch (_) {}
+  return s;
+})();
+const _dedupCaches = new Map(); // sessionId -> Map("name::path" -> contentSig)
+const _DEDUP_MAX_SESSIONS = 256;
+
+function _normPath(p) {
+  try { return require('path').resolve(String(p)).replace(/\\/g, '/'); } catch (_) { return String(p || '').trim(); }
+}
+function _hash32(s) {
+  // FNV-1a 32-bit，对返回文本做全量哈希（read 结果已被 _truncate 截到 maxToolOutput 上限，成本可忽略）
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+function _sessionDedup(sessionId) {
+  if (!sessionId) return null;
+  let m = _dedupCaches.get(sessionId);
+  if (!m) {
+    if (_dedupCaches.size > _DEDUP_MAX_SESSIONS) {
+      const keys = Array.from(_dedupCaches.keys());
+      for (const k of keys.slice(0, Math.ceil(keys.length / 3))) _dedupCaches.delete(k);
+    }
+    m = new Map();
+    _dedupCaches.set(sessionId, m);
+  }
+  return m;
+}
+function _applyCacheDedup(name, args, ctx, text) {
+  try {
+    if (!text || text.length < 64) return text; // 太短（错误或空结果）不值得去重
+    if (!_DEDUP_TOOLS.has(name)) return text;
+    const p = args && (args.path || args.file_path || args.filePath);
+    if (!p) return text;
+    let enabled = true;
+    try { enabled = vscode.workspace.getConfiguration('foxAi').get('cacheDedup.enabled', true); } catch (_) { enabled = true; }
+    if (!enabled) return text;
+    const sessionId = ctx && ctx.sessionId;
+    if (!sessionId) return text;
+    const cache = _sessionDedup(sessionId);
+    if (!cache) return text;
+    const key = name + '::' + _normPath(p);
+    const sig = _hash32(text);
+    if (cache.get(key) === sig) {
+      return '(已去重) 文件「' + p + '」本次会话此前已读取过且内容未变，完整内容已在上方上下文中，此处省略重复注入以省 token。';
+    }
+    cache.set(key, sig);
+    return text;
+  } catch (_) {
+    return text; // 任何异常都不阻断正常返回
+  }
+}
+
 async function execute(name, args, ctx) {
   const tool = getTool(name);
   if (!tool) throw new Error(`没有名为 ${name} 的工具，可用工具：${allTools().map((t) => t.name).join('、')}`);
@@ -1404,7 +1447,7 @@ async function execute(name, args, ctx) {
           : tool.run(args || {}, ctx || {});
       }, gt.timeoutMs);
       breaker.recordSuccess();
-      return _truncate(result, ctx);
+      return _applyCacheDedup(name, args, ctx, _truncate(result, ctx));
     } catch (e) {
       // 超时或任何执行异常都计入熔断
       breaker.recordFailure();
@@ -1427,7 +1470,7 @@ async function execute(name, args, ctx) {
   const result = tool.mcp
     ? await mcp.executeRemote(tool, args || {}, ctx || {})
     : await tool.run(args || {}, ctx || {});
-  return _truncate(result, ctx);
+  return _applyCacheDedup(name, args, ctx, _truncate(result, ctx));
 }
 
 /** 防御 undefined/null 并截断过长输出（与历史行为一致） */

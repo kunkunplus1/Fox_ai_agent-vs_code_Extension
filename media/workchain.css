@@ -1,0 +1,87 @@
+/* 工作链独立页面：复用 chat.css 的全部样式，然后把对话相关的区域隐藏，只留工作链面板 */
+@import url('./chat.css');
+
+body.workchain-only {
+  /* 与 chat 一样的 flex 列，但所有非工作链元素会被隐藏 */
+  min-width: 260px;
+}
+
+/* 隐藏聊天专属区域 */
+body.workchain-only .topbar,
+body.workchain-only #planPanel,
+body.workchain-only #contextPanel,
+body.workchain-only #messages,
+body.workchain-only #errorBar,
+body.workchain-only #runBar,
+body.workchain-only #ragHint,
+body.workchain-only .composer {
+  display: none !important;
+}
+
+/* 内容区撑满整个视口 */
+body.workchain-only .content-wrap {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 工作链面板独占页面 */
+body.workchain-only #workchainPanel {
+  position: static;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  min-width: auto;
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  background: transparent;
+}
+
+/* 独立页面强制始终展开：不再响应 collapsed 类，也不显示展开/收起按钮 */
+body.workchain-only #workchainPanel,
+body.workchain-only #workchainPanel.collapsed,
+body.workchain-only #workchainPanel.open {
+  display: flex;
+  flex-direction: column;
+}
+
+body.workchain-only #workchainPanel .workchain-subbar,
+body.workchain-only #workchainPanel .workchain-list,
+body.workchain-only #workchainPanel .workchain-head > * {
+  display: flex !important;
+}
+
+body.workchain-only #workchainPanel .workchain-list {
+  display: block !important;
+  flex: 1 1 auto;
+}
+
+body.workchain-only #workchainPanel .workchain-head {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--fox-line);
+  flex: 0 0 auto;
+}
+
+body.workchain-only #workchainPanel .workchain-title::before {
+  content: '';
+}
+
+/* 列表占满剩余高度 */
+body.workchain-only .workchain-list {
+  height: calc(100% - 76px);
+  overflow-y: auto;
+}
+
+/* 空状态提示 */
+body.workchain-only .workchain-list:empty::before {
+  display: block;
+  content: attr(data-empty);
+  content: '暂无工作链步骤。发送一条消息后，这里会显示思考与工具调用过程。';
+  padding: 24px 16px;
+  text-align: center;
+  opacity: .55;
+  font-size: 12px;
+}

@@ -99,11 +99,6 @@ function buildHeaders(apiKey, extra) {
   return headers;
 }
 
-/** 生成本会话稳定的会话 ID，仅作内部标识（日志/缓存统计报告），不注入任何 HTTP 头——各服务商缓存均不认 conversation id。 */
-function genConvId() {
-  return 'fox-' + crypto.randomBytes(8).toString('hex');
-}
-
 // DeepSeek Responses web_search 不返回结构化 results/URL，只在正文里写「（来源：xxx）」。
 // 兜底：解析所有来源标签（含 web_search 的合并列表与单个站点名），用原始搜索 query 生成可点击链接。
 function cleanSourceLabel(label) {
@@ -1007,6 +1002,46 @@ async function chatNonStream(options) {
   return result;
 }
 
+/**
+ * 专用 FIM 补全端点（DeepSeek Beta 等老的 /completions 接口，非 chat）。
+ * 与 chat/completions 不同：这里不包 FIM token，而是把前缀/后缀作为
+ * 原生参数 prompt / suffix 提交，由端点自己处理前后文。
+ * 返回结构：{ choices: [ { text: '...' } ] }（text completion，不是 chat message）。
+ * 参考：https://api-docs.deepseek.com/zh-cn/guides/fim_completion
+ * 注：DeepSeek 该端点需 baseUrl=https://api.deepseek.com/beta（开启 Beta 功能）。
+ * _requestJson 仅供单测注入，生产环境走默认 requestJson。
+ */
+function fimCompleteOnce(opts) {
+  const { baseUrl, apiKey, model, prompt, suffix, maxTokens = 128, temperature = 0.1, stop, timeout = 20000, signal, _requestJson } = opts || {};
+  const request = _requestJson || requestJson;
+  const body = { model, prompt, stream: false, max_tokens: maxTokens, temperature };
+  if (suffix) body.suffix = suffix;
+  if (stop && stop.length) body.stop = stop;
+  const handle = {
+    aborted: false,
+    abort() {
+      this.aborted = true;
+      if (signal) { try { signal.abort(); } catch (_) {} }
+    }
+  };
+  const promise = (async () => {
+    const data = await request(String(baseUrl).replace(/\/+$/, '') + '/completions', {
+      method: 'POST',
+      apiKey,
+      timeout: Math.max(timeout || 0, 30000),
+      insecureHTTPParser: opts && opts.insecureHTTPParser,
+      signal,
+      body
+    });
+    if (data.error) {
+      throw new Error(data.error.message || JSON.stringify(data.error));
+    }
+    const text = (data.choices && data.choices[0] && data.choices[0].text) || '';
+    return { content: text, usage: data.usage || null, aborted: handle.aborted };
+  })();
+  return { promise, handle };
+}
+
 // ─────────────────────────────────────────────────────────────
 // OpenAI Responses API（/v1/responses）支持：原生 function calling、
 // 推理增量、结构化输出。与 chat/completions 协议平行，按需选择。
@@ -1662,6 +1697,6 @@ async function listModels({ baseUrl, apiKey, timeout = 15000 }) {
 
 module.exports = {
   streamChat, chatOnce, chatNonStream, streamResponses, chatNonStreamResponses, toResponsesTools, listModels,
-  requestJson, extractCacheStats, getCacheCapability, genConvId,
+  requestJson, fimCompleteOnce, extractCacheStats, getCacheCapability,
   cleanSourceLabel, looksLikeLocalSource, parseInlineSourceLabels, fallbackUrlForSource, buildInlineSourcesText
 };

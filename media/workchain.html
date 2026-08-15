@@ -6,10 +6,12 @@
         content="default-src 'none'; img-src ${cspSource} https: data:; font-src ${cspSource} data:; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link href="${styleUri}" rel="stylesheet" />
-  <title>狐狸 AI</title>
+  <title>狐狸 AI · 工作链</title>
 </head>
-<body class="main-chat">
-  <header class="topbar">
+<body class="workchain-only">
+  <!-- 复用 chat.html 的完整骨架，但 workchain.css 会把非工作链区域隐藏掉，
+       这样 chat.js 的所有 DOM 查询都能继续工作，只有 #workchainPanel 可见。 -->
+  <header class="topbar" id="topbar">
     <button id="providerChip" class="chip" title="点击切换服务商" data-i18n-title="点击切换服务商">
       <span class="dot"></span><span id="providerName" data-i18n="未连接">未连接</span>
     </button>
@@ -60,21 +62,14 @@
         <div class="fox">🦊</div>
         <h3 data-i18n="狐狸 AI 智能体">狐狸 AI 智能体</h3>
         <p data-i18n-html="能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。">能读你的工作区、改代码、跑命令、看报错。<br />本地 llama.cpp / Ollama 与国内各家 API 都能接。</p>
-        <div class="quick">
-          <button class="quick-btn" data-q="看一下这个项目的结构，告诉我它是干什么的">🔍 摸清这个项目</button>
-          <button class="quick-btn" data-q="检查工作区里现在有哪些报错，并逐个修复">🛠 修掉所有报错</button>
-          <button class="quick-btn" data-q="读一下终端里最近的输出，看看有没有报错，有的话分析原因">📟 分析终端报错</button>
-          <button class="quick-btn" data-q="用一句话介绍你自己，并说明你现在跑在哪个模型上">✅ 测试模型连通</button>
-        </div>
       </div>
     </main>
 
-    <aside id="workchainPanel" class="workchain-panel collapsed">
+    <aside id="workchainPanel" class="workchain-panel open">
       <div class="workchain-head" id="workchainHead">
         <span class="workchain-title" data-i18n="工作链">工作链</span>
         <span class="workchain-count" id="workchainCount"></span>
         <span class="spacer"></span>
-        <button class="mini ghost" id="workchainToggle" title="展开/收起工作链" data-i18n-title="展开/收起工作链" data-i18n="收起">收起</button>
         <button class="mini ghost" id="workchainClear" data-i18n="清空">清空</button>
       </div>
       <div class="workchain-subbar" id="workchainSubbar">

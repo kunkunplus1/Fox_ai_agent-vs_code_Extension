@@ -210,7 +210,8 @@ async function readFile(args) {
 
   const width = String(end).length;
   const numbered = slice.map((l, i) => String(start + i).padStart(width, ' ') + '│' + l).join('\n');
-  const rangeNote = start === end && !Number.isNaN(startChar)
+  const hasCharRange = !Number.isNaN(startChar) && !Number.isNaN(endChar);
+  const rangeNote = start === end && hasCharRange
     ? `（共 ${lines.length} 行，显示 ${start} 行 ${startChar}-${endChar} 字符）`
     : `（共 ${lines.length} 行，显示 ${start}-${end}）`;
   let header = `文件：${relative(uri)}${rangeNote}\n`;
@@ -360,7 +361,13 @@ function previewEditFile(args, rawBefore) {
     const e = Math.min(lines.length, endLine);
     const head = lines.slice(0, s - 1);
     const tail = lines.slice(e);
-    after = head.join('\n') + (head.length && tail.length ? '\n' : '') + newText + (tail.length ? '\n' : '') + tail.join('\n');
+    // 区分「删除」与「替换」：newText 为空时 head/tail 之间只补一个换行，
+    // 否则会在删除处残留一个多余空行（删首行还会留下行首空行）。
+    if (newText) {
+      after = head.join('\n') + (head.length ? '\n' : '') + newText + (tail.length ? '\n' : '') + tail.join('\n');
+    } else {
+      after = head.join('\n') + (head.length && tail.length ? '\n' : '') + tail.join('\n');
+    }
     editKind = '范围' + (newText ? '替换' : '删除');
   } else {
     throw new Error('old_text 不能为空，创建新文件请用 write_file');
@@ -738,8 +745,10 @@ async function showDiff(pathLike, oldText, newText, title) {
 
 /** 生成一段紧凑的文本 diff 摘要，给审批卡片展示 */
 function unifiedPreview(before, after, maxLines = 40) {
-  const a = (before || '').split('\n');
-  const b = (after || '').split('\n');
+  // 先把 CRLF 归一成 LF：否则「CRLF 原文件 vs LF 新内容」会被逐行误判为全部改动，
+  // 审批预览 / 审查摘要里就会出现满屏的「每行都删又都加」假 diff。
+  const a = (before || '').replace(/\r\n/g, '\n').split('\n');
+  const b = (after || '').replace(/\r\n/g, '\n').split('\n');
   let start = 0;
   while (start < a.length && start < b.length && a[start] === b[start]) start++;
   let endA = a.length - 1;

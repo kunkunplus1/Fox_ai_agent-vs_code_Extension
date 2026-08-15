@@ -24,12 +24,18 @@ const { UserSkillStore } = require('./skills');
 const { PlanTaskStore } = require('./planTasks');
 const projectScan = require('./projectScan');
 const reviewer = require('./reviewer');
-const { shouldAutoContinue } = require('./autoContinue');
+const { shouldAutoContinue, buildContinuePrompt, isStuckRepeat } = require('./autoContinue');
 const reasoning = require('./reasoningParams'); // 深度思考：跨后端参数映射
 
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+
+// 动态附录哨兵：易变块（知识/环境/主题记忆/锚点/时间/审查）每轮重注，用此哨兵防多步循环重复叠加。
+const DYN_MARK = '狐狸AI·动态上下文';
+// 稳定上下文哨兵：规则/技能/结构/任务/人格/扁平记忆等跨轮稳定块，首轮注入一次并烤回源，
+// 之后随历史沉淀进缓存、每轮命中，不再每轮重烤成 miss。独立哨兵避免与易变块互相误判。
+const STABLE_MARK = '狐狸AI·稳定上下文';
 
 // —— 模块级 LLM 并发限流 ——
 // 跨所有 session / 可移动面板限制「同时飞向模型的请求数」。多个面板/会话同时跑任务时，
@@ -118,7 +124,11 @@ function modelSupportsNativeTools(cfg) {
   }
   // 某些推理模型（o1/o3 系列旧版）在 chat 接口不支持 tools；命中走 text 更稳
   if (/^o[13]-/.test(model)) return false;
-  // 主流云厂商（OpenAI、DeepSeek、SiliconFlow、OpenRouter、Gemini、Anthropic、GLM、ERNIE、Qwen-Turbo 等）默认 native
+  // DeepSeek 专用适配：原生 function calling 的 tools 字段序列化在 messages 之后、不参与前缀缓存，
+  // 导致 ~7000 token 的工具 schema 每轮按原价计费、命中率封顶在 ~85%。改用文本协议把工具写进 system（可缓存），
+  // 长任务命中率可达 ~98%。用户可用 foxAi.agent.toolProtocol=native 显式覆盖回原生。
+  if (provider === 'deepseek' || provider === 'openrouter' && model.includes('deepseek')) return false;
+  // 主流云厂商（OpenAI、SiliconFlow、Gemini、Anthropic、GLM、ERNIE、Qwen-Turbo 等）默认 native
   return true;
 }
 
@@ -306,8 +316,6 @@ function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
   if (protocol === 'chat') {
     return `${base}
 ${deepThinkingHint}
-【当前环境】
-${envBrief}
 
 （当前无法调用工具：可能是智能体模式未开启、当前协议/模型不支持 function calling，或 Responses 协议下工具调用被服务端拒绝。你只能基于用户提供的信息做文字回答，不要声称自己读取、修改或执行了任何操作。）`;
   }
@@ -337,8 +345,8 @@ ${envBrief}
   // 否则模型容易退回用 SVG/代码替代生图，或误以为自己无法处理图片。
   const multimodalGuide = `
 【多模态能力】
-- 生图（重要）：当用户要求画图、生成/创作图片、做海报/图标/logo/示意图/概念图/配图，或出现「画一个/画只/画张/生图/生成图片/配张图」等意图时，你必须调用 generate_image 工具。该工具使用在「狐狸 AI · 多模态生图（实验）」设置里单独配置的生图模型，与主控聊天模型完全隔离——即使你（主控模型）本身不能直接出图，也要通过它把图片生成并显示在对话里。除非用户明确要求「矢量图 / SVG / HTML 动画」，否则不要用 SVG、Python、HTML/CSS 等方式替代生图。
-- 识图：用户发送的图片会自动经「多模态识图中转」转成文字描述后再交给你推理，你无需调用任何工具即可理解图片内容；若看到“图片已忽略”的提示，说明未开启识图中转或当前模型不支持读图，此时直接向用户说明需要开启 foxAi.vision 或换用支持读图的模型即可。`;
+- 生图（重要）：用户要画图/生成图片/做海报/图标/logo/示意图/配图时，必须调用 generate_image 工具（走独立配置的生图模型，与你隔离）；除非用户明确要「矢量图/SVG/HTML 动画」，否则不要用 SVG、Python、HTML/CSS 代替生图。
+- 识图：用户发的图片会自动经识图中转转成文字再交给你，无需调用工具即可理解；若看到“图片已忽略”，说明未开启识图中转或当前模型不支持读图，向用户说明需开启 foxAi.vision 或换支持读图的模型。`;
 
   // 12 条编码铁律（用户要求注入，尽量省 token：极简中文 + 单行，不重复工作准则已有内容）。
   // 作为系统提示词的固定一小段，让所有厂商模型在编码时都遵循同一套方法论。
@@ -357,12 +365,18 @@ ${envBrief}
 11. 顺应既有约定：即便不认同也先遵循项目风格与规范。
 12. 失败要响亮：出错就明确报错并停下，别静默吞掉或假装成功。`;
 
+  // MCP 自写指南约 1.7k 字符（含完整协议模板），只在用户开启 MCP（foxAi.mcp.enabled）时注入；
+  // 默认关闭 MCP 的大多数用户直接省下这一整块固定前缀 token。
+  const mcpGuide = (() => {
+    try { return config.conf().get('mcp.enabled', false) ? mcpAuthor.MCP_AUTHORING_GUIDE : ''; } catch (_) { return ''; }
+  })();
+
   const common = `${base}
 
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
 【当前环境】
-${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
+${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 
 【工作准则】
 1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。
@@ -374,16 +388,18 @@ ${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 7. 任务完成后，用中文简明总结你改了什么、为什么改，不要复述整个文件内容。
 8. 如果需求不清晰或有破坏性风险，先说明并询问用户，不要擅自大改。
 9. 当用户询问当前时间、日期、天气、新闻、最新版本、实时数据等时效性信息时，必须调用 current_time 或 web_search 工具获取信息后再回答。绝对禁止直接说"我无法获取当前时间"或"我没有实时信息"。
-10. 当你发现某类任务存在可复用的固定流程（如某项目的部署检查、特定代码规范校验），且尚无对应技能时，可用 create_skill 把它沉淀成用户技能，下次用 use_skill 激活执行；用户技能与自带能力隔开、只属于本扩展，写好后系统会自动校验结构与脚本语法。**重要：若某技能已存在（list_skills 可见）或你刚刚用 use_skill 激活了它，绝对不要再 create_skill 同名技能——直接按其指导执行，并用 create_plan_task 跟踪多步骤进度。**
+10. 可复用的固定流程可用 create_skill 沉淀成用户技能，下次 use_skill 激活；**若技能已存在（list_skills 可见）或刚激活过，绝对不要再 create_skill 同名技能**，直接按其指导执行。
 11. 若你启动或指导用户使用了需要终端交互的程序（例如由 use_skill 激活的交互式脚本、游戏、REPL），必须在让用户输入后调用 get_terminal_output 读取终端最新输出，再根据输出继续交互；不要假设你知道用户输入了什么。
-12. 面对需要多步骤完成的项目任务时，先用 create_plan_task 把任务拆成可见清单（pending / in_progress / completed）；每完成一步用 update_plan_task 更新状态，用户问“进度”“还剩哪些”时调用 list_plan_tasks。**注意：已通过 use_skill 激活匹配技能时，不要把该技能本身当任务去 create_skill，直接执行并用 create_plan_task 记录步骤。**
-13. 编码类任务收尾时，除了系统已自动做的语法校验（node --check / 写后诊断），还应主动用 run_command 运行该项目的测试验证（如 package.json 的 test 脚本、pytest、go test、cargo test 等）；若项目没有测试，至少跑一次构建或类型检查。把测试结果写入最终总结。
+12. 多步骤项目任务先用 create_plan_task 拆成可见清单（pending/in_progress/completed），每步用 update_plan_task 更新；用户问“进度”“还剩哪些”用 list_plan_tasks。**已通过 use_skill 激活的技能不要当任务去 create_skill**，直接执行并用 create_plan_task 记录步骤。
+13. 编码类任务收尾时，除自动语法校验（node --check/写后诊断），还应主动 run_command 跑项目测试（package.json test / pytest / go test / cargo test）；无测试则至少跑一次构建或类型检查，结果写入最终总结。
 14. 系统提示词中的【本地知识库参考】已包含用户整理好的知识库文件内容，回答相关问题时请优先基于其中信息，不要调用 find_files / search_text 去工作区“找知识库文件”，也不要因检索关键词未命中就声称没有知识库。
-15. 保持谨慎：动手改文件或跑命令前，先想清楚影响范围，优先用可逆的最小改动；删除 / 覆盖 / 移动 / 重命名文件，以及 rm -rf、git reset --hard 这类不可逆命令，务必确认目标与后果，autoApprove 关闭时先征求用户同意。声称“完成”之前，必须用工具核实结果（get_diagnostics / 跑测试 / 读回文件），不要凭假设说成功；意图或风险拿不准时，先问清楚再动手，绝不瞎猜。
-16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 去读真实内容，不要反问“你的意思是…？”、不要凭记忆猜测、不要编造文件内容。读完后再基于原文回答或继续操作。\n17. 自动代码审查：你每完成一轮代码写操作（edit_file / write_file / delete_file），系统会用只读的审查子代理对改动做一次检查，并把审查意见作为后续观察发回给你。若审查意见指出明显问题（尤其 🔴 严重项），请在本轮结束前据以修正，不要带着低级错误直接收尾；若审查认为无问题，正常继续即可。\\n18. 自我验证：输出结论或声称“完成”前，先自检——事实是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题。剔除不准确或冗余信息。\n19. 安全自检双盲校验：调用 security_audit 做代码安全自检时，其结果仅供参考，**禁止作为修复的唯一依据**。当你据自检结论做了修复后，必须再调用只读的 referee_review（裁判 Agent）对比「修复前 HEAD 原版 vs 修复后工作区」的语义差异；若裁判判定「修复前后逻辑等价」（即自检疑似误报），必须**强制挂起转人工**，不得自行放行或忽略。
-20. 子代理编排：遇到「多条互不相干的支线可以同时查」或「某个子任务要翻十几个文件、会产生大量中间过程」时，用 spawn_subagent 把它们派出去——子代理有独立上下文，它的探索过程不会占用你的上下文，你只收到最终结论，这能显著省 token 也更快。角色按权限选（explorer 只读探索 / coder 可改代码 / reviewer 只读挑错 / tester 可跑命令 / researcher 可联网 / planner 只做拆解）。每个 task 必须具体自包含，需要的背景写进 context（子代理看不到你和用户的对话）。有先后依赖就用 depends_on 组队，会自动分批并把前置结论传给后置。**但别滥用**：一两次工具调用能搞定的事自己做，简单任务派代理反而更慢。
-
-21. 后台任务：只有当用户**明确表达异步意图**（「你先在后台帮我做 X，我干点别的」「顺手把测试补了，不用等」）或任务明显极耗时（全项目补测试、大范围重构）时，才用 run_background_agent 丢后台。丢完立刻回复「已在后台开始处理」并继续处理用户的其它需求，**不要**原地反复查询等它跑完。用户此刻在等结果的活儿，一律当场做。后台任务在 git 仓库里会自动开独立分支与副本，不会碰用户正在编辑的文件；非 git 仓库则自动降级为只读调研。后台任务结束后结论**不会**自动出现在对话里，用户问起时用 background_jobs（action=get）把结论取回来再回答。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：面对需要多个步骤才能完成的任务（如新建或修改多个文件、跑测试、跨模块改动），先用 create_plan_task 把完整计划逐条列出（含每步目标），再调用 present_plan 把计划提交给用户确认；调用 present_plan 之后必须停止，不得执行任何写文件或执行命令的操作，耐心等待用户确认。用户确认后你再逐步执行，每完成一步用 update_plan_task 标记状态。执行过程中若需调整计划（增删步骤或改变目标），必须先调用 update_plan_task / create_plan_task 改好计划，再调用 revise_plan 并说明原因，等待用户再次确认后才继续，不得擅自偏离已确认的计划。` : '') + codingRules + extSection + '\n\n' + mcpAuthor.MCP_AUTHORING_GUIDE;
+15. 保持谨慎：动手前先想清影响范围，优先可逆最小改动；删除/覆盖/移动/重命名文件及 rm -rf、git reset --hard 等不可逆命令务必先确认后果（autoApprove 关闭时先征得用户同意）。声称“完成”前必须用工具核实结果（get_diagnostics/跑测试/读回文件），不要凭假设说成功；拿不准先问清楚再动手。
+16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 读真实内容，不要反问、不要凭记忆猜测或编造文件内容，读完再基于原文回答。
+17. 自动代码审查：每轮写操作后，只读审查子代理会把意见发回；若有明显问题（🔴 严重项）请及时修正，无问题则继续。
+18. 自我验证：声称“完成”前先自检——结论是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题；剔除不准确或冗余信息。
+19. 安全自检双盲校验：security_audit 结果仅供参考，**禁止作为修复唯一依据**；据自检修复后必须再调用 referee_review 对比语义差异，若判定「修复前后等价」（疑似误报）则**强制挂起转人工**。
+20. 子代理编排：多条互不相干的支线、或子任务要翻十几个文件时，用 spawn_subagent 派出去（子代理有独立上下文，你只收到结论，省 token 更快）。角色：explorer 只读 / coder 改代码 / reviewer 挑错 / tester 跑命令 / researcher 联网 / planner 拆解。task 必须自包含，背景写进 context，有依赖用 depends_on。**别滥用**：一两次工具调用能搞定的自己做。
+21. 后台任务：仅当用户**明确要求异步**（「后台帮我做 X」）或任务极耗时时，才用 run_background_agent 丢后台；丢完立刻回复「已在后台处理」，**不要**原地反复查询。后台在 git 仓库自动开独立分支、不碰你正在编辑的文件，非 git 降级只读；结束后结论不会自动出现，用户问起用 background_jobs(action=get) 取回。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：多步骤任务先用 create_plan_task 列出完整计划，再调用 present_plan 提交确认；调用 present_plan 后必须停止，等待用户确认。确认后逐步执行，每步用 update_plan_task 标记；执行中需调整计划（增删步骤/改目标）时，先改好计划再调用 revise_plan 说明原因，等用户再次确认后继续。` : '') + codingRules + extSection + (mcpGuide ? '\n\n' + mcpGuide : '');
 
   // 本地小模型精简版：去掉重型工作准则（多模态/技能/子代理/后台/MCP 自写）、MCP_AUTHORING_GUIDE，
   // 只保留编码铁律 + 8 条最关乎工具正确调用的核心准则，降低指令跟随负担。
@@ -391,8 +407,7 @@ ${envBrief}${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
-【当前环境】
-${envBrief}${structured}${deepThinkingHint}
+${structured}${deepThinkingHint}
 
 【工作准则（精简版，针对本地模型）】
 1. 修改任何文件前，必须先用 read_file 看过真实内容；编辑用 edit_file 做最小必要改动，不要整文件重写。
@@ -409,12 +424,7 @@ ${envBrief}${structured}${deepThinkingHint}
 
 
   if (protocol === 'text') {
-    // 本地弱模型辅助模式（1.1.17）：在系统提示词头尾重复「核心任务锚点」，
-    // 防止长链工具调用时模型注意力漂移、忘了用户最初要什么。
-    const anchor = (isLocal && queryText) ? weakModel.buildAnchor(queryText) : '';
-    const anchorHead = anchor ? `【⚓ 核心任务·始终牢记】${anchor}\n\n` : '';
-    const anchorTail = anchor ? `\n\n【⚓ 再次提醒·核心任务】你刚才要完成的是：${anchor}。请围绕它作答，不要跑题。` : '';
-    return `${anchorHead}${commonUsed}
+    return `${commonUsed}
 
 【调用工具的方式】
 你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看 <foxtool> 块：
@@ -430,7 +440,7 @@ ${envBrief}${structured}${deepThinkingHint}
 4. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
 
 【可用工具】
-${tools.toTextManual(queryText, cfg)}${anchorTail}`;
+${tools.toTextManual(queryText, cfg)}`;
   }
 
   return commonUsed;
@@ -469,6 +479,9 @@ class AgentSession {
     this.stepCount = 0;
     // 单条回复因 max_tokens 截断时，自动发「继续」重新调用的次数计数（防无限循环）
     this._continuesUsed = 0;
+    // 续写防空转：上一轮续写的可见文本（用于检测原地重复）；续跑轮强制文本协议标记
+    this._lastContinuedText = '';
+    this._lenContinue = false;
     // deepseek+responses 下，只要本会话触发过一次官方 web_search，就标记为「联网搜索会话」，
     // 后续所有轮次持续只给官方 web_search（保证搜索连续、不中途退回本地 fetch 绕圈），
     // 直到用户明确说「用本地/别联网/用 mcp」才解除。
@@ -491,6 +504,8 @@ class AgentSession {
     this._reviewConsumed = false; // 本轮审查卡片是否已被 emit（避免 _doReview 与 _awaitReview 重复推送）
     this._reviewQuotaError = null; // 审查子代理遇到的配额错误，需冒泡给 run() 统一处理
     this._reviewId = null; // 当前这轮审查卡片的唯一 id，供前端 applyReview 对应
+    // 产物（本次任务创建/修改/删除的文件）：任务完成时汇总成卡片展示
+    this._artifacts = [];
     // 续跑：关联会话 id 与要复用的任务 id
     this.sessionId = opts.sessionId || null;
     this.resumeTaskId = opts.resumeTaskId || null;
@@ -500,9 +515,13 @@ class AgentSession {
     // 缓存命中监控状态
     this._cachePrefixHash = null;       // 本轮请求前缀（system+tools）SHA 指纹
     this._cacheBaselineHash = null;     // 本会话首次请求前缀指纹（用于漂移检测）
+    this._stableBlock = null;           // 跨会话字节稳定的「稳定上下文块」（规则/技能/结构/任务/人格/扁平记忆），会话级冻结
     this._cachePrevHitRate = null;      // 上一轮命中率（用于「命中骤降」告警）
     this._cachePrevRequested = false;
     this._cacheWarmed = false;          // 预热是否已做过
+    this._cacheSessionCached = 0;       // 会话累计命中 token（用于会话级累计命中率，目标 98%）
+    this._cacheSessionPrompt = 0;       // 会话累计输入 token
+    this._cacheSessionCompletion = 0;   // 会话累计输出 token（供任务报告统计）
     // 长期记忆（跨会话记住用户偏好/约定/教训）
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
@@ -1172,16 +1191,69 @@ class AgentSession {
       if (!folder) return '';
       const cfg = this.cfg || {};
       return projectScan.renderProjectContext(folder.uri.fsPath, null, {
-        maxChars: 4000,
+        maxChars: 2000,
         actionable: true,
-        maxRoles: 40,
+        maxRoles: 24,
         includeSkeleton: cfg.projectSkeleton !== false,
-        skeletonMaxFiles: 20,
+        skeletonMaxFiles: 10,
         includeNeighbors: false
       });
     } catch (_) {
       return '';
     }
+  }
+
+  /**
+   * 收集「跨轮字节稳定的上下文块」：用户技能 / 项目根规则 / 项目结构 / 项目任务清单 / Agent 模式人格 / 扁平长期记忆。
+   * 这些内容与当前 query 无关、在同一会话（乃至同项目跨会话）里字节稳定，应只在首轮注入一次并烤回源历史，
+   * 之后随历史沉淀进 KV 缓存、每轮命中，避免每轮重烤成 miss（这正是 1.1.20 前移方案想解决的痛点，
+   * 但 1.1.20 把它们塞进 system 前缀导致系统前缀变大、缓存预算压力下历史单元被挤占淘汰，反而回退命中率）。
+   *
+   * 任一来源异常 / 为空都不影响其余来源，绝不抛错阻断主流程。
+   * @param {string} flatMemory 已取好的扁平长期记忆（稳定，避免重复调用）
+   * @returns {string[]} 非空块数组（调用方用 '\n\n' 拼接，或逐块 push 进附录）
+   */
+  _collectStableParts(flatMemory) {
+    const parts = [];
+    // 用户技能：agent 自己编写的可复用工作流清单，跨会话稳定
+    try {
+      const skillText = this.skills.renderForPrompt();
+      if (skillText) parts.push('【用户技能】\n' + skillText);
+    } catch (_) {}
+    // 项目根规则（CLAUDE.md / AGENTS.md / .cursorrules …）：懒加载 + mtime 缓存，跨会话稳定
+    try {
+      if (config.conf().get('projectRules.enabled', true)) {
+        const rulesRoot = this._workspaceRoot();
+        if (rulesRoot) {
+          const projectRules = require('./projectRules');
+          const rulesText = projectRules.renderForPrompt({
+            root: rulesRoot,
+            budget: config.conf().get('projectRules.budget', 6000)
+          });
+          if (rulesText) parts.push(rulesText);
+        }
+      }
+    } catch (_) {}
+    // 项目结构：自动扫描工作区概览，带内部签名缓存，跨会话稳定
+    try {
+      const projCtx = this._buildProjectContext();
+      if (projCtx) parts.push('【项目结构】\n' + projCtx);
+    } catch (_) {}
+    // 项目任务清单：当前可见任务，稳定
+    try {
+      const planTaskText = this.planTasks.renderForPrompt();
+      if (planTaskText) parts.push('【项目任务清单】\n' + planTaskText);
+    } catch (_) {}
+    // Agent 模式人格：非默认模式才注入（code 模式一字不加），稳定
+    if (this.mode) {
+      try {
+        const suffix = require('./modes').renderForPrompt(this.mode);
+        if (suffix) parts.push(suffix);
+      } catch (_) {}
+    }
+    // 扁平长期记忆（用户偏好/约定/教训），稳定
+    if (flatMemory) parts.push('【长期记忆】\n' + flatMemory);
+    return parts;
   }
 
   _buildSkeletonSummary(root, proj) {
@@ -1275,11 +1347,15 @@ class AgentSession {
     if (!this._scVerified) this._scVerified = new Set();
     // 每次用户提问都重置自动继续计数
     this._continuesUsed = 0;
+    this._lastContinuedText = '';
+    this._lenContinue = false;
     // 每轮用户提问重置审查注入状态（本轮新的审查结果才应被主控参考）
     this._reviewInjected = false;
     this._reviewConsumed = false;
     this._reviewResult = null;
     this._reviewQuotaError = null;
+    // 产物只统计「本轮用户提问」内的改动，避免把上一轮/上一任务的产物重复展示
+    this._artifacts = [];
 
     // ---- Harness：任务状态机 ----
     if (this.taskManager) {
@@ -1361,86 +1437,69 @@ class AgentSession {
     await this._maybeAutoCompress(queryText, envBrief);
   } catch (_) {}
 
-  // ===== 铁打前缀：system 只放「绝对静态」的基础系统提示词；所有每轮变动内容收集到 dynParts，
-  // 最后注入「最后一条 user 消息（当前轮提问）」前面，确保 system 前缀永远不变、前缀缓存整段命中。
+  // ===== 铁打前缀：system 只放「绝对静态」的基础系统提示词；其余内容分两类 =====
   let baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol, queryText);
   // 知识库检索：向量模型（语义）启用时走异步召回，未启用时内部等价于旧的同步 BM25 路径。
   // 失败一律回退，绝不阻塞主流程。
   const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
   let knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
-  // 动态附录收集器：每轮随 query/记忆/kb/审查变动，但绝不写入 system
+
+  // 扁平长期记忆（稳定，仅随记忆文件变化）→ 进稳定块；主题记忆（查询相关，易变）→ 进易变块
+  let flatMemory = '';
+  try { flatMemory = this.memory.renderForPrompt(); } catch (_) {}
+  let topicMem = '';
+  try {
+    if (this.topicMemory) {
+      const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
+      if (rel && rel.text) topicMem = rel.text;
+    }
+  } catch (_) {}
+
+  // 易变（每轮变动）附录收集器：知识库/环境/主题记忆/弱模型锚点/时间/审查，每轮随 query 重新生成注入，
+  // 绝不写回 system、不烤回源（保持新鲜，避免历史污染），位于请求末尾、随轮 append-only。
   const dynParts = [];
   if (knowledgeText) dynParts.push(knowledgeText);
-
-    // 长期记忆：把用户偏好/约定/教训注入系统提示词
-    // 结构化主题记忆走「按需加载」：只挑与本次提问最相关的 2~3 个主题，受字符预算约束，
-    // 避免记忆越攒越多后把上下文吃光（旧的扁平记忆是全量注入，这是它最大的问题）。
-    let memoryText = '';
+  // 弱本地模型防注意力漂移锚点（1.1.16）：由 queryText 派生、每轮都变 → 只在动态附录，不污染可缓存前缀
+  if (this.protocol === 'text' && (cfg.meta && cfg.meta.local) && queryText) {
     try {
-      if (this.topicMemory) {
-        const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
-        if (rel && rel.text) memoryText = rel.text;
-      }
+      const anchor = weakModel.buildAnchor(queryText);
+      if (anchor) dynParts.push(`【⚓ 核心任务·始终牢记】${anchor}\n\n【⚓ 再次提醒·核心任务】你刚才要完成的是：${anchor}。请围绕它作答，不要跑题。`);
     } catch (_) {}
+  }
+  // 环境信息：随用户操作变化，作为动态附录注入到最后一条 user 消息尾部，不影响前缀缓存命中率
+  if (envBrief) dynParts.push('【当前环境】\n' + envBrief);
+  // 主题记忆（查询相关，易变）→ 每轮注入
+  if (topicMem) dynParts.push('【长期记忆】\n' + topicMem);
+  // 对明确的时间查询，取真实时间——只进 dynamicAppendix（user 消息），绝不进 system
+  let timeInfo = '';
+  if (/现在几点|当前时间|今天几号|今天日期|几点了|什么时间|几点钟/i.test(queryText)) {
     try {
-      const flat = this.memory.renderForPrompt();
-      if (flat) memoryText = memoryText ? memoryText + '\n\n' + flat : flat;
+      const ti = await tools.execute('current_time', {}, { maxToolOutput: 500 });
+      if (ti) timeInfo = ti;
     } catch (_) {}
-    if (memoryText) dynParts.push('【长期记忆】\n' + memoryText);
+  }
+  if (timeInfo) dynParts.push('【当前时间信息】\n' + timeInfo);
 
-    // 用户技能：把 agent 自己编写的可复用工作流清单注入系统提示词
-    let skillText = '';
-    try {
-      skillText = this.skills.renderForPrompt();
-    } catch (_) {}
-    if (skillText) dynParts.push('【用户技能】\n' + skillText);
-
-    // 项目任务清单：把当前可见任务注入系统提示词
-    let planTaskText = '';
-    try {
-      planTaskText = this.planTasks.renderForPrompt();
-    } catch (_) {}
-    if (planTaskText) dynParts.push('【项目任务清单】\n' + planTaskText);
-
-    // Agent 模式人格：非默认模式才注入后缀（code 模式一个字都不加，不浪费 token）
-    if (this.mode) {
-      try {
-        const suffix = require('./modes').renderForPrompt(this.mode);
-        if (suffix) dynParts.push(suffix);
-      } catch (_) {}
-    }
-
-    // 项目根规则（CLAUDE.md / AGENTS.md / .cursorrules …）：与 Claude Code、Roo Code 生态互通。
-    // 懒加载 + mtime 缓存：模块只在开关打开时 require，内部靠 stat 签名判断是否要重读，
-    // 文件没改就直接复用上次渲染好的字符串，不重复读盘、不常驻 watcher。
-    try {
-      if (config.conf().get('projectRules.enabled', true)) {
-        const rulesRoot = this._workspaceRoot();
-        if (rulesRoot) {
-          const projectRules = require('./projectRules');
-          const rulesText = projectRules.renderForPrompt({
-            root: rulesRoot,
-            budget: config.conf().get('projectRules.budget', 6000)
-          });
-          if (rulesText) dynParts.push(rulesText);
-        }
-      }
-    } catch (_) {}
-
-    // 项目结构：自动扫描工作区并注入概览，让 agent 始终知道文件布局；
-    // 多语言项目会明确提示「按语言拆分、每个职责一个文件」地写入。
-    const projCtx = this._buildProjectContext();
-    if (projCtx) dynParts.push('【项目结构】\n' + projCtx);
-
-    // 对明确的时间查询，取真实时间——但只进 dynamicAppendix（user 消息），绝不进 system，避免 system 前缀掺入变动时间戳
-    let timeInfo = '';
-    if (/现在几点|当前时间|今天几号|今天日期|几点了|什么时间|几点钟/i.test(queryText)) {
-      try {
-        const ti = await tools.execute('current_time', {}, { maxToolOutput: 500 });
-        if (ti) timeInfo = ti;
-      } catch (_) {}
-    }
-    if (timeInfo) dynParts.push('【当前时间信息】\n' + timeInfo);
+  // —— 稳定上下文块：规则/技能/结构/任务/人格/扁平记忆，跨轮字节稳定。
+  // 首轮（源历史尚无稳定哨兵）注入一次并烤回 this.messages 源，之后随历史沉淀进缓存、每轮命中，
+  // 不再每轮重烤成 miss（这正是 1.1.20 前移方案想解决的痛点，但 1.1.20 把它们塞进 system 前缀
+  // 导致系统前缀变大、缓存预算压力下历史单元被挤占淘汰，反而回退命中率）。
+  // 用独立哨兵【狐狸AI·稳定上下文】包裹，源与下发副本都烤入，保证冻结历史与下发逐字节一致、跨轮前缀命中。
+  // 开关关闭则退化为每轮注入（旧行为），功能不丢。
+  const stableEnabled = config.conf().get('stableContext.enabled', true);
+  // 会话级冻结：稳定块首轮算好后复用，下个会话构造函数把 _stableBlock 重置为 null 自动刷新
+  if (this._stableBlock === null) {
+    this._stableBlock = stableEnabled ? this._collectStableParts(flatMemory).join('\n\n') : '';
+  }
+  // ★ 稳定块前移进 system 前缀（而非每条 user 消息尾部）：会话内字节稳定，整段吃 DeepSeek
+  // 公共前缀缓存红利——所有请求（含单轮/浅会话）的 system 部分直接命中，不再让每条 user
+  // 消息额外承担这整块的必 miss。1.1.20 也曾前移但当时 varAppendix 未烤回源、历史前缀断裂
+  // 导致回退；1.1.22 已烤回 var 使历史稳定，此时前移 stable 不再重复该 bug。
+  if (this._stableBlock) baseSystem = baseSystem + '\n\n' + this._stableBlock;
+  // 开关关闭：稳定块退化为每轮注入 user（1.1.19 旧行为），功能不丢
+  if (!stableEnabled) {
+    this._collectStableParts(flatMemory).forEach((p) => dynParts.push(p));
+  }
 
     let downgraded = false;
 
@@ -1477,17 +1536,31 @@ class AgentSession {
             '\n请把这些意见纳入当前思考；若认同，在最终回答中说明你将如何修正。'
           : '';
 
-        // ★ 铁打前缀：system 恒等于静态 baseSystem，不掺任何动态内容；
-        // 动态附录（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查）注入到最后一条 user 消息前面，
-        // 位于请求尾部、随轮 append-only，绝不污染可缓存的静态前缀。
+        // ★ 铁打前缀：system 始终等于静态 baseSystem（不掺任何每轮变动内容）；
+        // 易变附录（知识库/环境/主题记忆/锚点/时间/审查）追加到最后一条 user 消息【尾部】，
+        // 位于请求末尾、随轮 append-only，用动态哨兵检测杜绝重复叠加，绝不污染可缓存的静态前缀；
+        // 稳定块（规则/技能/结构/任务/人格/扁平记忆）首轮注入一次、烤回源历史后随轮命中，
+        // 用独立 stable 哨兵包裹，不进 system、不放大系统前缀（避免 1.1.20 缓存预算回退）。
         const system = baseSystem;
-        const appendix = dynParts.concat(reviewInjectText || []).filter(Boolean).join('\n\n');
+        // 易变附录（每轮重注）
+        const varAppendix = dynParts.concat(reviewInjectText || []).filter(Boolean).join('\n\n');
+        // 稳定块已前移进 system 前缀（见上方 _stableBlock 拼接），此处不再注入 user 消息。
         const preparedHistory = await this.prepareHistory();
-        this._injectDynamicAppendix(preparedHistory, appendix);
+        if (varAppendix) {
+          this._injectDynamicAppendix(preparedHistory, varAppendix, DYN_MARK);
+          // ★ 关键修复（1.1.22）：易变附录必须同步烤回 this.messages 源历史，否则源里该 user 消息是裸的、
+          // 下一轮重建历史时它在「附录位置」接的是 assistant 回复，与本轮下发（接附录）前缀对不上 →
+          // 每个 user 边界缓存断裂、RAG/记忆/环境等大块每轮纯 miss。烤回后该 user 消息逐字节冻结，
+          // 后续轮次作为历史命中前缀缓存，把每轮必 miss 的大块变成「仅首次出现时 miss、之后全命中」。
+          this._bakeAppendixIntoSource(varAppendix, DYN_MARK);
+        }
+        // 遥测用上下文快照（与下发内容一致，不进模型）
+        const memoryText = (topicMem || '') + (flatMemory ? (topicMem ? '\n\n' : '') + flatMemory : '');
+        let planTaskText = '';
+        try { planTaskText = this.planTasks.renderForPrompt(); } catch (_) {}
         this._emitContextUsage({
           baseSystem,
           memoryText,
-          skillText,
           planTaskText,
           knowledgeText,
           protocol: this.protocol,
@@ -1500,7 +1573,8 @@ class AgentSession {
 
         let result;
         try {
-          result = await this.callModel(payload, useNative);
+          // 长度截断续跑轮：强制文本协议（不给工具），让模型只续写正文、不被工具调用带偏
+          result = await this.callModel(payload, useNative, this._lenContinue ? [] : undefined);
         } catch (err) {
           // 模型不支持 tools（或 MCP 大 schema 触发 400）→ 自动降级到文本协议再试一次
           // DeepSeek Responses API 必须保持 native 才能触发官方 {type:'web_search'} 原生联网；
@@ -1512,9 +1586,10 @@ class AgentSession {
             // 让模型用 <fox:tool> 块输出调用，客户端解析执行；不再直接落到无工具的 chat。
             this._forceText = true;
             this.protocol = 'text';
-            // 只重建静态 baseSystem；知识库检索文本与动态附录（记忆/技能/任务/结构/审查）由主循环统一注入到最后一条 user 消息，
-            // 绝不写回 system —— system 始终等于 baseSystem，铁打不变、可缓存。
-            baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol);
+            // 只重建静态 baseSystem；知识库检索文本与动态附录（记忆/任务/审查/稳定块）
+            // 由主循环统一注入到最后一条 user 消息，绝不写回 system —— system 始终等于
+            // baseSystem，铁打不变、可缓存。
+            baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol) + (this._stableBlock ? '\n\n' + this._stableBlock : '');
             const kbSys2 = await this._augmentWithKnowledge(baseSystem, queryText);
             knowledgeText = this.kbInjectedSegment(kbSys2, baseSystem);
             this.emit('notice', {
@@ -1525,6 +1600,9 @@ class AgentSession {
           }
           throw err;
         }
+
+        // 续跑轮强制文本协议只作用于当轮请求，立即复位（避免影响后续正常轮）
+        this._lenContinue = false;
 
         if (this.cancelled) throw new Cancelled();
 
@@ -1614,13 +1692,25 @@ class AgentSession {
 
           // ---- 输出截断自动继续 ----
           const maxContinues = Math.max(0, Number(cfg.maxContinues) || 3);
-          const willAutoContinue = shouldAutoContinue(result, cfg, this._continuesUsed);
+          let willAutoContinue = shouldAutoContinue(result, cfg, this._continuesUsed);
           if (willAutoContinue) {
-            this._continuesUsed++;
-            appendLog('agent', `[auto-continue] finishReason=${result.finishReason} count=${this._continuesUsed}/${maxContinues} contentLen=${String(visibleText || '').length}`);
-            this.emit('notice', { text: `模型输出达到长度上限，正在自动继续（${this._continuesUsed}/${maxContinues}）…` });
-            // 静默插入 continue 提示：不触发 UI 用户消息，只追加到历史供下次请求使用
-            this.messages.push({ role: 'user', content: '继续输出剩余内容，保持与上文连贯，不要重复已经输出的部分。' });
+            // 非推进检测：若本轮续写内容几乎全落在上一轮文本里，说明模型原地重复空转，
+            // 提前停止自动续跑（不再白白耗光 3 次），明确提示用户手动处理。
+            if (this._lastContinuedText && isStuckRepeat(this._lastContinuedText, visibleText)) {
+              appendLog('agent', `[auto-continue-stuck] finishReason=${result.finishReason} 续写原地重复，提前停止`);
+              this.emit('notice', { text: `自动续写检测到输出在原地重复、无法推进，已停止自动续跑。如需继续请手动发送「继续」，或检查是否已达到模型单次输出上限。` });
+              willAutoContinue = false;
+            } else {
+              this._continuesUsed++;
+              this._lastContinuedText = visibleText;
+              appendLog('agent', `[auto-continue] finishReason=${result.finishReason} count=${this._continuesUsed}/${maxContinues} contentLen=${String(visibleText || '').length}`);
+              this.emit('notice', { text: `模型输出达到长度上限，正在自动继续（${this._continuesUsed}/${maxContinues}）…` });
+              // 静默插入 continue 提示：回传上一轮截断处的末尾原文，让模型从正确位置续写；
+              // 不触发 UI 用户消息，只追加到历史供下次请求使用。
+              this.messages.push({ role: 'user', content: buildContinuePrompt(visibleText || String(result.reasoning || '')) });
+              // 标记下一轮请求强制文本协议（不给工具），让模型只续写正文
+              this._lenContinue = true;
+            }
           }
           const truncated = result.finishReason === 'length' || result.finishReason === 'incomplete';
           if (truncated && this._continuesUsed >= maxContinues) {
@@ -1670,6 +1760,21 @@ class AgentSession {
             // 结构化记忆自动沉淀：规则式抽取用户的纠正 / 约定 / 偏好，零模型调用、不额外花钱
             this._harvestMemories();
             this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
+            // 任务完成：汇总本轮产物（创建/修改/删除的文件 + Token 用量）给用户一张成果卡片，可一键导出报告
+            if (this._artifacts && this._artifacts.length) {
+              const sessionHitRate = this._cacheSessionPrompt > 0
+                ? Math.round((this._cacheSessionCached / this._cacheSessionPrompt) * 100)
+                : 0;
+              this.emit('artifact', {
+                files: this._artifacts.map((a) => ({ path: a.path, op: a.op, added: a.added || 0, removed: a.removed || 0 })),
+                title: (this.task && this.task.title) || '',
+                text: String(visibleText || ''),
+                sessionHitRate,
+                cachedTokens: this._cacheSessionCached,
+                promptTokens: this._cacheSessionPrompt,
+                completionTokens: this._cacheSessionCompletion || 0
+              });
+            }
             return { finished: true, text: visibleText };
           }
 
@@ -2026,34 +2131,114 @@ class AgentSession {
   }
 
   /**
-   * 把「动态附录」（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查）注入到历史里
-   * 「最后一条 user 消息（即当前轮提问）」的前面，而不是写进 system。
-   * 这样 system 前缀始终固定、可缓存；动态内容位于请求尾部、随轮自然 append-only，不污染静态前缀。
-   * 关键点：深拷贝最后一条 user 消息再改，绝不改动 this.messages 共享历史（否则跨轮会累积重复）。
+   * 把「动态附录」（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查）追加到历史里
+   * 「最后一条 user 消息（即当前轮提问）」的【尾部】，而不是写进 system、也不插在头部。
+   * 这样 system 前缀始终固定、可缓存；动态内容位于请求末尾、随轮自然 append-only，不污染静态前缀。
+   * 关键点：用哨兵【狐狸AI·动态上下文】检测「是否已含附录」，多步循环/跨轮绝不重复叠加；
+   * 源 this.messages 与下发副本都只注入一次，保证冻结历史与下发逐字节一致，跨轮前缀才能命中。
    * @param {Array} history prepareHistory() 返回的（已 sanitize 的）消息数组
    * @param {string} appendix 已用 '\n\n' 拼接好的动态内容；为空则不动
    */
-  _injectDynamicAppendix(history, appendix) {
+  /**
+   * 把「动态附录」（知识库/记忆/技能/任务/模式/根规则/项目结构/时间/审查/锚点）注入到历史里
+   * 「最后一条 user 消息（即当前轮提问）」的前面，而不是写进 system。
+   * 这样 system 前缀始终固定、可缓存；动态内容位于请求尾部、随轮自然 append-only，不污染静态前缀。
+   * 关键点：深拷贝最后一条 user 消息再改，绝不改动 this.messages 共享历史（否则跨轮会累积重复）。
+   *
+   * 【跨轮前缀缓存一致性（1.1.16）】：仅把附录塞进「本次下发的副本」会导致冻结历史里的同一 user
+   * 消息是裸的（无附录），而下发时带附录 → 下一轮前缀在 user 边界处对不上、缓存从 user 起断裂，
+   * 命中率被卡在 70%+。因此这里额外把附录「烤进」this.messages 的源 user 消息：一旦烤过即视为已带
+   * 附录，用内容前缀检测防多步循环重复叠加；下一轮该消息以「带附录」形态进入历史，前缀与本轮下发
+   * 完全一致 → 整段历史都能命中前缀缓存（命中率冲 98%+）。
+   */
+
+  // 附录用固定哨兵包裹，便于可靠检测「该 user 消息是否已含附录」，
+  // 彻底摆脱对自定义属性的依赖（prepareHistory 链路可能丢属性）。
+  // 必须追加到 user 消息【尾部】：官方规则要求易变内容后置，且缓存单元在
+  // 用户输入末尾落盘——只有尾部字节稳定，跨轮前缀才能命中。
+  // mark 决定用哪套哨兵：DYN_MARK（易变块，每轮重注）/ STABLE_MARK（稳定块，首轮注入一次）。
+  _wrapAppendix(a, mark) {
+    const m = mark || DYN_MARK;
+    // 注意：块本身不带前导 \n\n，分隔符由 _applyAppendix 在「首次追加」时补、原地替换时不补
+    return '【' + m + '】\n' + a + '\n【' + m + '·完】';
+  }
+  _hasMark(m, mark) {
+    const MARK = '【' + (mark || DYN_MARK) + '】';
+    if (!m || m.content == null) return false;
+    if (Array.isArray(m.content)) {
+      return m.content.some((c) => c && c.type === 'text' && typeof c.text === 'string' && c.text.includes(MARK));
+    }
+    return typeof m.content === 'string' && m.content.includes(MARK);
+  }
+
+  /** 源历史 this.messages 里是否已有某套哨兵（用于稳定块首轮注入判定：已注入则跳过） */
+  _sourceHasMark(mark) {
+    return (this.messages || []).some((mm) => this._hasMark(mm, mark));
+  }
+
+  /**
+   * 把附录块（哨兵包裹）合并进一条消息的 content：
+   * 已含同 mark 块则【替换】其内容为最新（覆盖降级重算/多步刷新场景），否则【追加】到尾部。
+   * 多模态（content 为数组）时操作最后一个文本块。保证幂等且永不重复叠加。
+   */
+  _applyAppendix(content, appendix, mark) {
+    const block = this._wrapAppendix(appendix, mark);
+    const MARK_OPEN = '【' + mark + '】';
+    const MARK_CLOSE = '【' + mark + '·完】';
+    if (Array.isArray(content)) {
+      let idx = -1;
+      for (let i = content.length - 1; i >= 0; i--) {
+        const c = content[i];
+        if (c && c.type === 'text' && typeof c.text === 'string' && c.text.includes(MARK_OPEN)) { idx = i; break; }
+      }
+      if (idx >= 0) {
+        const other = content.filter((_, i) => i !== idx);
+        return other.concat([{ type: 'text', text: block }]);
+      }
+      return content.concat([{ type: 'text', text: block }]);
+    }
+    if (typeof content === 'string') {
+      // 已含同 mark 块 → 仅原地替换【mark】…【mark·完】子串（块不含前导 \n\n，块前分隔已存在），保证幂等
+      const start = content.indexOf(MARK_OPEN);
+      if (start >= 0) {
+        const end = content.indexOf(MARK_CLOSE, start);
+        if (end >= 0) return content.slice(0, start) + block + content.slice(end + MARK_CLOSE.length);
+      }
+      // 首次追加：补 \n\n 分隔符
+      return content + '\n\n' + block;
+    }
+    return (content == null ? '' : String(content)) + '\n\n' + block;
+  }
+
+  _injectDynamicAppendix(history, appendix, mark) {
     if (!appendix || !history || !history.length) return;
-    // 找到最后一条 user 角色消息（当前轮提问）。工具结果用 role:'tool'，不会误判。
+    // 找最后一条 user 角色消息（当前轮提问）。工具结果用 role:'tool'，不会误判。
     let idx = -1;
     for (let i = history.length - 1; i >= 0; i--) {
       if (history[i] && history[i].role === 'user') { idx = i; break; }
     }
     if (idx < 0) {
-      // 兜底：历史里没有 user 消息，直接追加一条承载动态附录
-      history.push({ role: 'user', content: appendix });
+      // 兜底：历史里没有 user 消息，直接追加一条承载附录（哨兵包裹）
+      history.push({ role: 'user', content: this._wrapAppendix(appendix, mark) });
       return;
     }
     const m = history[idx];
     const clone = Object.assign({}, m);
-    if (Array.isArray(m.content)) {
-      // 多模态：在内容数组最前面插一个文本块（图片还在后面）
-      clone.content = [{ type: 'text', text: appendix }].concat(m.content);
-    } else {
-      clone.content = appendix + '\n\n' + (typeof m.content === 'string' ? m.content : (m.content == null ? '' : String(m.content)));
-    }
+    // 同 mark 块存在则【替换】为最新（降级重算后内容变化也能对齐），否则追加；绝不重复叠加。
+    clone.content = this._applyAppendix(m.content, appendix, mark);
     history[idx] = clone;
+  }
+
+  /** 把附录烤进 this.messages 里最后一条 user 源消息，使冻结历史与下发逐字节一致（同 mark 块替换语义） */
+  _bakeAppendixIntoSource(appendix, mark) {
+    if (!this.messages || !this.messages.length) return;
+    let oi = -1;
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      if (this.messages[i] && this.messages[i].role === 'user') { oi = i; break; }
+    }
+    if (oi < 0) return;
+    const om = this.messages[oi];
+    this.messages[oi] = Object.assign({}, om, { content: this._applyAppendix(om.content, appendix, mark) });
   }
 
   /** 用第二个多模态模型看一张图，返回文字描述 */
@@ -2383,6 +2568,11 @@ class AgentSession {
     const hitDrop = this._cachePrevRequested && prevHit != null && prevHit > 0.05 && stats.hitRate < 0.01;
     this._cachePrevHitRate = stats.hitRate;
     this._cachePrevRequested = true;
+    // 会话级累计命中率：跨多轮/多步把命中与输入 token 累计，给用户一个可对标的「98%」目标值
+    this._cacheSessionCached += stats.cachedTokens;
+    this._cacheSessionPrompt += stats.promptTokens;
+    this._cacheSessionCompletion += stats.completionTokens;
+    const sessionHitRate = this._cacheSessionPrompt > 0 ? this._cacheSessionCached / this._cacheSessionPrompt : 0;
     const report = {
       conversationId: this.conversationId,
       prefixHash,
@@ -2391,6 +2581,9 @@ class AgentSession {
       promptTokens: stats.promptTokens,
       completionTokens: stats.completionTokens,
       hitRate: Math.round(stats.hitRate * 1000) / 1000,
+      sessionHitRate: Math.round(sessionHitRate * 1000) / 1000,
+      sessionCachedTokens: this._cacheSessionCached,
+      sessionPromptTokens: this._cacheSessionPrompt,
       driftByHash,
       hitDrop
     };
@@ -2413,10 +2606,15 @@ class AgentSession {
         baseUrl: targetCfg.baseUrl,
         apiKey: targetCfg.apiKey,
         model: targetCfg.model,
-        messages: [{ role: 'system', content: typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg) }],
+        // 带一条最小 user 消息让请求结构完整：部分服务商（含 DeepSeek 前缀缓存）对「只有 system、无 user」的
+        // 探针请求不落缓存，导致预热白做。ping 与真实首条 user 消息不同，但前缀仍从 system 起算、可命中。
+        messages: [
+          { role: 'system', content: typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg) },
+          { role: 'user', content: 'ping' }
+        ],
         tools: opt.tools || [],
         toolChoice: undefined,
-        maxTokens: 1,
+        maxTokens: 4,
         stream: false,
         onDelta: null, onReasoning: null, onToolCallStart: null, onDone: null, onError: null, onSearchResults: null, onUsage: null
       });
@@ -2586,17 +2784,18 @@ class AgentSession {
     }
 
     // —— 时效性提问：Responses 原生联网厂商（DeepSeek / OpenAI / 通义百炼 responses）下
-    //    「只给原生搜索工具」杜绝模型改用 fetch / Chrome DevTools / MCP 代替官方联网（1.1.17 起改为
-    //    仅当「本次请求本身时效」，非时效追问交还完整工具集，本地 file 工具不再被永久剥夺）——
+    //    只用 toolChoice 在「首轮」强制触发官方 web_search；tools 字段始终等于 openAiTools（字节稳定）。
+    //    （1.1.30+ 前缀缓存稳定：网络类本地工具已由 toOpenAITools 统一剔除，不再按「时效性」二次替换 tools，
+    //      否则时效轮与普通轮的 tools 字段不同 → 整段前缀缓存漂移、命中率骤降。）
     if (isDeepResp || nativeSearch.isResponsesNativeSearch(cfg)) {
       const dec = computeOfficialSearch(payload, this._officialSearchStarted, openAiTools);
       if (dec) {
         this._officialSearchStarted = dec.started;
-        options.tools = dec.tools;
         if (dec.toolChoice) options.toolChoice = dec.toolChoice;
         else delete options.toolChoice;
         console.log('[fox-ai] official web_search forced (this turn), query=', String(dec.query || '').slice(0, 50), 'forceChoice=', !!dec.toolChoice);
       } else {
+        delete options.toolChoice;
         // 非时效 / 用户要本地工具：保留完整工具集（含本地 file 工具 + 官方 web_search）
         console.log('[fox-ai] official web_search not forced this turn, full tools kept (', (openAiTools.length), 'tools )');
       }
@@ -3369,6 +3568,20 @@ class AgentSession {
             summary
           });
         }
+        // 记录产物（任务完成后统一展示）：按路径去重合并，同文件多轮编辑只保留最新操作
+        const artifactOp = name === 'delete_file'
+          ? '删除'
+          : (name === 'write_file' && _reviewBefore == null ? '新增' : name === 'write_file' ? '覆盖' : '修改');
+        const ds = ws.diffStat(_reviewBefore || '', name === 'delete_file' ? '' : (after || ''));
+        const artExisting = this._artifacts.find((x) => x.path === args.path);
+        if (artExisting) {
+          artExisting.op = artifactOp;
+          artExisting.name = name;
+          artExisting.added = ds.added;
+          artExisting.removed = ds.removed;
+        } else {
+          this._artifacts.push({ name, path: args.path, op: artifactOp, added: ds.added, removed: ds.removed });
+        }
       }
       // 记录 read_file 调用（用于去重）—— 成功执行后存档，按「路径+区间」签名区分，避免不同区间被误判为重复
       if (name === 'read_file' && args && args.path) {
@@ -3833,6 +4046,10 @@ class AgentSession {
       const toolsText = parts.protocol === 'native'
         ? JSON.stringify(tools.toOpenAITools())
         : tools.toTextManual();
+      // 缓存工具定义文本：流式期间 _emitContextUsageDelta 每 ~100 字触发一次，
+      // 每次都重序列化全量工具 schema（sanitizeSchema × N + 排序）非常浪费 CPU，
+      // 而 tools 字段已字节稳定（toOpenAITools 对云端固定全集），缓存完全安全。
+      this._lastToolsText = toolsText;
       const data = contextUsage.measureContext({
         baseSystem: parts.baseSystem,
         memoryText: parts.memoryText,
@@ -3865,9 +4082,9 @@ class AgentSession {
       const extraTokens = Math.max(1, Math.round(extraChars / 2));
       const history = [...(parts.history || [])];
       history.push({ role: 'assistant', content: '█'.repeat(Math.min(extraChars, 200)) });
-      const toolsText = parts.protocol === 'native'
+      const toolsText = this._lastToolsText || (parts.protocol === 'native'
         ? JSON.stringify(tools.toOpenAITools())
-        : tools.toTextManual();
+        : tools.toTextManual());
       const data = contextUsage.measureContext({
         baseSystem: parts.baseSystem,
         memoryText: parts.memoryText,

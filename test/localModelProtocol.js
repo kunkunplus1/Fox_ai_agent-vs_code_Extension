@@ -22,6 +22,8 @@ function modelSupportsNativeTools(cfg) {
     if (model.includes(h)) return false;
   }
   if (/^o[13]-/.test(model)) return false;
+  // DeepSeek 专用适配：工具不参与前缀缓存，默认走 text 以提升命中率
+  if (provider === 'deepseek' || provider === 'openrouter' && model.includes('deepseek')) return false;
   return true;
 }
 
@@ -45,7 +47,7 @@ check('ollama qwen2.5-coder 走 text', !modelSupportsNativeTools({ provider: 'ol
 check('lm studio 走 text', !modelSupportsNativeTools({ provider: 'lmstudio', model: 'local-model', meta: { local: true } }));
 check('custom 本地 .gguf 走 text', !modelSupportsNativeTools({ provider: 'custom', model: 'some-model.gguf', meta: { local: true } }));
 check('custom 本地 qwen3.6 走 text', !modelSupportsNativeTools({ provider: 'custom', model: 'Qwen3.6-35B', meta: { local: true } }));
-check('deepseek 云端 deepseek-chat 走 native', modelSupportsNativeTools({ provider: 'deepseek', model: 'deepseek-chat', meta: { local: false } }));
+check('deepseek 云端 deepseek-chat 走 text（工具不可缓存，走 text 提命中率）', !modelSupportsNativeTools({ provider: 'deepseek', model: 'deepseek-chat', meta: { local: false } }));
 check('openai gpt-4o 走 native', modelSupportsNativeTools({ provider: 'openai', model: 'gpt-4o', meta: { local: false } }));
 check('anthropic 强制 native', modelSupportsNativeTools({ provider: 'claude', model: 'claude-sonnet-4', transport: 'anthropic', meta: { local: false } }));
 check('deepseek-r1 走 text', !modelSupportsNativeTools({ provider: 'custom', model: 'DeepSeek-R1-Distill-Qwen-1.5B', meta: { local: false } }));

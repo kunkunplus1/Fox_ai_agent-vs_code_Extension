@@ -750,6 +750,8 @@
     const completion = typeof data.completionTokens === 'number' ? data.completionTokens : 0;
     const hitRate = typeof data.hitRate === 'number' ? data.hitRate : 0;
     const hitPct = Math.round(hitRate * 100);
+    const sessionHitRate = typeof data.sessionHitRate === 'number' ? data.sessionHitRate : null;
+    const sessionPct = sessionHitRate == null ? null : Math.round(sessionHitRate * 100);
     // 估算节省：DeepSeek/OpenAI 命中部分约按 50% 计费，保守按命中 token 的 50% 算
     const saved = Math.round(cached * 0.5);
     let cls = 'cache-status';
@@ -764,8 +766,11 @@
     else { cls += ' hit-none'; icon = '🧊'; }
     if (data.driftByHash) cls += ' drift';
     if (data.hitDrop) cls += ' drop';
+    const hitLabel = sessionPct == null
+      ? icon + ' 前缀缓存命中 ' + hitPct + '%'
+      : icon + ' 本轮命中 ' + hitPct + '% · 会话累计 ' + sessionPct + '%';
     const parts = [
-      icon + ' 前缀缓存命中 ' + hitPct + '%',
+      hitLabel,
       '命中 ' + formatTokens(cached),
       '输出 ' + formatTokens(completion)
     ];
@@ -1456,6 +1461,107 @@
     scrollDown(true);
   }
 
+  function fmtTokenCount(n) {
+    const v = Number(n) || 0;
+    return v >= 1000 ? (v / 1000).toFixed(1) + 'k' : String(v);
+  }
+
+  function buildArtifactReport(msg) {
+    const files = (msg && msg.files) || [];
+    const title = (msg && msg.title) || '';
+    const text = (msg && msg.text) || '';
+    const lines = [];
+    lines.push('# 狐狸 AI 任务报告');
+    lines.push('');
+    lines.push('> 生成时间：' + new Date().toLocaleString('zh-CN'));
+    if (title) { lines.push(''); lines.push('## 任务'); lines.push(''); lines.push(String(title).replace(/\s+/g, ' ')); }
+    lines.push('');
+    lines.push('## 改动文件（' + files.length + ' 个）');
+    lines.push('');
+    if (files.length) {
+      lines.push('| 操作 | 文件 | 增 | 删 |');
+      lines.push('| --- | --- | --- | --- |');
+      for (const f of files) {
+        lines.push('| ' + (f.op || '') + ' | `' + (f.path || '') + '` | +' + (f.added || 0) + ' | -' + (f.removed || 0) + ' |');
+      }
+    } else {
+      lines.push('（无）');
+    }
+    if (typeof msg.sessionHitRate === 'number') {
+      lines.push('');
+      lines.push('## Token 用量（本任务）');
+      lines.push('');
+      lines.push('- 输入：约 ' + fmtTokenCount(msg.promptTokens) + ' token');
+      lines.push('- 输出：约 ' + fmtTokenCount(msg.completionTokens) + ' token');
+      lines.push('- 缓存命中：' + fmtTokenCount(msg.cachedTokens) + ' token（命中率 ' + msg.sessionHitRate + '%）');
+    }
+    if (text && String(text).trim()) {
+      lines.push('');
+      lines.push('## 完成总结');
+      lines.push('');
+      lines.push(String(text).slice(0, 4000));
+    }
+    return lines.join('\n');
+  }
+
+  function addArtifact(msg) {
+    hideWelcome();
+    const files = (msg && msg.files) || [];
+    const title = (msg && msg.title) || '';
+    const OP_LABEL = { '新增': '➕ 新增', '覆盖': '✏️ 覆盖', '修改': '✏️ 修改', '删除': '🗑 删除' };
+    const box = document.createElement('div');
+    box.className = 'review-card artifact-card';
+    let head = t('📦 本次任务产物');
+    if (title) head += ' · ' + escapeHtml(title);
+    const filesHtml = files.length
+      ? '<div class="artifact-files">' +
+        files.map(function (f) {
+          const p = f && f.path ? String(f.path) : '';
+          const op = OP_LABEL[f && f.op] || '📄';
+          const added = Number((f && f.added) || 0);
+          const removed = Number((f && f.removed) || 0);
+          const diff = (added || removed) ? '<span class="artifact-diff">+' + added + ' -' + removed + '</span>' : '';
+          return '<div class="artifact-file" data-path="' + escapeHtml(p) + '" title="' + t('点击打开') + '：' + escapeHtml(p) + '" role="button" tabindex="0">' +
+            '<span class="artifact-op">' + op + '</span>' +
+            '<code>' + escapeHtml(p) + '</code>' +
+            diff +
+            '</div>';
+        }).join('') +
+        '</div>'
+      : '<div class="review-body">' + t('（本次任务未修改文件）') + '</div>';
+    const statsHtml = (typeof msg.sessionHitRate === 'number')
+      ? '<div class="artifact-stats">🦊 输入 ' + fmtTokenCount(msg.promptTokens) +
+        ' · 输出 ' + fmtTokenCount(msg.completionTokens) +
+        ' · 缓存命中 ' + msg.sessionHitRate + '%（' + fmtTokenCount(msg.cachedTokens) + ' token）</div>'
+      : '';
+    box.innerHTML =
+      '<div class="review-head">' + head + '</div>' +
+      filesHtml +
+      statsHtml +
+      '<div class="artifact-actions">' +
+        '<button class="mini primary" data-act="export-report">📄 ' + t('导出报告（Markdown）') + '</button>' +
+      '</div>';
+    box.querySelectorAll('.artifact-file').forEach(function (el) {
+      const open = function () {
+        const p = el.getAttribute('data-path');
+        if (p) vscode.postMessage({ type: 'openFile', path: p });
+      };
+      el.addEventListener('click', open);
+      el.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      });
+    });
+    const exportBtn = box.querySelector('[data-act="export-report"]');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', function () {
+        // 复用 newFile 通道：把 Markdown 报告作为新文档打开（带 markdown 语法高亮），用户可另存
+        vscode.postMessage({ type: 'newFile', lang: 'markdown', code: buildArtifactReport(msg) });
+      });
+    }
+    messagesEl.appendChild(box);
+    scrollDown(true);
+  }
+
   function updateReviewButton(msg) {
     const box = msg.id ? messagesEl.querySelector('.review-card[data-review-id="' + msg.id + '"]') : messagesEl.querySelector('.review-card:last-child');
     if (!box) return;
@@ -1608,6 +1714,8 @@
   }
   if (workchainHead) {
     workchainHead.addEventListener('click', (e) => {
+      // 独立工作链页面不需要折叠功能
+      if (document.body.classList.contains('workchain-only')) return;
       if (e.target === workchainClear || workchainClear.contains(e.target)) return;
       if (e.target === workchainToggle || workchainToggle && workchainToggle.contains(e.target)) return;
       workchainPanel.classList.toggle('collapsed');
@@ -2341,6 +2449,9 @@
           break;
         case 'review':
           addReview(msg);
+          break;
+        case 'artifact':
+          addArtifact(msg);
           break;
         case 'reviewApplied':
           updateReviewButton(msg);

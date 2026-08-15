@@ -141,6 +141,8 @@ class ChatViewProvider {
     });
     /** 额外的可移动对话面板（WebviewPanel） */
     this.panels = new Set();
+    /** 独立工作链页面 webview 集合，由 workchainView.js 注册/注销 */
+    this._workchainWebviews = new Set();
     /** 上次上下文用量数据，关闭插件后再打开可恢复显示 */
     this.lastContextUsage = context.globalState.get('lastContextUsage') || null;
 
@@ -411,7 +413,7 @@ class ChatViewProvider {
         break;
       }
       case 'newFile': {
-        const doc = await vscode.workspace.openTextDocument({ content: msg.code || '' });
+        const doc = await vscode.workspace.openTextDocument({ content: msg.code || '', language: msg.lang || 'plaintext' });
         await vscode.window.showTextDocument(doc, { preview: false });
         break;
       }
@@ -642,11 +644,22 @@ class ChatViewProvider {
     return this._renderFor(webview);
   }
 
+  addWorkchainWebview(webview) {
+    if (webview) this._workchainWebviews.add(webview);
+  }
+
+  removeWorkchainWebview(webview) {
+    if (webview) this._workchainWebviews.delete(webview);
+  }
+
   post(msg) {
     const targets = [];
     if (this.view) targets.push(this.view.webview);
     for (const panel of this.panels) {
       if (panel && panel.webview) targets.push(panel.webview);
+    }
+    for (const wv of this._workchainWebviews) {
+      if (wv) targets.push(wv);
     }
     for (const webview of targets) {
       try {
@@ -1584,6 +1597,11 @@ class ChatViewProvider {
           this._pendingReviewCard = null;
           this.post({ type: 'review', files: card.files, text: card.text, id: card.id });
         }
+        if (this._pendingArtifact) {
+          const a = this._pendingArtifact;
+          this._pendingArtifact = null;
+          this.post(Object.assign({ type: 'artifact' }, a));
+        }
         if (this._pendingApplyReview) {
           const pending = this._pendingApplyReview;
           this._pendingApplyReview = null;
@@ -1800,6 +1818,15 @@ class ChatViewProvider {
           return;
         }
         self.post({ type: 'review', files: files || [], text: text || '', id: id || null });
+      },
+      artifact: (payload) => {
+        // 产物卡片：任务完成瞬间 session 可能仍被引用，先暂存、idle 后统一弹出，与审查卡片一致
+        self._pendingArtifact = payload || {};
+        if (!self.session && !self._planPendingSession) {
+          const a = self._pendingArtifact;
+          self._pendingArtifact = null;
+          self.post(Object.assign({ type: 'artifact' }, a));
+        }
       }
     };
   }

@@ -293,6 +293,7 @@
   "foxai.n293": "狐狸 AI · 代码库语义索引",
   "foxai.n294": "参与语义索引的文件扩展名（如 .ts、.py）。留空使用内置的常见代码与文档类型。",
   "foxai.n295": "索引的文件数量上限，防止超大仓库把内存吃满。",
+  "foxai.n296": "使用 DeepSeek 专用 /completions FIM 端点（Beta）而非 chat/completions。开启后前缀/后缀以原生参数提交，需把本补全的 baseUrl 设为 https://api.deepseek.com/beta 并使用支持 FIM 的模型；此模式下 fimStrategy 无效。",
   "foxai.n296": "索引超过这个小时数就在下次检索前自动重建。",
   "foxai.n297": "狐狸 AI · 结构化长期记忆",
   "foxai.n298": "启用按主题分文件的结构化长期记忆，检索时只加载与当前问题相关的主题，不再整段塞进上下文。",

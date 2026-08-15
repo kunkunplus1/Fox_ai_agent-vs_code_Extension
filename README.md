@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.8
+> **版本**：1.1.9
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -19,16 +19,15 @@
 
 本说明书面向最终使用者，说明如何安装、配置并正确使用本扩展的各项功能。有关实现细节与历史变更，请以源代码与发布说明为准。
 
-> **🦊 1.1.8 重大更新（综合能力发布）**：本版本为集大成发布，整合历次迭代能力，涵盖以下方面——
+> **🦊 1.1.9 更新**：本版在既有能力基础上，重点做了「省 Token」与「DeepSeek 前缀缓存命中」两方面工程优化，并新增任务成果展示。
 >
-> - **多厂商原生联网适配**：官方服务端联网搜索从仅 DeepSeek 扩展至 OpenAI、通义千问、智谱 GLM、Kimi（Moonshot）与 Claude，按各厂商官方形态分四类适配（Responses API 原生 `web_search`、通义 Chat `enable_search`、智谱 / Kimi 原生 `web_search` / `$web_search` 工具、Claude Messages server tool `web_search_20250305`），统一抽取真实来源 URL 透传至引用角标；新增 `src/nativeSearch.js` 并补充 41 项单元测试。
-> - **知识库与向量检索**：支持向量模型语义召回并与 AI 整理解耦、默认 RRF(K=60) 混合 BM25；多模态向量模型护栏、来源失效即作废的向量缓存、并集扫描与实时扫盘；新增自定义向量检索路径与「清空向量缓存」按钮。
-> - **引用角标可点化**：本地知识库来源可定位文件、官方 / 本地搜索来源可外链；数据层 `sourceStore` 与渲染层事件委托分离，晚到 URL 也能回填，无 URL 也始终可点。
-> - **中间栏正文与思考链**：架构级重构消息协议（thinking / final 通道分离、深度思考折叠面板回归）、逐字流式输出；工作链时间线微重构、状态提示移入工作链 `system_status` 步骤。
-> - **工具与稳定性**：官方搜索模式保留核心本地工具（反向过滤仅剔除纯联网抓取类）；修复泛指词误触、global 文件查找 glob、深度思考跨后端参数映射；压缩与上下文状态提示优化、RAG 死代码清理与测试补全（`npm test` 全绿）。
-> - **生图与镜像适配**：万相走百炼原生异步 `image-synthesis`、OpenAI DALL·E 走 `/images/generations`；`requestJson` 透传自定义头；恢复 KaTeX 公式渲染。
+> - **省 Token**：精简系统提示词（工作准则 / 多模态指南 / 编码铁律）；MCP 自写指南改为仅在开启 `foxAi.mcp.enabled` 时注入；精简工具 schema 描述；`foxAi.agent.maxToolOutput` 默认降为 4000；项目上下文注入预算下调。
+> - **DeepSeek 前缀缓存命中**：DeepSeek 的原生 `tools` 字段不参与前缀缓存，导致工具 schema 每轮原价计费、命中率封顶在约 85%。现默认对 DeepSeek 走 **text 协议**（工具写进 system、可缓存），长任务命中率可达约 98%；缓存预热补上最小 user 消息以稳定落缓存；状态栏显示「本轮命中 · 会话累计命中率」。可设 `foxAi.agent.toolProtocol=native` 覆盖回原生 function calling。
+> - **任务产物与报告**：任务完成后展示「📦 本次任务产物」卡片（改动文件 + 增删行数，点击打开文件），并支持一键「📄 导出报告（Markdown）」。
+> - **行内补全加强**：修复光标在最后一行时补全静默失效；新增上下文字符上限 `foxAi.inlineCompletion.maxContextChars`（默认 6000）与缩进感知，停止符收紧。
+> - **其它修复**：`edit_file` 删除行范围不再残留空行、diff 预览 CRLF 归一化、`read_file` 提示修正等。
 
-> **🦊 1.0.0 重大更新（对标主流 Agent 框架）**：补齐六大能力——子代理 / 并行 Agent / Agent Teams、后台异步 Agent（独立 worktree）、Checkpoint 回滚、生命周期 Hooks、全仓库向量 RAG 索引、结构化长期记忆。详见第六节 6.20–6.25。
+> **历史版本（1.0.0 → 1.1.23）已陆续补齐**：子代理 / 并行 Agent / 后台异步 Agent、Checkpoint 回滚、生命周期 Hooks、全仓库向量 RAG、结构化长期记忆、多厂商原生联网、知识库向量检索、引用角标可点化、深度思考、文生图、行内补全、沙盒自测、失败切换、本地弱模型适配等，详见第六节各小节。前缀缓存相关的历次迭代（稳定块前移、易变附录烤回源、只读工具去重、缓存预热等）统一收敛为上述「DeepSeek 前缀缓存命中」方案。
 
 ---
 
@@ -44,10 +43,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-1.1.8.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.9.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-1.1.8.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-1.1.9.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏使用狐狸图标（`media/fox.svg`），扩展详情页使用新头像图标（`media/fox-icon.png`）。
@@ -115,6 +114,8 @@
 - “运行 `npm test` 并把失败用例修掉。”
 
 过程中，深度思考过程以可折叠卡片展示，并标注计划、读取、执行、思考等分步状态，可随时展开查看。复杂任务会自动拆分为清单，逐项标记状态（待办 / 进行中 / 已完成）。
+
+任务完成后，对话里会汇总一张「📦 本次任务产物」卡片：列出本次创建 / 修改 / 删除的文件（含增删行数），点击文件名可直接在编辑器打开；卡片底部还提供「📄 导出报告（Markdown）」按钮，一键把任务标题、改动清单与 Token 用量整理成 Markdown 报告打开，可另存归档。
 
 ### 6.2 文件操作（读 / 写 / 编辑 / 删除）
 
@@ -206,7 +207,9 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - `foxAi.inlineCompletion.maxFileLines`：超过此行数的大文件跳过补全（**默认 8000**，超大文件限流以省 token，对标 Copilot 行为）。
 - `foxAi.inlineCompletion.debounce` / `.contextLines`：触发防抖（默认 350ms）与上下文行数（默认 60）。
 - `foxAi.inlineCompletion.suffixLines` / `.fimStrategy`：光标后取多少行作为后缀（**默认 30**），以及是否使用 Fill-in-the-Middle 格式（**默认 auto**）。代码段中间书写时，suffix 能帮模型知道后文结构，避免补全与后文冲突；`auto` 会根据模型名自动选 `diffusion` / `codellama` / `deepseek` / `starcoder` 等 FIM token 格式。
+- `foxAi.inlineCompletion.fimEndpoint`：**专用 FIM 端点开关（默认 false）**。开启后行内补全改走 DeepSeek Beta 的 `/completions` 端点（`prompt`/`suffix` 原生参数），需把本补全的 `baseUrl` 设为 `https://api.deepseek.com/beta` 且模型支持 FIM（如 `deepseek-coder` / `deepseek-v4-pro`）；此模式下 `fimStrategy` 失效。关闭时走原来的 chat/completions + FIM token 方式，向后兼容。
 - `foxAi.inlineCompletion.useProjectContext` / `.projectContextChars`：是否结合项目上下文（默认 true）/ 上下文最大字符数（默认 1000）。
+- `foxAi.inlineCompletion.maxContextChars`：补全前后文（不含项目上下文）的最大字符数（**默认 6000**），超出时前文优先保留、后文裁剪，控制每次补全的 token 消耗。
 
 > 提示：每次按键都会向模型发一次请求，若主模型较慢或按量计费，强烈建议把 `provider` + `model` 指向一个快模型（如 `qwen2.5-coder`、`deepseek-chat` 等）；不需要时可关闭 `enabled`。
 
@@ -481,7 +484,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 安全策略 | `foxAi.policy.mode` / `.blockedPaths` / `.blockedCommands` |
 | 知识库检索 | `foxAi.knowledgeBase.bm25Enabled` / `.topK`（检索 Top-K，默认 10） |
 | 项目扫描 | `foxAi.projectScan.cacheEnabled`（结果缓存，默认 true） |
-| 行内补全 | `foxAi.inlineCompletion.enabled`（默认 true） / `.provider`（供应商，默认空=主模型） / `.baseUrl` / `.apiKey` / `.model`（专用模型，默认空=主模型） / `.maxTokens`（默认 256） / `.maxFileLines`（默认 8000） / `.suffixLines`（后缀行数，默认 30） / `.fimStrategy`（FIM 格式，默认 auto） / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
+| 行内补全 | `foxAi.inlineCompletion.enabled`（默认 true） / `.provider`（供应商，默认空=主模型） / `.baseUrl` / `.apiKey` / `.model`（专用模型，默认空=主模型） / `.maxTokens`（默认 256） / `.maxFileLines`（默认 8000） / `.maxContextChars`（默认 6000） / `.suffixLines`（后缀行数，默认 30） / `.fimStrategy`（FIM 格式，默认 auto） / `.fimEndpoint`（专用 /completions FIM 端点开关，默认 false） / `.useProjectContext`（默认 true） / `.projectContextChars`（默认 1000） / `.debounce` / `.contextLines` |
 | 智能体（续） | `foxAi.agent.maxMessageBytes`（历史总字节硬上限，默认 1048576） / `.structuredOutput` / `.projectSkeleton`（L1 代码骨架，默认 true） |
 | 失败切换 | `foxAi.failover.enabled` / `.triggers` / `.maxRetries` / `.targets` |
 | 沙盒 | `foxAi.sandbox.enabled` / `.dir` / `.timeout` / `.allowDocker` |
@@ -606,10 +609,10 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 当输入总量很大（可达十万级 token）时，模型服务商的前缀缓存（Prompt Cache / KV Cache）能把「请求开头固定不变的那段」缓存下来，后续同前缀请求只计费 / 计算增量部分，大幅省 token 与延迟。fox-ai 做了一系列工程配合：
 
 - **铁打前缀（System Prompt 绝对硬编码）**：系统提示词与工具定义在请求最前面且一成不变；知识库检索、长期记忆、技能、任务清单、项目规则、项目结构、时间、代码审查意见等每轮变动内容，统一收集后注入「最后一条用户消息」前面（请求尾部、仅追加），绝不回写 system，确保前缀缓存整段命中。
-- **工具集固化**：云端模型始终发送全量工具定义，并按函数名排序固化序列化顺序，避免 `tools` 字段抖动破坏前缀。
-- **会话粘滞（X-Conversation-Id）**：每个会话生成一个稳定 `conversationId`，作为 `X-Conversation-Id` 请求头透传给 API，让同一会话的前缀缓存稳定粘滞到同一计算节点。
-- **缓存命中监控**：从各协议响应的 `usage` 中抽取缓存命中 token（OpenAI `prompt_tokens_details.cached_tokens`、DeepSeek `prompt_cache_hit_tokens`、Anthropic `cache_read_input_tokens`、Responses API `input_tokens_details.cached_tokens`），计算命中率，并通过 `cacheStats` 事件与日志上报；同时计算请求前缀（system+tools）的 SHA 指纹，一旦与本轮会话首次不一致即告警「前缀缓存将整段失效」，若上一轮有命中而本轮骤降为 0 亦告警。
-- **缓存预热（可选）**：设置 `foxAi.cacheWarmup.enabled = true` 后，新会话首轮会先发一个只含 system+tools、`max_tokens=1` 的请求，把「铁打前缀」提前灌进服务商缓存，使随后的真实大体量请求直接命中。默认关闭，以免产生额外调用。
+- **DeepSeek 专用适配（text 协议）**：DeepSeek 的原生 function calling 会把 `tools` 字段序列化在 messages 之后、不参与前缀缓存，导致工具 schema 每轮原价计费、命中率封顶在约 85%。因此扩展对 DeepSeek 默认走 **text 协议**，把工具定义写进 system（可缓存），长任务命中率可达约 98%；需要原生 function calling 时把 `foxAi.agent.toolProtocol` 设为 `native`。
+- **工具集固化**：非 DeepSeek 云端模型始终发送全量工具定义，并按函数名排序固化序列化顺序，避免 `tools` 字段抖动破坏前缀。
+- **缓存命中监控**：从各协议响应的 `usage` 中抽取缓存命中 token（OpenAI `prompt_tokens_details.cached_tokens`、DeepSeek `prompt_cache_hit_tokens`、Anthropic `cache_read_input_tokens`、Responses API `input_tokens_details.cached_tokens`），计算「本轮命中率」与「会话累计命中率」并通过 `cacheStats` 事件与状态栏上报；同时计算请求前缀（system+tools）的 SHA 指纹，一旦与本轮会话首次不一致即告警「前缀缓存将整段失效」，若上一轮有命中而本轮骤降为 0 亦告警。
+- **缓存预热（可选）**：设置 `foxAi.cacheWarmup.enabled = true` 后，新会话首轮会先发一个只含 system+tools、`max_tokens` 极小的请求，把「铁打前缀」提前灌进服务商缓存，使随后的真实大体量请求直接命中。默认关闭，以免产生额外调用。
 
 ---
 

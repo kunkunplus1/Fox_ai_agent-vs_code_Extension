@@ -173,8 +173,6 @@ function listRuntimes() {
   });
 }
 
-function getRuntime(id) { return RUNTIMES[id]; }
-
 function resolveSource(id, version) {
   const rt = RUNTIMES[id];
   if (!rt) throw new Error('未知运行时：' + id);
@@ -497,18 +495,14 @@ async function _doInstallRuntime(context, id, opts = {}) {
   }
 }
 
-function getInstalled(context) {
-  return context.globalState.get('foxAi.runtimes', {});
-}
-
 // os 在尾部再 require，避免部分环境缺包报错
 const os = require('os');
 
 module.exports = {
   ALLOWED_HOSTS, isHostAllowed,
-  RUNTIMES, listRuntimes, getRuntime, resolveSource,
+  RUNTIMES, listRuntimes, resolveSource,
   sha256File, verifyHash, downloadFile, extractArchive,
   backupUserPath, addToUserPath,
   needsElevation, runElevated, resetElevationCache,
-  installRuntime, getInstalled, auditLog
+  installRuntime, auditLog
 };

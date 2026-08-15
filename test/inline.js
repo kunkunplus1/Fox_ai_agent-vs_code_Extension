@@ -78,6 +78,63 @@ check('trimOverlap 去除结尾回显的光标后文本', () => eq(
   'hello '
 ));
 
+// —— 异步单测：fimCompleteOnce 专用 FIM 端点（DeepSeek Beta /completions）——
+const asyncChecks = [];
+function checkAsync(name, fn) { asyncChecks.push({ name, fn }); }
+
+checkAsync('fimCompleteOnce 命中 /completions 且取 choices[0].text', async () => {
+  const client = require('../src/client');
+  let calledUrl = null, calledBody = null;
+  const stub = async (url, opts) => { calledUrl = url; calledBody = opts.body; return { choices: [{ text: '  filled  ' }] }; };
+  const { promise } = client.fimCompleteOnce({
+    baseUrl: 'https://api.deepseek.com/beta/',
+    apiKey: 'k', model: 'deepseek-coder',
+    prompt: 'def f', suffix: 'return', maxTokens: 64, stop: ['\n\n'],
+    _requestJson: stub
+  });
+  const r = await promise;
+  if (calledUrl !== 'https://api.deepseek.com/beta/completions') throw new Error('url=' + calledUrl);
+  if (r.content !== '  filled  ') throw new Error('content=' + JSON.stringify(r.content));
+  if (calledBody.model !== 'deepseek-coder') throw new Error('model=' + calledBody.model);
+  if (calledBody.prompt !== 'def f') throw new Error('prompt=' + calledBody.prompt);
+  if (calledBody.suffix !== 'return') throw new Error('suffix=' + calledBody.suffix);
+  if (calledBody.max_tokens !== 64) throw new Error('max_tokens=' + calledBody.max_tokens);
+  if (!Array.isArray(calledBody.stop) || calledBody.stop[0] !== '\n\n') throw new Error('stop=' + JSON.stringify(calledBody.stop));
+  if (calledBody.stream !== false) throw new Error('stream=' + calledBody.stream);
+});
+
+checkAsync('fimCompleteOnce 无 suffix 时不发送 suffix 字段', async () => {
+  const client = require('../src/client');
+  let calledBody = null;
+  const stub = async (url, opts) => { calledBody = opts.body; return { choices: [{ text: '' }] }; };
+  const { promise } = client.fimCompleteOnce({
+    baseUrl: 'https://api.deepseek.com/beta', apiKey: 'k', model: 'm',
+    prompt: 'p', maxTokens: 16, _requestJson: stub
+  });
+  await promise;
+  if ('suffix' in calledBody) throw new Error('suffix 不应出现：' + JSON.stringify(calledBody));
+});
+
+checkAsync('fimCompleteOnce 服务端 error 抛异常', async () => {
+  const client = require('../src/client');
+  const stub = async () => ({ error: { message: 'bad model' } });
+  let threw = false;
+  try {
+    const { promise } = client.fimCompleteOnce({ baseUrl: 'x', apiKey: 'k', model: 'm', prompt: 'p', _requestJson: stub });
+    await promise;
+  } catch (e) {
+    threw = true;
+    if (!/bad model/.test(e.message)) throw new Error('msg=' + e.message);
+  }
+  if (!threw) throw new Error('未抛错');
+});
+
 Module._load = origLoad;
-console.log('\n结果：通过 ' + pass + ' / 失败 ' + fail);
-process.exit(fail ? 1 : 0);
+(async () => {
+  for (const ac of asyncChecks) {
+    try { await ac.fn(); pass++; console.log('  ✓ ' + ac.name); }
+    catch (e) { fail++; console.log('  ✗ ' + ac.name + ' → ' + e.message); }
+  }
+  console.log('\n结果：通过 ' + pass + ' / 失败 ' + fail);
+  process.exit(fail ? 1 : 0);
+})();

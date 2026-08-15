@@ -293,6 +293,7 @@
   "foxai.n293": "Fox AI · Codebase Semantic Index",
   "foxai.n294": "File extensions to include in the semantic index (e.g. .ts, .py). Empty uses the built-in defaults.",
   "foxai.n295": "Maximum number of files to index, protecting memory on huge repositories.",
+  "foxai.n296": "Use the dedicated DeepSeek /completions FIM endpoint (Beta) instead of chat/completions. When on, the prefix/suffix are submitted as native params; set this completion's baseUrl to https://api.deepseek.com/beta and use a FIM-capable model. fimStrategy is ignored in this mode.",
   "foxai.n296": "Rebuild the index automatically before the next search once it is older than this many hours.",
   "foxai.n297": "Fox AI · Structured Long-term Memory",
   "foxai.n298": "Enable topic-based long-term memory. Only topics relevant to the current question are loaded into context.",
