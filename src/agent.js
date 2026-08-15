@@ -26,6 +26,7 @@ const projectScan = require('./projectScan');
 const reviewer = require('./reviewer');
 const { shouldAutoContinue, buildContinuePrompt, isStuckRepeat } = require('./autoContinue');
 const reasoning = require('./reasoningParams'); // 深度思考：跨后端参数映射
+const providerProfiles = require('./providerProfiles'); // 厂商专属适配：缩小厂商原生 vs 第三方 agent 差距
 
 const fs = require('fs');
 const os = require('os');
@@ -420,11 +421,15 @@ ${structured}${deepThinkingHint}
 8. 如果回复文本里没有任何工具调用块，系统会把它当作最终回答直接展示给用户。${codingRules}`;
 
   const commonUsed = isLocal ? commonLocal : common;
+  // 厂商专属适配：缩小「厂商原生 agent vs 第三方 agent」在同一模型上的质量差距。
+  // 文本随 system 前缀一起缓存、字节稳定；可设 foxAi.agent.providerProfile 覆盖（auto / deepseek / openai / claude / none / 自定义文本）。
+  const providerProfile = providerProfiles.resolveProfile(cfg);
+  const withProfile = providerProfile ? (commonUsed + '\n\n' + providerProfile) : commonUsed;
 
 
 
   if (protocol === 'text') {
-    return `${commonUsed}
+    return `${withProfile}
 
 【调用工具的方式】
 你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看 <foxtool> 块：
@@ -443,7 +448,7 @@ ${structured}${deepThinkingHint}
 ${tools.toTextManual(queryText, cfg)}`;
   }
 
-  return commonUsed;
+  return withProfile;
 }
 
 /**
@@ -3806,7 +3811,12 @@ class AgentSession {
     const cfg = this.cfg || {};
     const maxToolOutput = cfg.maxToolOutput || 8000;
     if (text.length > maxToolOutput) {
-      text = text.slice(0, maxToolOutput) + `\n…（输出已截断，原 ${text.length} 字）`;
+      // 智能截断（头+尾）：与 tools/_truncate 保持一致，保留尾部关键报错，避免弱模型误判
+      const headLen = Math.floor(maxToolOutput * 0.6);
+      const tailLen = maxToolOutput - headLen;
+      text = text.slice(0, headLen)
+        + '\n…（输出已截断，原 ' + text.length + ' 字，中间省略）…\n'
+        + text.slice(-tailLen);
     }
     const status = isError ? 'error' : 'ok';
     let observe;

@@ -1484,10 +1484,14 @@ function _truncate(result, ctx) {
     text = JSON.stringify(result);
   }
   const limit = (ctx && ctx.maxToolOutput) || 8000;
-  if (text.length > limit) {
-    return text.slice(0, limit) + `\n…（输出过长，已截断，共 ${text.length} 字）`;
-  }
-  return text;
+  if (text.length <= limit) return text;
+  // 智能截断：头 + 尾。命令输出 / 测试结果 / 日志的关键报错与失败摘要常在尾部，
+  // 从头硬截断会丢掉失败原因，导致模型（尤其弱模型）误判“成功”或反复重试。
+  const headLen = Math.floor(limit * 0.6);
+  const tailLen = limit - headLen;
+  return text.slice(0, headLen)
+    + '\n…（输出过长已截断，共 ' + text.length + ' 字，中间省略；如需完整内容请用更精确参数重新调用）…\n'
+    + text.slice(-tailLen);
 }
 
 module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema };

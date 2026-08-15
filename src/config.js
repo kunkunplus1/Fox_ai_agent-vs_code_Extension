@@ -2,11 +2,27 @@
 
 const vscode = require('vscode');
 const { PROVIDERS } = require('./providers');
+const providerProfiles = require('./providerProfiles');
 
 const SECRET_PREFIX = 'foxAi.apiKey.';
 
 function conf() {
   return vscode.workspace.getConfiguration('foxAi');
+}
+
+/** 取配置项：用户显式设置过则用它，否则用 fallback（用于厂商速度默认值，避免覆盖用户手填） */
+function resolvedOr(c, key, fallback) {
+  try {
+    const insp = c.inspect(key);
+    if (insp) {
+      const v = insp.globalValue !== undefined ? insp.globalValue
+        : insp.workspaceValue !== undefined ? insp.workspaceValue
+        : insp.workspaceFolderValue !== undefined ? insp.workspaceFolderValue
+        : undefined;
+      if (v !== undefined) return v;
+    }
+  } catch (_) {}
+  return fallback;
 }
 
 function currentProviderId() {
@@ -123,8 +139,15 @@ async function resolve(context) {
     model: modelName(id),
     apiKey: await getApiKey(context, id),
     temperature: c.get('temperature', 0.3),
-    maxTokens: c.get('maxTokens', meta.local ? 1536 : 2048),
-    timeout: c.get('timeout', 30000),
+    // 厂商速度默认：DeepSeek/OpenAI/Claude 各有延迟与输出特性，未显式设置时套用专属 timeout/maxTokens
+    maxTokens: (() => {
+      const sp = providerProfiles.resolveSpeed({ provider: id, model: modelName(id), transport: (PROVIDERS[id] && PROVIDERS[id].transport) || 'openai', local: !!meta.local });
+      return resolvedOr(c, 'maxTokens', (sp && sp.maxTokens) || (meta.local ? 1536 : 2048));
+    })(),
+    timeout: (() => {
+      const sp = providerProfiles.resolveSpeed({ provider: id, model: modelName(id), transport: (PROVIDERS[id] && PROVIDERS[id].transport) || 'openai', local: !!meta.local });
+      return resolvedOr(c, 'timeout', (sp && sp.timeout) || 60000);
+    })(),
     maxHistory: c.get('maxHistory', 20),
     systemPrompt: c.get('systemPrompt', ''),
     forceNonStream: c.get('forceNonStream', false),
@@ -230,6 +253,8 @@ async function resolve(context) {
     maxSteps: c.get('agent.maxSteps', meta.local ? 8 : 12),
     maxContinues: c.get('agent.maxContinues', 3),
     toolProtocol: c.get('agent.toolProtocol', 'auto'),
+    // 厂商专属适配：auto（按 provider 自动选）/ deepseek / openai / claude / none / 自定义文本
+    providerProfile: c.get('agent.providerProfile', 'auto'),
     // —— 本地弱模型辅助模式设置（1.1.17 / 1.1.19）——
     localWeakModelMode: weakModeSetting,
     localWeak: localWeak, // 便捷布尔，agent 直接读它判断是否进入弱模型适配逻辑
