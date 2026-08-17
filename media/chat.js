@@ -300,12 +300,15 @@
     const s = String(text || '');
     if (!s || s.indexOf('://') === -1) return false;
     let changed = false;
-    const re = /^[ \t]*(?:\[\^?(\d+)\^?\][ \t]*)?(.+?)[ \t]*\r?\n[ \t]*(?:URL|url|链接|网址)[:：][ \t]*(https?:\/\/\S+)/gm;
+    // 后端 buildSourcesText 生成「[n] 标题\nURL: url\n摘要」；这里把摘要（snippet）也一并收割，
+    // 让引用浮窗能展示来源内容摘要（参考 DSH WebSource.snippet），而不只是标题 + 链接。
+    const re = /^[ \t]*(?:\[\^?(\d+)\^?\][ \t]*)?(.+?)[ \t]*\r?\n[ \t]*(?:URL|url|链接|网址)[:：][ \t]*(https?:\/\/\S+)(?:[ \t]*\r?\n[ \t]*([^\r\n]+))?/gm;
     let m;
     while ((m = re.exec(s))) {
       const num = m[1] ? Number(m[1]) : 0;
       const title = String(m[2] || '').trim();
       const url = String(m[3] || '').trim();
+      const snippet = String(m[4] || '').trim().slice(0, 200);
       if (!title || !url) continue;
       const key = normKey(title);
       if (key.length >= 2) {
@@ -317,8 +320,8 @@
       }
       if (num > 0) {
         const prev = citeUrlByNum[num];
-        if (!prev || prev.url !== url || prev.title !== title) {
-          citeUrlByNum[num] = { title, url };
+        if (!prev || prev.url !== url || prev.title !== title || (snippet && prev.snippet !== snippet)) {
+          citeUrlByNum[num] = { title, url, snippet: snippet || (prev && prev.snippet) || '' };
           changed = true;
         }
       }
@@ -447,7 +450,7 @@
       const label = found ? found.title : ('来源 ' + num);
       const url = found ? found.url : '';
       const kb = found && found.localPath ? found : findKbSource(label);
-      cites.push({ label, url, type: kb ? 'kb' : '', localPath: kb ? kb.file : '' });
+      cites.push({ label, url, snippet: (found && found.snippet) || '', type: kb ? 'kb' : '', localPath: kb ? kb.file : '' });
       numMap[num] = idx;
       return idx;
     }
@@ -532,14 +535,14 @@
   const kbSourceMap = {};
   function recordSources(fid, cites) {
     if (!fid) return;
-    sourceStore[fid] = cites.map((c) => ({ label: c.label || '', url: c.url || '', type: c.type || '', localPath: c.localPath || '' }));
+    sourceStore[fid] = cites.map((c) => ({ label: c.label || '', url: c.url || '', snippet: c.snippet || '', type: c.type || '', localPath: c.localPath || '' }));
   }
   function getSource(fid, idx) {
     const arr = sourceStore[fid];
     if (!arr) return null;
     const s = arr[Number(idx)];
     if (!s) return null;
-    return { label: s.label || '', url: s.url || '', type: s.type || '', localPath: s.localPath || '' };
+    return { label: s.label || '', url: s.url || '', snippet: s.snippet || '', type: s.type || '', localPath: s.localPath || '' };
   }
   // 测试/外部重置本地知识库来源映射（仅 Node 导出）
   function setKbSources(sources) {
@@ -613,6 +616,7 @@
     citePopupEl.className = 'cite-popup hidden';
     citePopupEl.innerHTML =
       '<div class="cite-popup-title"></div>' +
+      '<div class="cite-popup-snippet"></div>' +
       '<button type="button" class="cite-popup-link">打开来源 ↗</button>' +
       '<div class="cite-popup-url"></div>';
     document.body.appendChild(citePopupEl);
@@ -635,9 +639,15 @@
   function showCitePopup(anchor, src) {
     const pop = ensureCitePopup();
     const titleEl = pop.querySelector('.cite-popup-title');
+    const snippetEl = pop.querySelector('.cite-popup-snippet');
     const linkEl = pop.querySelector('.cite-popup-link');
     const urlEl = pop.querySelector('.cite-popup-url');
     titleEl.textContent = src.label || (src.type === 'kb' ? t('本地知识库文件') : t('来源'));
+    if (snippetEl) {
+      const sn = String((src && src.snippet) || '').trim();
+      snippetEl.textContent = sn;
+      snippetEl.style.display = sn ? '' : 'none';
+    }
     if (src.type === 'kb' && src.localPath) {
       linkEl.style.display = '';
       linkEl.textContent = '在资源管理器定位 ↗';
@@ -2126,7 +2136,9 @@
     runBar.classList.toggle('paused', state === 'paused');
     runText.textContent = STATE_TEXT[state] || t('运行中…');
     btnPause.classList.toggle('hidden', state === 'paused' || state === 'pausing');
-    btnResume.classList.toggle('hidden', state !== 'paused');
+    // pausing 是「已点暂停、等待工具/请求走到下一个闸口」的过渡态：此时保留「继续」可点，
+    // 让用户能立即反悔取消暂停，而不是两个按钮都被隐藏、只能干等或点停止。
+    btnResume.classList.toggle('hidden', state !== 'paused' && state !== 'pausing');
     btnSend.textContent = busy ? t('运行中…') : t('发送');
     btnSend.disabled = busy;
     btnAttach.disabled = busy;

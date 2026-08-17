@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.12",
+  "version": "1.1.13",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -33,7 +33,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js && node test/staticPrefix.js && node test/providerProfiles.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js && node test/staticPrefix.js && node test/providerProfiles.js && node test/layeredContext.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -654,7 +654,7 @@
           },
           "foxAi.maxHistory": {
             "type": "number",
-            "default": 20,
+            "default": 40,
             "description": "%foxai.n125%"
           },
           "foxAi.includeFileContext": {
@@ -1273,7 +1273,7 @@
           },
           "foxAi.knowledgeBase.maxChars": {
             "type": "number",
-            "default": 8000,
+            "default": 3000,
             "description": "%foxai.n173%"
           },
           "foxAi.knowledgeBase.chunkSize": {
@@ -1881,6 +1881,12 @@
             "type": "number",
             "default": 1048576,
             "description": "%foxai.n245%"
+          },
+          "foxAi.agent.maxHistoryTokens": {
+            "type": "number",
+            "default": 0,
+            "markdownDescription": "历史 token 预算（前缀缓存优化）：历史以只追加方式增长，仅当超过此预算时才从最早截断。相比固定条数滑动窗口，token 预算窗口更大、截断频率更低，前缀更稳定、缓存命中率更高。0 表示自动（优先 contextWindow×60%，否则默认 60000，约 DeepSeek 128K 的一半）。",
+            "order": 15
           },
           "foxAi.agent.structuredOutput": {
             "type": "boolean",

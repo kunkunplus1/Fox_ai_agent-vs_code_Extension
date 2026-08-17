@@ -711,6 +711,52 @@ function buildFileTree(root, maxDepth = 2, skip = new Set(['node_modules', '.git
   return { root, nodes: walk(root, 1) };
 }
 
+/**
+ * L1 极速层用的精简文件树文本：只输出「目录 / 文件」层级路径，不带角色/大小/骨架。
+ * 目标是 ≤ 约 1.5K token、随会话常驻可缓存，比完整的「项目概览 + 代码骨架」轻得多，
+ * 让「你好」这类轻问只走这一层就能命中前缀缓存、秒回。
+ * @param {string} root 项目根目录
+ * @param {number} [maxDepth=2] 递归深度
+ * @param {number} [maxEntries=120] 最多输出多少条（防止超大仓库撑爆 L1）
+ * @param {Set<string>} [skip] 跳过的目录名
+ */
+function renderFileTreeText(root, maxDepth = 2, maxEntries = 120, skip) {
+  const SKIP = skip || new Set(['node_modules', '.git', '.vscode', '__pycache__', '.vs', '.venv', 'venv', 'out', 'dist', 'build', 'target', '.next', 'coverage', 'vendor']);
+  const lines = [];
+  let count = 0;
+  let truncated = false;
+
+  function walk(dir, depth, prefix) {
+    if (depth > maxDepth || truncated) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    const dirs = [];
+    const files = [];
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (SKIP.has(e.name)) continue;
+      (e.isDirectory() ? dirs : files).push(e.name);
+    }
+    dirs.sort((a, b) => a.localeCompare(b));
+    files.sort((a, b) => a.localeCompare(b));
+    for (const name of dirs) {
+      if (count >= maxEntries) { truncated = true; return; }
+      lines.push(prefix + '📁 ' + name + '/');
+      count++;
+      walk(path.join(dir, name), depth + 1, prefix + '  ');
+    }
+    for (const name of files) {
+      if (count >= maxEntries) { truncated = true; return; }
+      lines.push(prefix + '📄 ' + name);
+      count++;
+    }
+  }
+
+  walk(root, 1, '');
+  if (truncated) lines.push('…（文件树已截断，用 list_dir / read_file 按需查看）');
+  return lines.join('\n');
+}
+
 /* ---------- 代码骨架（零依赖 AST） ---------- */
 
 /**
@@ -1060,5 +1106,5 @@ function renderProjectContext(root, currentFile, opts = {}) {
 module.exports = {
   detectProject, projectOverviewText, buildFileTree, classifyFile,
   detectProjectCached, buildSkeletonMap, buildSkeletonMapCached,
-  astSkeleton, queryGraph, findProjectRoot, renderProjectContext
+  astSkeleton, queryGraph, findProjectRoot, renderProjectContext, renderFileTreeText
 };

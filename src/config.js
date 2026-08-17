@@ -148,7 +148,7 @@ async function resolve(context) {
       const sp = providerProfiles.resolveSpeed({ provider: id, model: modelName(id), transport: (PROVIDERS[id] && PROVIDERS[id].transport) || 'openai', local: !!meta.local });
       return resolvedOr(c, 'timeout', (sp && sp.timeout) || 60000);
     })(),
-    maxHistory: c.get('maxHistory', 20),
+    maxHistory: c.get('maxHistory', 40),
     systemPrompt: c.get('systemPrompt', ''),
     forceNonStream: c.get('forceNonStream', false),
     streamFormat: c.get('streamFormat', 'auto'),
@@ -298,6 +298,16 @@ async function resolve(context) {
     })(),
     maxToolOutput: c.get('agent.maxToolOutput', 8000),
     maxMessageBytes: c.get('agent.maxMessageBytes', 1024 * 1024),
+    // 历史 token 预算（前缀缓存优化）：历史 append-only 增长，只有超过此预算才从最早截断。
+    // 相比固定条数滑动窗口，token 预算窗口大、截断频率低，前缀更稳定、命中率更高。
+    // 优先级：显式配置 > contextWindow*0.6 > 默认 60000（约 DeepSeek 128K 的一半，留 system/tools/输出空间）。
+    maxHistoryTokens: (() => {
+      const explicit = c.get('agent.maxHistoryTokens', 0);
+      if (explicit > 0) return explicit;
+      const cw = c.get('contextWindow', 0);
+      if (cw > 0) return Math.floor(cw * 0.6);
+      return 60000;
+    })(),
     structuredOutput: c.get('agent.structuredOutput', false),
     projectSkeleton: c.get('agent.projectSkeleton', true),
     includeFileContext: c.get('includeFileContext', true),

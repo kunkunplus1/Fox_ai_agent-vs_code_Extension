@@ -249,7 +249,13 @@ function buildReasoningParams(cfg, opts) {
 
   // —— 关闭：对「默认就会思考」的模型主动下发关闭开关，否则它们会一直思考 ——
   if (!enabled) {
-    if (strategy === 'qwen') {
+    if (isDeepSeekResp && !isReasoner) {
+      // DeepSeek 非 reasoner（v4-flash / v4-pro）Responses API 默认开启思考（默认 effort=high），
+      // 必须显式下发 effort:none 关闭，否则模型以高强度思考产生超长意识流：反复规划、吃光
+      // max_output_tokens 导致正文为空/截断（「问一句干一个事」「模型没有返回任何内容」的根因）。
+      out.extraBody.reasoning = { effort: 'none' };
+      out.reason = '显式关闭 DeepSeek Responses 思考（effort=none）';
+    } else if (strategy === 'qwen') {
       out.extraBody.enable_thinking = false;
       out.reason = '显式关闭通义思考';
     } else if (strategy === 'zhipu') {
@@ -279,7 +285,12 @@ function buildReasoningParams(cfg, opts) {
       break;
     }
     case 'responses': {
-      const eff = mapEffort(provider, model, effort);
+      // DeepSeek Responses 的 reasoning.effort 取值是 none/minimal/low/medium/high/xhigh/max（区别于
+      // Chat 的 low/high/max）：minimal/low=低强度，medium/high/xhigh=高强度，max=最高。这里把内部
+      // low/medium/high 正确映射为 low/medium/max，避免沿用 Chat 的 high 取值导致强度错档。
+      const eff = isDeepSeekResp
+        ? (effort === 'low' ? 'low' : effort === 'high' ? 'max' : 'medium')
+        : mapEffort(provider, model, effort);
       const r = { effort: eff };
       // 官方 OpenAI 才支持思考摘要，第三方 /responses 实现可能不认
       if (provider === 'openai') r.summary = 'auto';

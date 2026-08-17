@@ -22,7 +22,7 @@ const PROFILES = {
 1. 你通过 <foxtool name="工具名">{"参数":"值"}</foxtool> 调用工具：工具块必须独立成段、参数是合法 JSON，写完立刻停止输出，等结果再继续。
 2. 先读后改、小步精确：用 read_file 看真实内容，用 edit_file 做最小修改，不要整文件重写，也不要反复读同一段。
 3. 直接推进任务、结论先行；回答用简体中文，代码块完整可运行，不冗长铺垫、不反复确认。`,
-    speed: { timeout: 45000, maxTokens: 2048 }
+    speed: { timeout: 45000, maxTokens: 4096 }
   },
   openai: {
     label: 'OpenAI',
@@ -30,7 +30,7 @@ const PROFILES = {
 1. 你通过原生 function calling 调用工具，参数按工具 schema 填写合法 JSON。
 2. 多步任务先想清步骤再逐步执行；回答优先结构化（列表 / 要点 / 代码块），结论先行。
 3. 只基于工具返回与检索内容下结论，不编造路径 / 版本号 / 数据；拿不准就明确说明不确定性。`,
-    speed: { timeout: 60000, maxTokens: 2048 }
+    speed: { timeout: 60000, maxTokens: 4096 }
   },
   claude: {
     label: 'Claude',

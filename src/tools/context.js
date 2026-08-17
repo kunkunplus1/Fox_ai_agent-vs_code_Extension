@@ -173,4 +173,25 @@ async function environmentBrief() {
   return lines.join('\n');
 }
 
-module.exports = { getDiagnostics, getEditorContext, environmentBrief, getDebugConsole, getForwardedPorts };
+/** L1 极速层：当前激活文件的 Diagnostics 摘要（前 3 个 Error）。无激活文件或无误报返回空串。 */
+function activeFileDiagnosticsBrief() {
+  try {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return '';
+    const uri = editor.document.uri;
+    const diags = vscode.languages.getDiagnostics(uri);
+    const errors = diags.filter((d) => d.severity === vscode.DiagnosticSeverity.Error);
+    if (!errors.length) return '';
+    const shown = errors.slice(0, 3).map((d) => {
+      const line = d.range.start.line + 1;
+      const col = d.range.start.character + 1;
+      const src = d.source ? `（${d.source}）` : '';
+      return `L${line}:${col} ${d.message.replace(/\s+/g, ' ')}${src}`;
+    });
+    return `当前文件 ${ws.relative(uri)} 的前 ${shown.length} 个报错：\n` + shown.map((s) => '- ' + s).join('\n');
+  } catch (_) {
+    return '';
+  }
+}
+
+module.exports = { getDiagnostics, getEditorContext, environmentBrief, getDebugConsole, getForwardedPorts, activeFileDiagnosticsBrief };

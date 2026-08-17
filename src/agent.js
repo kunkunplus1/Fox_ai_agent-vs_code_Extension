@@ -38,6 +38,17 @@ const DYN_MARK = '狐狸AI·动态上下文';
 // 之后随历史沉淀进缓存、每轮命中，不再每轮重烤成 miss。独立哨兵避免与易变块互相误判。
 const STABLE_MARK = '狐狸AI·稳定上下文';
 
+// —— 会话级缓存统计累加器（模块级，keyed by sessionId）——
+// AgentSession 每轮用户提问都会重建，导致 this._cacheSession* 每轮归零；若直接用它算
+// 「会话累计命中率」会把早前的冷启动轮（含预热请求）丢掉、显示值虚高，与 DeepSeek 官方口径对不上。
+// 这里用模块级 Map 跨轮次累计，让「会话累计命中率」与官方账单口径一致（含冷启动，真实偏低才真实）。
+const sessionCacheStats = new Map();
+function _accCache(key) {
+  let a = sessionCacheStats.get(key);
+  if (!a) { a = { cached: 0, prompt: 0, completion: 0 }; sessionCacheStats.set(key, a); }
+  return a;
+}
+
 // —— 模块级 LLM 并发限流 ——
 // 跨所有 session / 可移动面板限制「同时飞向模型的请求数」。多个面板/会话同时跑任务时，
 // 若不限制会瞬间并发多个 LLM 请求（主请求 + 审查子代理 + 多模态识图 + planner 子模型），
@@ -303,6 +314,19 @@ ${lines.join('\n')}
 </foxtool>`;
 }
 
+/**
+ * 深度思考的「提示词兜底」（模型没有原生思考开关时用）。与 buildSystemPrompt 解耦，
+ * 作为动态附录每轮注入，避免「切换思考开关 → system 前缀变化 → 前缀缓存整段失效」的漂移。
+ */
+function buildDeepThinkingHint(cfg) {
+  try {
+    const rp = reasoning.buildReasoningParams(cfg || {}, { stream: !((cfg && cfg.forceNonStream)) });
+    return rp && rp.promptHint ? rp.promptHint : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
   const base = cfg.systemPrompt || '你是一位资深工程师，回答简洁准确。';
   const extSection = buildExtensionCommandsSection();
@@ -310,13 +334,8 @@ function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
   // 用精简版系统提示，避免 21 条工作准则 + 12 条编码铁律 + 全工具 schema + MCP 自写指南把它压垮。
   const isLocal = !!(cfg.meta && cfg.meta.local);
 
-  // 深度思考：模型没有原生思考开关时（deepseek-chat、常规 GPT 等），用提示词兜底
-  const rp = reasoning.buildReasoningParams(cfg, { stream: !cfg.forceNonStream });
-  const deepThinkingHint = rp.promptHint ? '\n\n' + rp.promptHint : '';
-
   if (protocol === 'chat') {
     return `${base}
-${deepThinkingHint}
 
 （当前无法调用工具：可能是智能体模式未开启、当前协议/模型不支持 function calling，或 Responses 协议下工具调用被服务端拒绝。你只能基于用户提供的信息做文字回答，不要声称自己读取、修改或执行了任何操作。）`;
   }
@@ -377,7 +396,7 @@ ${deepThinkingHint}
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
 【当前环境】
-${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
+${structured}${nativeSearchHint}${citationGuard}
 
 【工作准则】
 1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。
@@ -408,7 +427,7 @@ ${structured}${nativeSearchHint}${citationGuard}${deepThinkingHint}
 
 你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
-${structured}${deepThinkingHint}
+${structured}
 
 【工作准则（精简版，针对本地模型）】
 1. 修改任何文件前，必须先用 read_file 看过真实内容；编辑用 edit_file 做最小必要改动，不要整文件重写。
@@ -524,9 +543,6 @@ class AgentSession {
     this._cachePrevHitRate = null;      // 上一轮命中率（用于「命中骤降」告警）
     this._cachePrevRequested = false;
     this._cacheWarmed = false;          // 预热是否已做过
-    this._cacheSessionCached = 0;       // 会话累计命中 token（用于会话级累计命中率，目标 98%）
-    this._cacheSessionPrompt = 0;       // 会话累计输入 token
-    this._cacheSessionCompletion = 0;   // 会话累计输出 token（供任务报告统计）
     // 长期记忆（跨会话记住用户偏好/约定/教训）
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
@@ -933,6 +949,7 @@ class AgentSession {
     const raw = (res && res.toolCalls) || [];
     return {
       content: (res && res.content) || '',
+      finishReason: (res && res.finishReason) || '',
       toolCalls: raw.map((tc) => ({
         id: tc.id,
         name: tc.name || (tc.function && tc.function.name),
@@ -1186,23 +1203,16 @@ class AgentSession {
   }
 
   /**
-   * 扫描当前工作区，生成供 agent 使用的项目结构概览文本（含多语言拆分指导）。
-   * 使用缓存版本避免每轮重扫；可选注入代码骨架（L1 摘要）。
-   * 与行内补全共用 projectScan.renderProjectContext，保证上下文一致。
+   * L1 极速层：生成精简的项目文件树（仅目录/文件层级，≤ 约 1.5K token）。
+   * 不再注入角色/代码骨架（那些改由 L2 read_file 按需读取），让「你好」这类轻问
+   * 只带这一小块稳定上下文，前缀缓存命中、秒回。
    */
   _buildProjectContext() {
     try {
       const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
       if (!folder) return '';
-      const cfg = this.cfg || {};
-      return projectScan.renderProjectContext(folder.uri.fsPath, null, {
-        maxChars: 2000,
-        actionable: true,
-        maxRoles: 24,
-        includeSkeleton: cfg.projectSkeleton !== false,
-        skeletonMaxFiles: 10,
-        includeNeighbors: false
-      });
+      const tree = projectScan.renderFileTreeText(folder.uri.fsPath, 2, 120);
+      return tree ? '【项目结构（文件树）】\n' + tree : '';
     } catch (_) {
       return '';
     }
@@ -1464,6 +1474,11 @@ class AgentSession {
   // 绝不写回 system、不烤回源（保持新鲜，避免历史污染），位于请求末尾、随轮 append-only。
   const dynParts = [];
   if (knowledgeText) dynParts.push(knowledgeText);
+  // 深度思考提示词兜底：放动态附录（每轮随开关刷新），避免写进 system 导致「切换思考开关→前缀漂移→缓存失效」
+  try {
+    const thinkHint = buildDeepThinkingHint(cfg);
+    if (thinkHint) dynParts.push('【深度思考】\n' + thinkHint);
+  } catch (_) {}
   // 弱本地模型防注意力漂移锚点（1.1.16）：由 queryText 派生、每轮都变 → 只在动态附录，不污染可缓存前缀
   if (this.protocol === 'text' && (cfg.meta && cfg.meta.local) && queryText) {
     try {
@@ -1473,6 +1488,12 @@ class AgentSession {
   }
   // 环境信息：随用户操作变化，作为动态附录注入到最后一条 user 消息尾部，不影响前缀缓存命中率
   if (envBrief) dynParts.push('【当前环境】\n' + envBrief);
+  // L1 极速层（易变部分）：当前激活文件的 Diagnostics 摘要（前 3 个 Error），每轮随 query 刷新。
+  // 极小（≤ 几百 token），放进动态附录尾部，不破坏可缓存的稳定前缀；让用户切文件后模型立刻知道新文件的报错。
+  try {
+    const diagBrief = ctxTools.activeFileDiagnosticsBrief();
+    if (diagBrief) dynParts.push('【当前文件报错】\n' + diagBrief);
+  } catch (_) {}
   // 主题记忆（查询相关，易变）→ 每轮注入
   if (topicMem) dynParts.push('【长期记忆】\n' + topicMem);
   // 对明确的时间查询，取真实时间——只进 dynamicAppendix（user 消息），绝不进 system
@@ -1484,6 +1505,10 @@ class AgentSession {
     } catch (_) {}
   }
   if (timeInfo) dynParts.push('【当前时间信息】\n' + timeInfo);
+  // L3 批处理模式（用户主动触发）：检测 /fix_all、/review 等指令，注入「并行分批 + 关注文件尾部报错」提示。
+  // 仅在命中时才注入（不进 stable，避免污染可缓存前缀）；这是对抗长上下文注意力衰减的关键。
+  const batchHint = buildBatchModeHint(queryText);
+  if (batchHint) dynParts.push(batchHint);
 
   // —— 稳定上下文块：规则/技能/结构/任务/人格/扁平记忆，跨轮字节稳定。
   // 首轮（源历史尚无稳定哨兵）注入一次并烤回 this.messages 源，之后随历史沉淀进缓存、每轮命中，
@@ -1698,6 +1723,15 @@ class AgentSession {
           // ---- 输出截断自动继续 ----
           const maxContinues = Math.max(0, Number(cfg.maxContinues) || 3);
           let willAutoContinue = shouldAutoContinue(result, cfg, this._continuesUsed);
+          // 可见正文为空时分两种情况：
+          // 1) 思考（reasoning）有内容但被截断 → 是「思考吃光输出预算、正文没空间」，应续跑补正文
+          //    （续跑轮已关闭思考），否则任务卡死在原地；
+          // 2) 思考也为空 → 模型真没返回任何东西，跳过续跑，避免白耗 3 次空转。
+          const _reasoningOnly = !String(visibleText || '').trim() && !!String(result.reasoning || '').trim();
+          if (willAutoContinue && !String(visibleText || '').trim() && !_reasoningOnly) {
+            willAutoContinue = false;
+            appendLog('agent', `[auto-continue-skip-empty] finishReason=${result.finishReason} 可见正文与思考均为空，跳过自动继续`);
+          }
           if (willAutoContinue) {
             // 非推进检测：若本轮续写内容几乎全落在上一轮文本里，说明模型原地重复空转，
             // 提前停止自动续跑（不再白白耗光 3 次），明确提示用户手动处理。
@@ -1712,7 +1746,11 @@ class AgentSession {
               this.emit('notice', { text: `模型输出达到长度上限，正在自动继续（${this._continuesUsed}/${maxContinues}）…` });
               // 静默插入 continue 提示：回传上一轮截断处的末尾原文，让模型从正确位置续写；
               // 不触发 UI 用户消息，只追加到历史供下次请求使用。
-              this.messages.push({ role: 'user', content: buildContinuePrompt(visibleText || String(result.reasoning || '')) });
+              // 正文空但思考被截断时，改为明确要求「直接输出最终答案」，避免模型接着思考又截断。
+              const _contMsg = _reasoningOnly
+                ? '你上一轮的思考过程因达到长度上限被截断，但还没输出最终答案。现在请直接输出完整的最终答案正文，不要再输出思考过程、不要调用任何工具。'
+                : buildContinuePrompt(visibleText || String(result.reasoning || ''));
+              this.messages.push({ role: 'user', content: _contMsg });
               // 标记下一轮请求强制文本协议（不给工具），让模型只续写正文
               this._lenContinue = true;
             }
@@ -1767,17 +1805,16 @@ class AgentSession {
             this.emit('step', { kind: 'done', title: '完成', status: 'ok' });
             // 任务完成：汇总本轮产物（创建/修改/删除的文件 + Token 用量）给用户一张成果卡片，可一键导出报告
             if (this._artifacts && this._artifacts.length) {
-              const sessionHitRate = this._cacheSessionPrompt > 0
-                ? Math.round((this._cacheSessionCached / this._cacheSessionPrompt) * 100)
-                : 0;
+              const acc = _accCache(this.sessionId || this.conversationId);
+              const sessionHitRate = acc.prompt > 0 ? Math.round((acc.cached / acc.prompt) * 100) : 0;
               this.emit('artifact', {
                 files: this._artifacts.map((a) => ({ path: a.path, op: a.op, added: a.added || 0, removed: a.removed || 0 })),
                 title: (this.task && this.task.title) || '',
                 text: String(visibleText || ''),
                 sessionHitRate,
-                cachedTokens: this._cacheSessionCached,
-                promptTokens: this._cacheSessionPrompt,
-                completionTokens: this._cacheSessionCompletion || 0
+                cachedTokens: acc.cached,
+                promptTokens: acc.prompt,
+                completionTokens: acc.completion
               });
             }
             return { finished: true, text: visibleText };
@@ -2573,11 +2610,12 @@ class AgentSession {
     const hitDrop = this._cachePrevRequested && prevHit != null && prevHit > 0.05 && stats.hitRate < 0.01;
     this._cachePrevHitRate = stats.hitRate;
     this._cachePrevRequested = true;
-    // 会话级累计命中率：跨多轮/多步把命中与输入 token 累计，给用户一个可对标的「98%」目标值
-    this._cacheSessionCached += stats.cachedTokens;
-    this._cacheSessionPrompt += stats.promptTokens;
-    this._cacheSessionCompletion += stats.completionTokens;
-    const sessionHitRate = this._cacheSessionPrompt > 0 ? this._cacheSessionCached / this._cacheSessionPrompt : 0;
+    // 会话级累计命中率：用模块级累加器跨轮次累计（含冷启动轮），与官方账单口径一致
+    const acc = _accCache(this.sessionId || this.conversationId);
+    acc.cached += stats.cachedTokens;
+    acc.prompt += stats.promptTokens;
+    acc.completion += stats.completionTokens;
+    const sessionHitRate = acc.prompt > 0 ? acc.cached / acc.prompt : 0;
     const report = {
       conversationId: this.conversationId,
       prefixHash,
@@ -2587,8 +2625,8 @@ class AgentSession {
       completionTokens: stats.completionTokens,
       hitRate: Math.round(stats.hitRate * 1000) / 1000,
       sessionHitRate: Math.round(sessionHitRate * 1000) / 1000,
-      sessionCachedTokens: this._cacheSessionCached,
-      sessionPromptTokens: this._cacheSessionPrompt,
+      sessionCachedTokens: acc.cached,
+      sessionPromptTokens: acc.prompt,
       driftByHash,
       hitDrop
     };
@@ -2627,6 +2665,12 @@ class AgentSession {
       console.log('[fox-ai] cache warmup priming conversation ' + this.conversationId);
       await b.nonStream(warmOpt);
       console.log('[fox-ai] cache warmup done');
+      // 预热是冷启动（0 命中）：把它的输入 token 计入会话累计，避免「会话累计命中率」虚高、与官方口径对不上
+      const acc = _accCache(this.sessionId || this.conversationId);
+      const warmPrompt = contextUsage.estimateTokens(typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg))
+        + contextUsage.estimateTokens('ping')
+        + contextUsage.estimateTokens(JSON.stringify(opt.tools || []));
+      acc.prompt += warmPrompt;
     } catch (e) {
       console.log('[fox-ai] cache warmup failed (ignored):', e && e.message);
     }
@@ -2728,14 +2772,31 @@ class AgentSession {
           this.emit('text', { text: t, channel: 'final', msg_id: this.finalMsgId });
         }
       },
-      onReasoning: (t) => { this.reasoningSeen = true; this._thinkingBuffer.reasoning += t; },
+      onReasoning: (t) => {
+        this.reasoningSeen = true;
+        this._thinkingBuffer.reasoning += t;
+        // 实时流式：把思考过程逐字推到 thinking 通道（右侧工作链「调用模型」步骤卡片），
+        // 让用户即时看到模型在思考什么，而不是等整轮结束才一次性蹦出（「看不到即时工作」的根因）。
+        // 文本协议（含 <fox:tool> 标签）与非流式 provider 不实时推，避免把工具标签/整段裸推。
+        if (this.protocol !== 'text' && !(cfg.forceNonStream || this.streamBroken)) {
+          // stream:true 标记这是「实时增量」：只用于工作链即时滚动，不落盘 transcript（避免增量膨胀），
+          // 轮末的全量 reasoning（无 stream 标记）才落盘，供重载/切换会话后恢复「已思考」内容。
+          this.emit('reasoning', { text: t, channel: 'thinking', msg_id: this.thinkingMsgId, stream: true });
+        }
+      },
       onToolCallStart: (name) => this.emit('toolPending', { name })
     };
 
     // —— 深度思考：按当前 provider/传输/协议映射成各家的思考参数 ——
     // 走 extraBody 通道并入请求体，四个后端入口（chat 流/非流、responses 流/非流、anthropic）都支持。
     const willStream = !(cfg.forceNonStream || this.streamBroken);
-    const rp = reasoning.buildReasoningParams(cfg, { stream: willStream });
+    // 续跑轮（长度截断自动继续）：关闭深度思考，让模型专注续写正文、不再生成超长 reasoning 吃光
+    // 输出预算导致再次截断（日志里 finishReason=incomplete + reasoning 截断后反复续跑空转的根因）。
+    // 关闭后 Responses 模式不再下发 reasoning 参数、chat 模式下发 thinking:disabled，均等价于「本轮不思考」。
+    const reasoningCfg = this._lenContinue
+      ? Object.assign({}, cfg, { deepThinking: Object.assign({}, cfg.deepThinking, { enabled: false }) })
+      : cfg;
+    const rp = reasoning.buildReasoningParams(reasoningCfg, { stream: willStream });
     this._reasoningPlan = rp;
     if (rp.extraBody && Object.keys(rp.extraBody).length) {
       options.extraBody = Object.assign({}, options.extraBody, rp.extraBody);
@@ -4130,7 +4191,8 @@ class AgentSession {
     }
     return clean(this.messages, this.protocol, cfg.maxHistory || 20, {
       maxBytesPerMessage: cfg.maxToolOutput || 8000,
-      maxTotalBytes: cfg.maxMessageBytes || 1024 * 1024
+      maxTotalBytes: cfg.maxMessageBytes || 1024 * 1024,
+      maxHistoryTokens: cfg.maxHistoryTokens || 0
     });
   }
 
@@ -4140,6 +4202,31 @@ class AgentSession {
    */
   _compactMessages() {
     const cfg = this.cfg || {};
+    // 历史 token 预算（前缀缓存优化）：优先按 token 预算裁剪源历史（窗口大、低频、前缀稳定、命中率高）；
+    // 未配置 token 预算才退回固定条数（旧行为）。裁剪同样不能切断 assistant(tool_calls)+tool 结果对。
+    const tokenBudget = cfg.maxHistoryTokens > 0 ? cfg.maxHistoryTokens : 0;
+    if (tokenBudget > 0) {
+      const { estimateTokens, messageText } = require('./contextUsage');
+      let totalTok = 0;
+      for (const m of this.messages) totalTok += estimateTokens(messageText(m)) + 4;
+      if (totalTok <= tokenBudget) return;
+      let start = 0;
+      while (totalTok > tokenBudget && start < this.messages.length - 4) {
+        const removed = this.messages[start];
+        let removeCount = 1;
+        if (removed.role === 'assistant' && removed.tool_calls) {
+          const ids = new Set(removed.tool_calls.map((t) => t.id));
+          let i = start + 1;
+          while (i < this.messages.length && this.messages[i].role === 'tool' && ids.has(this.messages[i].tool_call_id)) { i++; removeCount++; }
+        }
+        for (let i = 0; i < removeCount && start < this.messages.length; i++) {
+          totalTok -= estimateTokens(messageText(this.messages[start])) + 4;
+          this.messages.splice(start, 1);
+        }
+      }
+      while (this.messages.length && this.messages[0].role === 'tool') this.messages.shift();
+      return;
+    }
     const limit = Math.max(10, (cfg.maxHistory || 20) * 2);
     if (this.messages.length <= limit) return;
     let start = this.messages.length - limit;
@@ -4251,4 +4338,19 @@ function _isMultiStepTask(query) {
   return false;
 }
 
-module.exports = { AgentSession, Cancelled, QuotaError, isQuotaError, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask };
+/**
+ * L3 批处理模式检测（用户主动触发）：命中 /fix_all、/review 等指令时返回一段提示，
+ * 强制模型「并行分批 + 关注文件尾部最新报错」，对抗长上下文里的注意力衰减。
+ * 未命中返回空串。纯函数，可离线单测。
+ * @param {string} query 当前用户输入
+ */
+function buildBatchModeHint(query) {
+  const q = String(query || '');
+  if (!/(^|\s)[#\/](fix_all|fixall|review|fix)/i.test(q)) return '';
+  return `【批处理模式已触发（${q.trim().slice(0, 40)}）】
+- 这是一个批量任务：请用工具并行推进，每次处理 3-5 个文件，一批完成后再继续下一批。
+- 优先关注每个文件【尾部】的最新报错——上下文变长后注意力会衰减，尾部报错最关键，不要只看开头。
+- 先用 get_diagnostics 拉全量诊断，分批读文件、分批修复，最后统一跑一次测试/构建验证。`;
+}
+
+module.exports = { AgentSession, Cancelled, QuotaError, isQuotaError, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask, buildBatchModeHint, buildDeepThinkingHint };

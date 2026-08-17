@@ -64,30 +64,34 @@ function trimHistory(messages, protocol, maxHistory, opts) {
   let list = (messages || []).filter((m) => m && m.role !== 'system');
 
   // 1) 单条消息截断：防止 read_file / search_text / terminal 输出把单条消息撑爆
+  //    注意：clampMessage 是「前缀保持」的确定性截断（保留前 maxBytes 字符），不是改写——
+  //    同一条消息截断结果逐字节一致，截断一次后即冻结，不破坏前缀缓存。
   list = list.map((m) => clampMessage(m, maxBytesPerMsg));
 
-  // 1.5) 旧工具结果摘要化：超出「最近窗口」的旧 role:'tool' 长结果，剥离原始数据，
-  //      仅保留「调过什么 / 成败」的元摘要，既省 token 又保留执行轨迹（优于直接丢弃）。
-  const RECENT_TOOL_KEEP = 20; // 最近 20 条不摘要（约最近 10 轮，防止模型因摘要化丢失信息而反复重读）
-  const toolCutoff = Math.max(0, list.length - RECENT_TOOL_KEEP);
-  for (let i = 0; i < toolCutoff; i++) {
-    const m = list[i];
-    if (m && m.role === 'tool' && typeof m.content === 'string' && m.content.length > 500) {
-      const c = m.content;
-      const failed = /\[MCP 工具报错\]|status=error|执行失败/i.test(c.slice(0, 400));
-      // read_file 结果：保留前 300 字符的开场白，让模型记得「读过什么文件、内容第一行是什么」
-      const isReadFile = m.name === 'read_file';
-      const preview = isReadFile ? c.replace(/[\n\r]+/g, ' ').slice(0, 300) : '';
-      const previewPart = preview ? `，内容开头：「${preview}…」` : '';
-      list[i] = Object.assign({}, m, {
-        content: '[历史工具结果摘要] ' + (m.name || '工具') + ' 调用' + (failed ? '失败' : '成功') + '，原始结果约 ' + c.length + ' 字符' + previewPart + '（如需完整内容可重新调用该工具）。'
-      });
-    }
-  }
-
-  // 2) 超长截断：从尾部保留最近 limit 条，但不能把「assistant(tool_calls) + 其 tool 结果」
+  // 2) 超长截断：优先按「token 预算」截断（窗口大、低频、前缀更稳定，命中率更高）；
+  //    未配置 token 预算时退回固定条数窗口。两者都不能把「assistant(tool_calls) + 其 tool 结果」
   //    整块切断，否则会留下孤立 tool 消息导致 400。
-  if (list.length > limit) {
+  const maxHistoryTokens = opts.maxHistoryTokens > 0 ? opts.maxHistoryTokens : 0;
+  if (maxHistoryTokens > 0) {
+    let totalTok = 0;
+    for (const m of list) totalTok += estimateTokens(messageText(m)) + 4;
+    if (totalTok > maxHistoryTokens) {
+      let start = 0;
+      while (totalTok > maxHistoryTokens && start < list.length - 4) {
+        const removed = list[start];
+        let removeCount = 1;
+        if (removed.role === 'assistant' && removed.tool_calls) {
+          const ids = new Set(removed.tool_calls.map((t) => t.id));
+          let i = start + 1;
+          while (i < list.length && list[i].role === 'tool' && ids.has(list[i].tool_call_id)) { i++; removeCount++; }
+        }
+        for (let i = 0; i < removeCount && start < list.length; i++) {
+          totalTok -= estimateTokens(messageText(list[start])) + 4;
+          list.splice(start, 1);
+        }
+      }
+    }
+  } else if (list.length > limit) {
     let start = list.length - limit;
     while (start > 0 && list[start - 1] && list[start - 1].role === 'tool') start--;
     if (start > 0 && list[start - 1] && list[start - 1].role === 'assistant' && list[start - 1].tool_calls) {

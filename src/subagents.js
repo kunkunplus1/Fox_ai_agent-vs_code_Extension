@@ -52,7 +52,9 @@ const COMMON_RULES = `
 2. 你的上下文是隔离的，主代理看不到你的中间过程，**只会看到你最后一条结论**，所以结论必须自包含。
 3. 能用工具核实的就别猜；工具不可用时说明「无法核实」，不要编造文件路径、行号、函数名。
 4. 完成后直接输出结论，**不要再调用工具**。结论用 Markdown，控制在 400 字以内。
-5. 结论结尾必须有一行 \`结果：成功\` 或 \`结果：失败（原因）\`。`;
+5. 结论结尾必须有一行 \`结果：成功\` 或 \`结果：失败（原因）\`。
+6. 你的工具权限在启动时已固定，无权使用的工具**不要反复重试**，直接说明「该操作超出我的权限」并交给主代理处理。
+7. 你不能再派生子代理，也不能修改全局配置；需要这些能力时说明原因，让主代理来做。`;
 
 /**
  * 角色预设。
@@ -400,6 +402,11 @@ class SubagentRunner {
           result.summary = clip(content, MAX_SUMMARY);
           result.stopReason = 'done';
           result.ok = true;
+          // 输出被单次长度上限截断时，明确标记不完整，避免主代理把半截结论当真（参考 DSH partial-output 回传）
+          if (res && (res.finishReason === 'length' || res.finishReason === 'incomplete')) {
+            result.summary += '\n\n（注：结论因单次输出上限被截断，可能不完整。）';
+            result.stopReason = 'truncated';
+          }
           break;
         }
 

@@ -969,6 +969,10 @@ body[data-vscode-theme-kind="vscode-dark"] .reasoning-body { background: rgba(12
 .cite-popup-url {
   opacity: .7; font-size: 11px; word-break: break-all; max-height: 3.2em; overflow: auto;
 }
+.cite-popup-snippet {
+  opacity: .82; font-size: 12px; line-height: 1.5; word-break: break-word;
+  max-height: 4.6em; overflow: hidden; margin-bottom: 6px;
+}
 .reasoning-md ul, .reasoning-md ol { margin: 2px 0 8px; padding-left: 20px; }
 .reasoning-md li { margin: 2px 0; }
 .reasoning-md li > ol, .reasoning-md li > ul { margin-top: 2px; margin-bottom: 4px; }

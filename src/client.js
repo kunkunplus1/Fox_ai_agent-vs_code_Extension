@@ -205,21 +205,29 @@ function buildInlineSourcesText(text, queries) {
  */
 function extractCacheStats(usage) {
   if (!usage || typeof usage !== 'object') return null;
-  let cached = 0;
   const ptd = usage.prompt_tokens_details;
-  if (ptd && typeof ptd.cached_tokens === 'number') cached += ptd.cached_tokens;
-  if (typeof usage.prompt_cache_hit_tokens === 'number') cached += usage.prompt_cache_hit_tokens;
-  if (typeof usage.cache_read_input_tokens === 'number') cached += usage.cache_read_input_tokens;
   const itd = usage.input_tokens_details;
-  if (itd && typeof itd.cached_tokens === 'number') cached += itd.cached_tokens;
-  if (typeof usage.cached_tokens === 'number') cached += usage.cached_tokens;
-  if (typeof usage.total_cached_tokens === 'number') cached += usage.total_cached_tokens; // Gemini Interactions API
+  // 按优先级取「第一个出现的缓存命中字段」——多字段并存时不再累加，避免命中率虚高
+  // （例如部分厂商同时返回 prompt_cache_hit_tokens 与 total_cached_tokens 会被旧逻辑重复累加）。
+  const candidates = [
+    usage.prompt_cache_hit_tokens,      // DeepSeek
+    ptd && ptd.cached_tokens,           // OpenAI Chat
+    usage.cache_read_input_tokens,      // Anthropic
+    itd && itd.cached_tokens,           // OpenAI/DeepSeek Responses
+    usage.cached_tokens,                // 通用
+    usage.total_cached_tokens           // Gemini
+  ];
+  let cached = null;
+  for (const c of candidates) {
+    if (typeof c === 'number') { cached = c; break; }
+  }
+  if (cached === null) return null;
   let promptTokens = 0;
   if (typeof usage.prompt_tokens === 'number') promptTokens = usage.prompt_tokens;
   else if (typeof usage.input_tokens === 'number') promptTokens = usage.input_tokens;
   let miss = 0;
   if (typeof usage.prompt_cache_miss_tokens === 'number') miss = usage.prompt_cache_miss_tokens;
-  if (!promptTokens && (cached || miss)) promptTokens = cached + miss;
+  if (!promptTokens) promptTokens = cached + miss;
   const total = promptTokens || cached;
   const hitRate = total > 0 ? cached / total : 0;
   const completionTokens =
@@ -1089,12 +1097,14 @@ function toResponsesInput(messages) {
     } else if (m.role === 'assistant') {
       const t = textOfContent(m.content);
       const reasoning = m.reasoning && String(m.reasoning).trim();
-      if (reasoning) {
-        // DeepSeek 等「思考模式」实现要求多轮时把上一轮 assistant 的 reasoning 回传，
-        // 否则报 "reasoning_text in the thinking mode must be passed back"。
+      const hasToolCalls = Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+      // DeepSeek 思考模式：reasoning 只在「带工具调用的回合」必须回传（否则报
+      // "reasoning_text must be passed back"）；纯文本回合的 reasoning 会被服务端忽略。
+      // 只回传 tool-call 回合的 reasoning、纯文本回合丢弃——省 token 且不违反官方语义。
+      if (reasoning && hasToolCalls) {
         input.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text: reasoning }] });
       }
-      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      if (hasToolCalls) {
         // 工具调用：必须以「顶层独立 item」形式给出（type:'function_call'）。
         // 不能包进 assistant.content 数组——DeepSeek 等严格实现会报
         // "unknown variant function_call, expected input_text/output_text/..."。

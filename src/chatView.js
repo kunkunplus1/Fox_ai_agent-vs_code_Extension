@@ -667,7 +667,11 @@ class ChatViewProvider {
         if (p && typeof p.then === 'function') p.then(() => {}, () => {});
       } catch (_) {}
     }
-    if (msg && ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'step', 'notice', 'error'].includes(msg.type)) {
+    // 落盘白名单：assistant（RAG 直答的一次性回答）与 reasoning（全量思考）都要落盘，否则重载/切换会话后
+    // 这些内容会丢失（回答气泡消失、思考折叠区变空）。reasoning 的 stream:true 增量不落盘，避免 transcript 膨胀；
+    // 轮末全量 reasoning（无 stream 标记）才落盘，供恢复「已思考」内容。
+    const PERSIST = ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'step', 'notice', 'error', 'assistant'];
+    if (msg && (PERSIST.includes(msg.type) || (msg.type === 'reasoning' && !msg.stream))) {
       this.transcript.push(msg);
       // 按轮次压缩，保留每轮锚点（详见 compactTranscript），避免长会话丢锚点导致恢复后对话栏为空
       this.transcript = compactTranscript(this.transcript);
@@ -858,7 +862,10 @@ class ChatViewProvider {
   _saveCurrentSession() {
     const currentId = this.sessionManager.currentId();
     if (!currentId) return;
-    const title = (this.sessionManager.current() || {}).title;
+    // 标题仍是默认「新会话」时传空字符串，让 sessions.save 里的 makeTitle 兜底用首条用户消息
+    // 自动生成标题；否则会话列表里所有会话永远都叫「新会话」。
+    const curTitle = (this.sessionManager.current() || {}).title;
+    const title = (curTitle && curTitle !== '新会话') ? curTitle : '';
     try {
       this.sessionManager.save({
         id: currentId,
@@ -1677,8 +1684,8 @@ class ChatViewProvider {
       text: ({ text, channel, msg_id }) => {
         this.post({ type: 'delta', channel, msg_id: msg_id || this.bubbleId, text });
       },
-      reasoning: ({ text, channel, msg_id }) => {
-        this.post({ type: 'reasoning', channel, msg_id: msg_id || this.bubbleId, text });
+      reasoning: ({ text, channel, msg_id, stream }) => {
+        this.post({ type: 'reasoning', channel, msg_id: msg_id || this.bubbleId, text, stream: !!stream });
       },
       image: ({ src, alt, channel, msg_id }) => {
         this.post({ type: 'image', channel, msg_id: msg_id || this.bubbleId, src, alt });
