@@ -117,16 +117,10 @@ function registerFoxApi(context, chatProvider) {
   reg('foxAi.bridge.isReady', () => !!chatProvider);
 }
 
-// 审计
+// 审计（统一落到 ~/.fox-ai/logs；context.logUri 可能为空/被清理，不再使用）
+const _auditBridge = require('./auditLog').auditBridge;
 function audit(context, action, detail) {
-  try {
-    const fs = require('fs');
-    const path = require('path');
-    const dir = context && context.logUri ? context.logUri.fsPath : require('os').tmpdir();
-    fs.mkdirSync(dir, { recursive: true });
-    const line = `[${new Date().toISOString()}] ${action} ${detail ? JSON.stringify(detail) : ''}\n`;
-    fs.appendFileSync(path.join(dir, 'bridge-audit.log'), line);
-  } catch (_) {}
+  return _auditBridge(action, detail);
 }
 
 module.exports = {

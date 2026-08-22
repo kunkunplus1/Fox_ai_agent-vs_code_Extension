@@ -145,6 +145,12 @@ const HARVEST_PATTERNS = [
 // 明显不值得记的（一次性指令、闲聊）
 const HARVEST_BLOCK = /^(?:好的|谢谢|收到|继续|嗯+|ok|okay|行|可以|试试|再来|停|等等)[\s。.!！]*$/i;
 
+// 协议/系统噪音特征：WebAI2API 网页对话全文被粘贴进 user 消息时，这些痕迹绝不能当作"用户偏好"
+const PROTO_NOISE = /<foxtool|<function|fox:tool|【狐狸AI·动态上下文|=== 系统指令|Unexpected token|is not valid JSON|JSON\.parse|工具调用块|回灌|deepseek_text|webai2api/i;
+
+// 动态上下文/环境块标记：命中即把该段剥掉（防「【深度思考】…」「代码骨架（当前文件优先）」等被误沉淀）
+const DYN_MARK_RE = /【狐狸AI·动态上下文】[\s\S]*?【狐狸AI·动态上下文·完】|【深度思考】|【当前环境】|【当前文件报错】|【长期记忆】|代码骨架（当前文件优先）[\s\S]*?(?=【|$)/g;
+
 /**
  * 从对话消息里抽取候选记忆。纯规则式，零模型调用，不产生额外开销。
  * @param {Array<{role:string, content:any}>} messages
@@ -166,8 +172,12 @@ function harvest(messages, opts) {
     if (!text || text.length < 6) continue;
     if (HARVEST_BLOCK.test(text)) continue;
     if (text.startsWith('[系统]')) continue;
+    // 协议/系统噪音（WebAI2API 全文粘贴、工具报错、回灌提示）整体跳过
+    if (PROTO_NOISE.test(text)) continue;
+    // 剥掉动态上下文/环境块后再匹配，防「代码骨架（当前文件优先）」这类环境信息被误当偏好
+    const cleaned = text.replace(DYN_MARK_RE, ' ');
     for (const p of HARVEST_PATTERNS) {
-      const mm = text.match(p.re);
+      const mm = cleaned.match(p.re);
       if (!mm) continue;
       // 取匹配到的整句（含触发词），更完整可读
       let sentence = normalizeText(mm[0]);
@@ -177,6 +187,8 @@ function harvest(messages, opts) {
       if (cut > 8) sentence = sentence.slice(0, cut + 1);
       sentence = sentence.slice(0, 160).trim();
       if (sentence.length < 6) continue;
+      // 沉淀前最终护栏：正文不得残留任何协议/噪音痕迹
+      if (PROTO_NOISE.test(sentence)) continue;
       if (found.some((f) => similarity(f.text, sentence) >= 0.8)) continue;
       found.push({ text: sentence, topic: routeTopic(sentence), weight: p.weight });
       break; // 一条消息只取最先命中的一个模式

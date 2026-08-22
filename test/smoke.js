@@ -179,8 +179,13 @@ function once(content) {
   });
   const prev = ws.unifiedPreview(before, after);
   check('预览包含 +/- 标记', () => {
-    assert.ok(prev.includes('- b'));
-    assert.ok(prev.includes('+ B2'));
+    assert.ok(/-2│ b/.test(prev));
+    assert.ok(/\+2│ B2/.test(prev));
+  });
+  check('预览带 1 索引行号', () => {
+    // 删除行标原文件行号、新增行标新文件行号；行号错位用「原→新」标注
+    assert.ok(/1→2│ a/.test(prev));
+    assert.ok(/\+5│ e/.test(prev));
   });
 
   console.log('\n[6] ANSI 清洗');

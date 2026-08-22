@@ -780,10 +780,12 @@ function openEnvPanel(context, chatProvider, initialTab) {
         await cfg.update('webai2api.mirror', mv, vscode.ConfigurationTarget.Global);
         panel.webview.postMessage({ type: 'webai2apiMirror', value: mv });
       } else if (msg.type === 'loadAudit') {
+        // 统一从 ~/.fox-ai/logs 读取审计日志（写入端也统一落此目录；
+        // 旧实现用 context.logUri 定位，该目录可能为空/被 VS Code 清理，导致永远「无记录」）
         const fs = require('fs');
         const p = require('path');
-        const dir = context && context.logUri ? context.logUri.fsPath : require('os').tmpdir();
-        const files = ['runtime-audit.log', 'bridge-audit.log'];
+        const dir = require('./auditLog').auditDir();
+        const files = ['runtime-audit.log', 'bridge-audit.log', 'kb-organize.log'];
         let text = '';
         for (const f of files) {
           const fp = p.join(dir, f);

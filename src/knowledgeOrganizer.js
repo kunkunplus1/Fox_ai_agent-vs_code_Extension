@@ -154,14 +154,10 @@ function chunkForOrganize(text, maxChunk) {
   return chunks.filter(Boolean);
 }
 
-// 审计日志
+// 审计日志（统一落到 ~/.fox-ai/logs；context.logUri 可能为空/被清理，不再使用）
+const _auditKB = require('./auditLog').auditKB;
 function auditLog(context, action, detail) {
-  try {
-    const dir = context && context.logUri ? context.logUri.fsPath : path.join(os.tmpdir(), 'fox-ai');
-    fs.mkdirSync(dir, { recursive: true });
-    const line = `[${new Date().toISOString()}] ${action} ${detail ? JSON.stringify(detail) : ''}\n`;
-    fs.appendFileSync(path.join(dir, 'kb-organize.log'), line);
-  } catch (_) {}
+  return _auditKB(action, detail);
 }
 
 function statePath(outputDir) {

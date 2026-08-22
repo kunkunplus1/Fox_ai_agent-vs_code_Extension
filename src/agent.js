@@ -73,6 +73,18 @@ function _qOverlap(a, b) {
   return inter / Math.min(a.size, b.size);
 }
 
+// —— 内容指纹（易变大块「变了才更新」判据，1.1.15）——
+// 对动态上下文候选文本做 SHA-1 指纹；空/无实质变化时返回 ''（视为未变化）。
+function _contentFingerprint(text) {
+  try {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    return crypto.createHash('sha1').update(s, 'utf8').digest('hex').slice(0, 16);
+  } catch (_) {
+    return String(text || '').length ? 'x' : '';
+  }
+}
+
 // —— 模块级 LLM 并发限流 ——
 // 跨所有 session / 可移动面板限制「同时飞向模型的请求数」。多个面板/会话同时跑任务时，
 // 若不限制会瞬间并发多个 LLM 请求（主请求 + 审查子代理 + 多模态识图 + planner 子模型），
@@ -308,6 +320,76 @@ function safeParseArgs(raw) {
 }
 
 /**
+ * 1.1.15：WebAI2API 网页渲染把 JSON 字符串值里的转义序列破坏后的修复器。
+ * 网页会把 \n 渲染成真换行、把 \" 渲染成引号、吞掉反斜杠（如 c:\Users 的 \U 变成非法转义），
+ * 使整段 JSON 变成非法文本。这里在「字符串内部」做最小修复，不动字符串外的结构：
+ *   - 字符串值内未转义的真换行 / 制表符 → 转义为 \n / \t
+ *   - 字符串值内未转义的双引号（被网页渲染破坏的 \"）→ 转义为 \"
+ *   - 字符串值内反斜杠后跟非法转义字符（如 \U、\a）→ 转义为 \\U（保留字面反斜杠）
+ * 实现：逐字符扫描，维护 inString 状态与 stringKind（键/值）。只处理值字符串内的破坏；
+ * 键的结束引号、值的结束引号（后跟 , 或 }）保持原样。结构破坏（缺括号/键值对）交给 safeParseArgs。
+ */
+function repairArgsJson(raw) {
+  const s = String(raw || '');
+  let out = '';
+  let inString = false;
+  let stringKind = null; // 'key' | 'value'
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (!inString) {
+      if (ch === '"') {
+        // 确定字符串类型：前面非空白字符是 { 或 , → 键；否则（: 后）→ 值
+        let j = i - 1;
+        while (j >= 0 && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n' || s[j] === '\r')) j--;
+        const prev = j >= 0 ? s[j] : '';
+        stringKind = (prev === '{' || prev === ',') ? 'key' : 'value';
+        inString = true;
+        out += ch;
+      } else {
+        out += ch;
+      }
+      continue;
+    }
+    if (ch === '\\') {
+      const n = i + 1 < s.length ? s[i + 1] : '';
+      if (n && /[\\"\/bfnrtu]/.test(n)) {
+        out += ch + n; i++;            // 合法转义，保留
+      } else if (n) {
+        out += '\\\\' + n; i++;        // 非法转义（\U 等）→ 字面反斜杠 + 字符
+      } else {
+        out += '\\\\';                 // 行尾裸反斜杠
+      }
+      continue;
+    }
+    if (ch === '"') {
+      if (stringKind === 'key') {
+        // 键的结束引号（后跟 :），保持原样
+        inString = false; stringKind = null; out += ch; continue;
+      }
+      // 值字符串内：判断是结束引号还是被网页破坏的 \"
+      let j = i + 1;
+      while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
+      const nxt = j < s.length ? s[j] : '';
+      if (nxt === ',' || nxt === '}' || nxt === '' || nxt === '\n' || nxt === '\r') {
+        inString = false; stringKind = null; out += ch;   // 值的结束引号
+      } else {
+        out += '\\"';                   // 值内的裸引号 → 转义
+      }
+      continue;
+    }
+    if (ch === '\r') {
+      if (i + 1 < s.length && s[i + 1] === '\n') i++;      // \r\n 合并为一个换行
+      out += '\\n';
+      continue;
+    }
+    if (ch === '\n') { out += '\\n'; continue; }
+    if (ch === '\t') { out += '\\t'; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * 从文本 start 位置起，找到与首个 { 匹配的闭合 }（正确处理字符串内的括号与转义）。
  * 用于从模型的自由文本里截出一个完整的 JSON 对象块。
  */
@@ -523,25 +605,22 @@ ${structured}
       return `${withProfile}
 
 【调用工具的方式】
-你没有原生函数调用，必须用下面的固定格式调用工具，一次只调用一个。系统只认 <foxtool> 块：
+你没有原生函数调用，必须用下面的固定格式调用工具，一次只调用一个。系统只认工具调用块：
 
-<foxtool name="工具名">
-{"参数名": "参数值"}
-</foxtool>
+${tools.wrapToolCall('工具名', '{"参数名": "参数值"}')}
 
 规则：
 1. 【第一步·锁死】开始任何任务前，你的第一条回复必须且只能是下面这一个工具调用（先获取可用工具清单，再决定怎么做）：
-<foxtool name="get_tools">
-{}
-</foxtool>
+${tools.wrapToolCall('get_tools', '{}')}
    在成功调用 get_tools 拿到工具清单之前，系统不会执行任何其他工具；若第一轮没有输出该调用，系统会回灌提示要求你重试。
-2. 之后想用某个工具时，先按需调用 get_tools（query 填关键词，如"文件""搜索""执行命令"）检索它的参数与 <foxtool> 调用示例，再照抄格式调用；拿不准有什么工具就随时再查。
-3. 工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待工具结果。
-4. 如果文本中没有任何 <foxtool> 块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
-5. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出 <foxtool> 块，不要额外解释。
+2. 之后想用某个工具时，先按需调用 get_tools（query 填关键词，如"文件""搜索""执行命令"）检索它的参数与调用示例，再照抄格式调用；拿不准有什么工具就随时再查。
+3. 工具块必须独立成段，里面是合法 JSON。写完调用块后立刻停止输出，等待工具结果。
+4. 如果文本中没有任何工具调用块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
+5. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出工具调用块，不要额外解释。
 6. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
-7. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、不要把它写进代码块围栏、不要模拟系统提示/日志/记忆沉淀、更不要用「我已使用 write_file 创建了…」这类叙述代替执行——那些都不会触发任何执行。调用工具唯一可靠的写法就是 <foxtool> 块。
-8. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用 <foxtool> 块调用工具执行下一步；有多套方案就选最合理的直接做。系统会把每一步的真实执行与结果展示出来，只有遇到真正无法决定或危险的操作才询问用户。
+7. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、不要把它写进代码块围栏、不要模拟系统提示/日志/记忆沉淀、更不要用「我已使用 write_file 创建了…」这类叙述代替执行——那些都不会触发任何执行。调用工具唯一可靠的写法就是上面的工具调用块。
+8. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用工具调用块执行下一步；有多套方案就选最合理的直接做。系统会把每一步的真实执行与结果展示出来，只有遇到真正无法决定或危险的操作才询问用户。
+9. 复杂任务善用特色工具（全部见 get_tools 清单，按需检索）：多步骤任务先用 create_plan_task 列计划、用 set_plan_tasks 更新进度；多条互不相干的支线用 spawn_subagent 派子代理；写完代码用 run_in_sandbox 隔离自测、security_audit 只读自检、get_diagnostics 核对报错；跨会话回忆用 allow_session_access；需要配图用 generate_image。别只会 read/write。
 
 【常用工具速记】（完整清单与参数请调用 get_tools 检索）：
 read_file 读文件 · write_file 写文件 · edit_file 改文件 · list_dir 列目录 · find_files 找文件 · search_text 搜文本 · run_command 执行命令 · get_tools 查工具`;
@@ -549,20 +628,18 @@ read_file 读文件 · write_file 写文件 · edit_file 改文件 · list_dir �
     return `${withProfile}
 
 【调用工具的方式】
-你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看 <foxtool> 块：
+你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看工具调用块：
 
-<foxtool name="工具名">
-{"参数名": "参数值"}
-</foxtool>
+${tools.wrapToolCall('工具名', '{"参数名": "参数值"}')}
 
 规则：
-1. 工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待我把结果发给你。
-2. 如果文本中没有任何 <foxtool> 块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
-3. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出 <foxtool> 块，不要额外解释。
+1. 工具块必须独立成段，里面是合法 JSON。写完调用块后立刻停止输出，等待我把结果发给你。
+2. 如果文本中没有任何工具调用块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
+3. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出工具调用块，不要额外解释。
 4. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
-5. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、也不要把它写进代码块围栏、更不要模拟系统提示/日志/记忆沉淀——那些不会被识别成工具调用（个别情况下系统会尽力识别函数调用样式作为兜底，但参数顺序按工具定义 path 在前，容易出错）。调用工具唯一可靠的写法就是 <foxtool> 块。
-6. 严禁用自然语言「声称已调用」代替执行：不要输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述——系统没有收到任何调用块时，这些陈述**不会触发任何执行**，会被判定为无效并回灌修正提示。想执行就输出 <foxtool> 块，别无他法。
-7. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用 <foxtool> 块调用工具执行下一步；有多套方案就选最合理的直接做，系统会把每一步的真实执行与结果展示出来，只有真正无法决定或危险的操作才询问用户。
+5. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、也不要把它写进代码块围栏、更不要模拟系统提示/日志/记忆沉淀——那些不会被识别成工具调用（个别情况下系统会尽力识别函数调用样式作为兜底，但参数顺序按工具定义 path 在前，容易出错）。调用工具唯一可靠的写法就是上面的工具调用块。
+6. 严禁用自然语言「声称已调用」代替执行：不要输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述——系统没有收到任何调用块时，这些陈述**不会触发任何执行**，会被判定为无效并回灌修正提示。想执行就输出工具调用块，别无他法。
+7. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用工具调用块执行下一步；有多套方案就选最合理的直接做，系统会把每一步的真实执行与结果展示出来，只有真正无法决定或危险的操作才询问用户。
 
 【可用工具】
 ${tools.toTextManual(queryText, cfg)}`;
@@ -606,8 +683,29 @@ class AgentSession {
     // 1.1.14：get_tools 首轮强制——是否已获取工具清单、强制回灌计数
     this._toolGuideFetched = false;
     this._guideNudges = 0;
+    // 1.1.15：恢复旧会话（重启服务/切换会话）时，若历史里已有 get_tools 成功记录，
+    // 视为「工具清单已获取」，避免再强制模型重发一遍 get_tools 调用。
+    try {
+      const msgs = this.messages || [];
+      for (const m of msgs) {
+        if (!m) continue;
+        // text 协议：工具结果以 [工具 get_tools 的结果] 的 user 消息存在
+        if (typeof m.content === 'string' && /\[工具\s+get_tools\s*的结果\]/.test(m.content)) {
+          this._toolGuideFetched = true;
+          break;
+        }
+        // native 协议：工具结果以 role:'tool' + name 存在
+        if (m.role === 'tool' && m.name === 'get_tools') {
+          this._toolGuideFetched = true;
+          break;
+        }
+      }
+    } catch (_) {}
     // 1.1.14：只说不做/请求确认的回灌计数（限 2 次）
     this._askNudges = 0;
+    // 1.1.15：textOnly（WebAI2API）动态上下文「内容哈希去重」缓存（见 _dynCache.env 位点）；
+    // 1.1.14 的轮次降频（_dynTick/DYN_EVERY）已废弃，改为内容变化才注入。
+    this._dynTick = 0;
     this.stepCount = 0;
     // 单条回复因 max_tokens 截断时，自动发「继续」重新调用的次数计数（防无限循环）
     this._continuesUsed = 0;
@@ -655,6 +753,29 @@ class AgentSession {
     // 易变块指纹缓存（对齐 DSH「变了才更新」）：会话级缓存 RAG/主题记忆等 query 驱动块的
     // 结果，query 无实质变化时复用旧字节，避免每轮重检 → 每轮 miss 数千 token（命中率 71% 的主因）。
     this._dynCache = { kb: null, topicMem: null, env: null, diag: null };
+    // textOnly（WebAI2API）会话级动态块防重复：mark → { fp }，同内容块本会话只发一次
+    this._webBlockCache = new Map();
+    // 1.1.15：恢复旧会话（重启服务/切换会话）时，历史里可能已带动态上下文块。
+    // 预扫描历史里的【狐狸AI·动态上下文】块并记录其内容指纹，使恢复后的会话
+    // 不会把这些块再发一遍（否则 _webBlockCache 为空 → 走"首次"分支重复追加）。
+    try {
+      const msgs = this.messages || [];
+      for (const m of msgs) {
+        if (!m) continue;
+        const c = Array.isArray(m.content)
+          ? (m.content.find((p) => p && p.type === 'text' && typeof p.text === 'string') || {}).text
+          : (typeof m.content === 'string' ? m.content : null);
+        if (!c) continue;
+        const open = c.indexOf('【' + DYN_MARK + '】');
+        if (open < 0) continue;
+        const close = c.indexOf('【' + DYN_MARK + '·完】', open);
+        if (close < 0) continue;
+        const block = c.slice(open, close + ('【' + DYN_MARK + '·完】').length);
+        if (!this._webBlockCache.has(DYN_MARK)) {
+          this._webBlockCache.set(DYN_MARK, { fp: _contentFingerprint(block) });
+        }
+      }
+    } catch (_) {}
     // 长期记忆（跨会话记住用户偏好/约定/教训）
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
@@ -1592,12 +1713,17 @@ class AgentSession {
   try {
     if (this.topicMemory) {
       const c = this._dynCache.topicMem;
-      if (topicSwitched(qFp, c)) {
-        const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
-        topicMem = (rel && rel.text) || '';
-        this._dynCache.topicMem = { fp: qFp, text: topicMem };
+      // 1.1.15：主题记忆也走「内容哈希去重」——同话题后续轮次若检索结果与上次注入完全一致，
+      // 则不重复注入（WebAI2API 网页整段粘贴最怕大块每轮重复）；内容变了（记忆文件更新/话题切换
+      // 导致检索结果变化）才重发。缓存从 query 指纹改为内容指纹，比对的是「实际会注入的文本」。
+      const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
+      topicMem = (rel && rel.text) || '';
+      const curFp = _contentFingerprint(topicMem);
+      if (c && c.fp === curFp) {
+        topicMem = ''; // 内容没变：本轮不注入，杜绝每轮重复粘贴
+      } else {
+        this._dynCache.topicMem = { fp: curFp };
       }
-      // else：同话题后续轮次，topicMem 保持空，不注入
     }
   } catch (_) {}
 
@@ -1605,11 +1731,30 @@ class AgentSession {
   // 绝不写回 system、不烤回源（保持新鲜，避免历史污染），位于请求末尾、随轮 append-only。
   const dynParts = [];
   if (knowledgeText) dynParts.push(knowledgeText);
+  // 1.1.15：textOnly（WebAI2API 本质是模拟点击网页、每轮整段粘贴）下，
+  // 「易变大块」（深度思考/当前环境等）改为【内容哈希去重】注入：内容与上次注入完全一致则
+  // 本轮整轮不发（不是每 N 轮发一次，而是「只有内容变了才发一次」，见 dynOk 逻辑）；
+  // 内容一旦变化（切思考开关/换文件/环境变更）立即重发，保证模型始终持有最新状态。
+  // 普通模型保持每轮注入（有前缀缓存红利，不受影响）。
+  const isWebText = !!(cfg.meta && cfg.meta.textOnly);
+  const dynOk = !isWebText || (() => {
+    const acc = this._dynCache.env; // 复用预留位点：{ fp: 内容指纹 }
+    const cur = _contentFingerprint([
+      (() => { try { return buildDeepThinkingHint(cfg); } catch (_) { return ''; } })(),
+      envBrief || '',
+      (() => { try { return ctxTools.activeFileDiagnosticsBrief(); } catch (_) { return ''; } })()
+    ].join('\n'));
+    if (acc && acc.fp === cur) return false; // 内容没变：整轮不发，杜绝重复粘贴
+    this._dynCache.env = { fp: cur };
+    return true;
+  })();
   // 深度思考提示词兜底：放动态附录（每轮随开关刷新），避免写进 system 导致「切换思考开关→前缀漂移→缓存失效」
-  try {
-    const thinkHint = buildDeepThinkingHint(cfg);
-    if (thinkHint) dynParts.push('【深度思考】\n' + thinkHint);
-  } catch (_) {}
+  if (dynOk) {
+    try {
+      const thinkHint = buildDeepThinkingHint(cfg);
+      if (thinkHint) dynParts.push('【深度思考】\n' + thinkHint);
+    } catch (_) {}
+  }
   // 弱本地模型防注意力漂移锚点（1.1.16）：由 queryText 派生、每轮都变 → 只在动态附录，不污染可缓存前缀
   if (this.protocol === 'text' && (cfg.meta && cfg.meta.local) && queryText) {
     try {
@@ -1618,7 +1763,7 @@ class AgentSession {
     } catch (_) {}
   }
   // 环境信息：随用户操作变化，作为动态附录注入到最后一条 user 消息尾部，不影响前缀缓存命中率
-  if (envBrief) dynParts.push('【当前环境】\n' + envBrief);
+  if (dynOk && envBrief) dynParts.push('【当前环境】\n' + envBrief);
   // L1 极速层（易变部分）：当前激活文件的 Diagnostics 摘要（前 3 个 Error），每轮随 query 刷新。
   // 极小（≤ 几百 token），放进动态附录尾部，不破坏可缓存的稳定前缀；让用户切文件后模型立刻知道新文件的报错。
   try {
@@ -1713,7 +1858,9 @@ class AgentSession {
           // 下一轮重建历史时它在「附录位置」接的是 assistant 回复，与本轮下发（接附录）前缀对不上 →
           // 每个 user 边界缓存断裂、RAG/记忆/环境等大块每轮纯 miss。烤回后该 user 消息逐字节冻结，
           // 后续轮次作为历史命中前缀缓存，把每轮必 miss 的大块变成「仅首次出现时 miss、之后全命中」。
-          this._bakeAppendixIntoSource(varAppendix, DYN_MARK);
+          // 1.1.14：textOnly（WebAI2API）不烤回源——网页浏览器自带会话历史，无前缀缓存需求，
+          // 烤回源反而让动态块在历史里每轮累积重复粘贴；普通 text（DeepSeek/本地）仍烤回源吃缓存红利。
+          if (!isWebText) this._bakeAppendixIntoSource(varAppendix, DYN_MARK);
         }
         // 审查意见（每 step 随审查批次变化）**不进 varAppendix**——否则 varAppendix 每 step 漂移，
         // 工具调用之间的前缀断裂（命中率到不了 harness「第三次调用 99%」）。改为独立 append-only
@@ -1801,7 +1948,7 @@ class AgentSession {
           if (calls.length) {
             this.messages.push({
               role: 'user',
-              content: `[系统提示] 你上一轮一次性输出了超过 ${truncated} 个工具调用，超出的部分已被丢弃。请严格遵守「一次只调用一个工具」：先观察已执行结果，然后继续逐个输出下一个 <foxtool> 块。`
+              content: `[系统提示] 你上一轮一次性输出了超过 ${truncated} 个工具调用，超出的部分已被丢弃。请严格遵守「一次只调用一个工具」：先观察已执行结果，然后继续逐个输出下一个工具调用块。`
             });
             this.emit('notice', { text: `检测到单轮工具调用超过 ${truncated} 个，已提示模型逐个执行` });
           }
@@ -1820,7 +1967,7 @@ class AgentSession {
               this._weakArgRetries++;
               this.messages.push({
                 role: 'user',
-                content: `[系统·参数校验未通过] 你刚才的工具调用参数不符合要求，请修正后重新只输出正确的 <foxtool> 块，不要重复错误。\n${checked.report}`
+                content: `[系统·参数校验未通过] 你刚才的工具调用参数不符合要求，请修正后重新只输出正确的工具调用块，不要重复错误。\n${checked.report}`
               });
               this.emit('notice', { text: `参数校验未通过，已把错误反馈给模型自我修正（${this._weakArgRetries}/${this._weakArgMax}）…` });
               continue; // 重新请求模型
@@ -1880,9 +2027,9 @@ class AgentSession {
             this._claimNudges = (this._claimNudges || 0) + 1;
             this.messages.push({
               role: 'user',
-              content: `[系统] 你刚才声称已使用某个工具（如 write_file / list_dir / read_file），但系统没有收到任何工具调用——既没有 <foxtool> 块，也没有 read_file("路径") 这类函数调用样式，因此没有任何文件操作真正发生。请立即用 <foxtool> 块输出你要执行的真实工具调用，一次只调用一个；在输出真实调用之前，系统不会执行任何操作。`
+              content: `[系统] 你刚才声称已使用某个工具（如 write_file / list_dir / read_file），但系统没有收到任何工具调用——既没有工具调用块，也没有 read_file("路径") 这类函数调用样式，因此没有任何文件操作真正发生。请立即用工具调用块输出你要执行的真实工具调用，一次只调用一个；在输出真实调用之前，系统不会执行任何操作。`
             });
-            this.emit('notice', { text: `检测到模型「声称已调用工具但无实际调用」（第 ${this._claimNudges}/2 次），已回灌修正提示，要求输出真实 <foxtool> 调用` });
+            this.emit('notice', { text: `检测到模型「声称已调用工具但无实际调用」（第 ${this._claimNudges}/2 次），已回灌修正提示，要求输出真实工具调用块` });
             appendLog('agent', `[claim-nudge] 声称调用但无实际调用，回灌修正 (${this._claimNudges}/2)`);
             continue;
           }
@@ -1892,9 +2039,18 @@ class AgentSession {
             && (this.cfg.toolGuideMode === 'on' || this.cfg.toolGuideMode === 'auto');
           if (needGuide && (this._guideNudges || 0) < 2) {
             this._guideNudges = (this._guideNudges || 0) + 1;
+            // 首轮精简：模型第一轮往往只会输出一大段"分析/方案"而没有任何工具调用——这段对任务
+            // 无价值还占历史。直接移除该轮 assistant 消息，让下一轮从「请先调用 get_tools」的
+            // 系统提示干净开始，省掉一问一答的浪费轮次（1.1.14）。
+            if (step === 0) {
+              for (let i = this.messages.length - 1; i >= 0; i--) {
+                const mm = this.messages[i];
+                if (mm && mm.role === 'assistant') { this.messages.splice(i, 1); break; }
+              }
+            }
             this.messages.push({
               role: 'user',
-              content: `[系统] 本任务的第一步必须先调用 get_tools 获取可用工具清单（这是固定格式要求）。你刚才没有输出任何工具调用。请立即只输出下面这一个 <foxtool> 调用块，不要附加任何解释：\n\n<foxtool name="get_tools">\n{}\n</foxtool>`
+              content: `[系统] 本任务的第一步必须先调用 get_tools 获取可用工具清单（这是固定格式要求）。你刚才没有输出任何工具调用。请立即只输出下面这一个工具调用块，不要附加任何解释：\n\n${tools.wrapToolCall('get_tools', '{}')}`
             });
             this.emit('notice', { text: `已强制模型先调用 get_tools 获取工具清单（第 ${this._guideNudges}/2 次）` });
             appendLog('agent', `[guide-nudge] textOnly 首轮未调 get_tools，强制回灌 (${this._guideNudges}/2)`);
@@ -1907,7 +2063,7 @@ class AgentSession {
             this._askNudges = (this._askNudges || 0) + 1;
             this.messages.push({
               role: 'user',
-              content: `[系统] 你刚才只输出了方案或请求确认，没有输出任何工具调用。请**直接**用 <foxtool> 块调用工具执行下一步（一次只调用一个）；若有多套方案，选最合理的直接做，不要先征求用户确认——系统会把每一步的真实执行与结果展示出来。只有遇到真正无法决定或危险的操作才询问用户。`
+              content: `[系统] 你刚才只输出了方案或请求确认，没有输出任何工具调用。请**直接**用工具调用块调用工具执行下一步（一次只调用一个）；若有多套方案，选最合理的直接做，不要先征求用户确认——系统会把每一步的真实执行与结果展示出来。只有遇到真正无法决定或危险的操作才询问用户。`
             });
             this.emit('notice', { text: `检测到模型「只说不做/请求确认」（第 ${this._askNudges}/2 次），已回灌提示要求直接执行` });
             appendLog('agent', `[ask-nudge] 只说不做/请求确认，回灌直接执行 (${this._askNudges}/2)`);
@@ -2151,6 +2307,8 @@ class AgentSession {
       if (stat.added === 0 && stat.removed === 0) {
         return `修改 ${path}${scope}：实际未产生内容差异（无变化）。`;
       }
+      // unifiedPreview 带 1 索引行号：删除行标原行号、新增行标新行号，错位处「原→新」，
+      // 让审查/自检能直接看出「想让第 15 行变成 X、实际落到第 14/16 行」这类落点偏差。
       return `修改 ${path}${scope}（+${stat.added} -${stat.removed}）：\n${cut(ws.unifiedPreview(before, after), 1600)}`;
     }
     if (name === 'write_file') {
@@ -2457,6 +2615,26 @@ class AgentSession {
 
   _injectDynamicAppendix(history, appendix, mark) {
     if (!appendix || !history || !history.length) return;
+    // textOnly（WebAI2API）：会话级防重复——同内容动态块本会话只发一次，避免网页对话历史里
+    // 动态块（深度思考/长期记忆/项目约定等）每轮重复累积（网页模拟点击会把整段历史重新粘贴）。
+    // 关键认知：WebAI2API 网页自带会话历史——之前注入的块模型始终能在历史里看到，
+    // 所以同内容块【直接不注入】即可，不需要"检查历史是否已有再决定补不补"（text 协议不烤回源，
+    // this.messages 里根本没有块，任何历史检查都会误判"没有"→重复注入；工具结果也是 user 角色，
+    // 每条新 user 都会成为"最后一条"→ 块跟着每条工具结果重复出现，正是日志里看到的现象）。
+    // 普通 API 不启用：前缀缓存红利下每轮替换语义本身不重复，且烤回源依赖该语义。
+    const isWebText = !!(this.cfg && this.cfg.meta && this.cfg.meta.textOnly);
+    if (isWebText && this._webBlockCache && this._webBlockCache.has(mark)) {
+      const sent = this._webBlockCache.get(mark);
+      const curFp = _contentFingerprint(appendix);
+      if (sent.fp === curFp) {
+        // 内容没变：本会话已发过同内容块 → 本轮【直接不注入】（网页历史里有，模型能看到）
+        return;
+      }
+      // 内容变了：更新指纹，正常追加（_applyAppendix 替换语义保证同 mark 不叠加）
+      this._webBlockCache.set(mark, { fp: curFp });
+    } else if (isWebText && this._webBlockCache && !this._webBlockCache.has(mark)) {
+      this._webBlockCache.set(mark, { fp: _contentFingerprint(appendix) });
+    }
     // 找最后一条 user 角色消息（当前轮提问）。工具结果用 role:'tool'，不会误判。
     let idx = -1;
     for (let i = history.length - 1; i >= 0; i--) {
@@ -3135,7 +3313,9 @@ class AgentSession {
   /** 解析文本协议里的工具调用（增强：兼容 <foxtool> / <function> / 裸 JSON 多格式） */
   parseTextCalls(content, knownTools) {
     const out = [];
-    const text = String(content || '');
+    // 1.1.15：先把用户自定义的调用符号（tool-tag-map.json，如 [[tool:write_file]]）归一化为
+    // 内部标准 <foxtool>，再走既有解析链——网页上不再出现统一标签，规避风控识别防封号。
+    const text = tools.normalizeToolTags(String(content || ''));
     const seen = new Set();
     // exact=true：明确标签来源（<foxtool>/<function>/函数样式）不去重——模型一次输出多个
     // write_file 块（如连续写多份教材文件）时，1.1.14 之前被 seen 按工具名去重，只有第一个
@@ -3325,19 +3505,32 @@ class AgentSession {
         continue;
       }
       let args;
+      const rawArgs = String(c.rawArgs || '{}');
+      // 1.1.15：WebAI2API 网页渲染会把 JSON 字符串值里的 \n 变成真换行、吞掉反斜杠（如 c:\Users 的 \U），
+      // 导致裸 JSON.parse 失败。这里先做本地容错修复（safeParseArgs 已有容错链 + repairArgsJson 处理
+      // 「字符串值内未转义的真换行/引号」），修复成功直接执行，不回灌模型白费轮次。
       try {
-        args = JSON.parse(String(c.rawArgs || '{}'));
-      } catch (e) {
-        invalid.push(c);
-        reports.push(`- 工具 ${c.name} 的参数不是合法 JSON：${String(e.message).slice(0, 120)}`);
-        continue;
+        args = JSON.parse(rawArgs);
+      } catch (_) {
+        try {
+          args = safeParseArgs(rawArgs);
+        } catch (_2) {
+          try {
+            args = JSON.parse(repairArgsJson(rawArgs));
+          } catch (_3) {
+            invalid.push(c);
+            reports.push(`- 工具 ${c.name} 的参数不是合法 JSON（本地修复失败）：${String(_3 && _3.message || '').slice(0, 120)}`);
+            continue;
+          }
+        }
       }
       const v = weakModel.validateToolArgs(tool, args);
       if (!v.ok) {
         invalid.push(c);
         reports.push(`- 工具 ${c.name}：${v.errors.join('；')}`);
       } else {
-        valid.push(c);
+        // 1.1.15：修复后参数已可用，把修复后的参数写回，本地执行时直接吃修复结果
+        valid.push(Object.assign({}, c, { rawArgs: JSON.stringify(args) }));
       }
     }
     return { valid, invalid, report: reports.join('\n') };

@@ -246,7 +246,9 @@ async function readFile(args) {
     slice = [line.slice(sc, ec)];
   }
 
-  const width = String(end).length;
+  // 行号用「总行数定宽」而非「结束行号定宽」：否则行号位数在文件中部会跳动
+  // （如第 2 行标签 2│、第 100 行 100│），模型会把前导空格误读成补零/偏移而数错行。
+  const width = Math.max(2, String(lines.length).length);
   const numbered = slice.map((l, i) => String(start + i).padStart(width, ' ') + '│' + l).join('\n');
   const hasCharRange = !Number.isNaN(startChar) && !Number.isNaN(endChar);
   const rangeNote = start === end && hasCharRange
@@ -781,7 +783,16 @@ async function showDiff(pathLike, oldText, newText, title) {
   );
 }
 
-/** 生成一段紧凑的文本 diff 摘要，给审批卡片展示 */
+/**
+ * 生成带行号的紧凑 diff 摘要，给审批卡片 / 审查摘要展示。
+ *
+ * 行号规则（与编辑器、read_file 的 1 索引一致）：
+ *   - 上下文行 / 删除行 标「原文件行号」，新增行标「新文件行号」；
+ *   - 原行号 ≠ 新行号 时用「原→新」标注（删除/插入带来的行号错位），
+ *     让模型一眼看出「第 N 行内容被挪到了第 M 行」——正是「让 AI 写第 15 行、
+ *     结果写到第 14 行」这类落点偏差能被自检发现的锚点；
+ *   - 行号右对齐、定宽，避免 read_file 那种宽度跳动（1/9/10 行号宽窄不一）。
+ */
 function unifiedPreview(before, after, maxLines = 40) {
   // 先把 CRLF 归一成 LF：否则「CRLF 原文件 vs LF 新内容」会被逐行误判为全部改动，
   // 审批预览 / 审查摘要里就会出现满屏的「每行都删又都加」假 diff。
@@ -795,13 +806,26 @@ function unifiedPreview(before, after, maxLines = 40) {
     endA--;
     endB--;
   }
-  const out = [];
+  const aWidth = Math.max(1, String(a.length).length);
+  const bWidth = Math.max(1, String(b.length).length);
+  const width = Math.max(aWidth, bWidth);
+  const ln = (n, pad) => String(n).padStart(pad || width, ' ');
   const ctxStart = Math.max(0, start - 2);
-  for (let i = ctxStart; i < start; i++) out.push('  ' + a[i]);
-  for (let i = start; i <= endA; i++) out.push('- ' + a[i]);
-  for (let i = start; i <= endB; i++) out.push('+ ' + b[i]);
+  const out = [];
+  // 上下文行：原行号与目标行号错位时标注「原→新」，行号一致则只标一个
+  for (let i = ctxStart; i < start; i++) {
+    const oldNo = i + 1;
+    const newNo = oldNo + (b.length - a.length);
+    out.push((oldNo === newNo ? ' ' + ln(oldNo) : ln(oldNo) + '→' + ln(newNo, aWidth)) + '│ ' + a[i]);
+  }
+  for (let i = start; i <= endA; i++) out.push('-' + ln(i + 1, aWidth) + '│ ' + a[i]);
+  for (let i = start; i <= endB; i++) out.push('+' + ln(i + 1, bWidth) + '│ ' + b[i]);
   const tailEnd = Math.min(a.length - 1, endA + 2);
-  for (let i = endA + 1; i <= tailEnd; i++) out.push('  ' + a[i]);
+  for (let i = endA + 1; i <= tailEnd; i++) {
+    const oldNo = i + 1;
+    const newNo = oldNo + (b.length - a.length);
+    out.push((oldNo === newNo ? ' ' + ln(oldNo) : ln(oldNo) + '→' + ln(newNo, aWidth)) + '│ ' + a[i]);
+  }
   if (out.length > maxLines) {
     return out.slice(0, maxLines).join('\n') + `\n… 还有 ${out.length - maxLines} 行`;
   }

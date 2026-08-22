@@ -1,6 +1,9 @@
 'use strict';
 
 const vscode = require('vscode');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const ws = require('./workspace');
 const term = require('./terminal');
 const ctxTools = require('./context');
@@ -1422,9 +1425,64 @@ function toTextManual(query, cfg) {
 }
 
 /**
- * get_tools 检索结果的单工具渲染：名称 + 描述 + 必填参数 + <foxtool> 调用示例。
+ * ===== 1.1.15 工具调用符号映射（规避固定 <foxtool> 标签被网页风控识别，防封号）=====
+ * 配置文件（优先级：工作区 .fox-ai/tool-tag-map.json > 用户级 ~/.fox-ai/tool-tag-map.json）：
+ *   { "open": "[[tool:%name%]]", "close": "[[/tool]]" }
+ * %name% 为工具名占位。配置后：
+ *   - 系统提示 / get_tools 示例会用自定义符号渲染，引导模型照抄（网页上不再出现统一 <foxtool>）；
+ *   - parseTextCalls 解析前会把自定义符号归一化为内部 <foxtool> 再执行。
+ * 留空 / 无配置文件 → 默认 <foxtool> 标签，行为不变。
+ */
+let _toolTagMapCache = null;
+function loadToolTagMap() {
+  if (_toolTagMapCache) return _toolTagMapCache;
+  _toolTagMapCache = { open: '', close: '' };
+  try {
+    const cands = [];
+    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length) {
+      cands.push(path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, '.fox-ai', 'tool-tag-map.json'));
+    }
+    cands.push(path.join(os.homedir(), '.fox-ai', 'tool-tag-map.json'));
+    for (const f of cands) {
+      if (fs.existsSync(f)) {
+        const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+        if (j && typeof j.open === 'string' && typeof j.close === 'string' && j.open.includes('%name%')) {
+          _toolTagMapCache = { open: j.open, close: j.close };
+        }
+        break;
+      }
+    }
+  } catch (_) { /* 配置异常走默认标签 */ }
+  return _toolTagMapCache;
+}
+function toolTagMap() { return loadToolTagMap(); }
+function usingCustomToolTag() { return !!(loadToolTagMap().open); }
+/** 用当前生效的符号包裹一个工具调用示例（open 含 %name% 占位） */
+function wrapToolCall(name, body) {
+  const m = loadToolTagMap();
+  if (!m.open) return `<foxtool name="${name}">\n${body}\n</foxtool>`;
+  return `${m.open.replace('%name%', name)}\n${body}\n${m.close}`;
+}
+/** 把文本里的自定义符号归一化为内部标准 <foxtool>（解析前调用；无自定义配置则原样返回） */
+function normalizeToolTags(text) {
+  const m = loadToolTagMap();
+  if (!m.open || !m.close) return String(text == null ? '' : text);
+  try {
+    const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const openPat = esc(m.open).replace(esc('%name%'), '([A-Za-z0-9_]+)');
+    const openRe = new RegExp(openPat, 'gi');
+    const closeRe = new RegExp(esc(m.close), 'gi');
+    return String(text == null ? '' : text)
+      .replace(openRe, '<foxtool name="$1">')
+      .replace(closeRe, '</foxtool>');
+  } catch (_) { return String(text == null ? '' : text); }
+}
+
+/**
+ * get_tools 检索结果的单工具渲染：名称 + 描述 + 必填参数 + 调用示例。
  * brief = 名称+描述+必填参数+示例；full = 追加完整参数表。
  * 示例中的参数值用占位符，模型照抄结构、替换为真实值即可（格式锚定核心）。
+ * 示例符号跟随用户自定义的 tool-tag-map.json（规避固定 <foxtool> 标签）。
  */
 function renderToolGuideLine(t, detail) {
   const props = (t.parameters && t.parameters.properties) || {};
@@ -1433,19 +1491,22 @@ function renderToolGuideLine(t, detail) {
   const head = `● ${t.name}：${t.description || ''}`;
   let body = '';
   if (detail === 'full' && Object.keys(props).length) {
+    // 1.1.15：参数表改为紧凑单行（"参数名": 类型 必填/可选 说明），不再逐行展开多行 JSON 模板——
+    // WebAI2API 网页渲染会把示例里的 \n 变成真换行，模型照抄时 JSON 转义被破坏导致反复重试。
     const rows = Object.keys(props).map((k) => {
       const p = props[k];
-      return `    "${k}": ${p.type === 'integer' || p.type === 'number' ? '数字' : p.type === 'boolean' ? 'true/false' : '"字符串"'}  // ${reqSet.has(k) ? '必填' : '可选'} ${p.description || ''}`;
+      return `"${k}": ${p.type === 'integer' || p.type === 'number' ? '数字' : p.type === 'boolean' ? 'true/false' : '"字符串"'}${reqSet.has(k) ? ' 必填' : ' 可选'}${p.description ? ' ' + p.description : ''}`;
     });
-    body += `\n  参数：\n{\n${rows.join('\n')}\n}`;
+    body += `\n  参数：${rows.join('，')}`;
   } else if (req.length) {
     body += `\n  必填参数：${req.join('、')}`;
   }
-  // 调用示例：用必填参数拼 <foxtool> 占位 JSON
+  // 调用示例：用必填参数拼调用占位 JSON（符号跟随用户自定义 tool-tag-map）。
+  // 占位值统一用「…」单字符，避免示例里出现引号/换行等会被网页渲染破坏的字符。
   const exampleArgs = req.length
     ? '{' + req.map((k) => `"${k}": "…"`).join(', ') + '}'
     : '{}';
-  body += `\n  调用示例：\n<foxtool name="${t.name}">\n${exampleArgs}\n</foxtool>`;
+  body += `\n  调用示例：\n${wrapToolCall(t.name, exampleArgs)}`;
   return head + body;
 }
 
@@ -1598,4 +1659,4 @@ function _truncate(result, ctx) {
     + text.slice(-tailLen);
 }
 
-module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema };
+module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema, toolTagMap, usingCustomToolTag, wrapToolCall, normalizeToolTags };

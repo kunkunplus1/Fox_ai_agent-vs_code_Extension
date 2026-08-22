@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.14
+> **版本**：1.1.15
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -41,10 +41,16 @@
 **会话同步 + 去掉 ping 噪音（1.1.48）**：① **新建会话同步到 Web 侧**：此前狐狸 AI 点「新建会话」后，WebAI2API 浏览器里的 DeepSeek 仍停留在上一轮对话，上下文错位。1.1.48 起，狐狸 AI 在「新建会话后首条消息」自动携带 `fox_new_session` 信号，经 WebAI2API 的 routes/queue 透传到 `deepseek_text` 适配器，适配器读到后点击 DeepSeek「新对话」按钮，让浏览器侧会话与狐狸 AI 一起归零（按钮找不到则自动跳过、不影响正常对话）。② **去掉 warmup 的 ping 噪音**：此前开启「缓存预热（cacheWarmup）」时，扩展会向模型发一条 `ping` 探测消息把前缀灌进缓存——这对真实 API 无害，但经 WebAI2API 文本协议会被当成真实聊天消息打进 DeepSeek、污染上下文、浪费 token。1.1.48 起对 WebAI2API 文本协议（浏览器自动化）**跳过该 ping 预热**（文本协议本就不走 API 前缀缓存），对话里不再凭空多一条 ping。上述 WebAI2API 侧补丁（deepseek_text 新会话重置 + routes/queue 透传）同样由 fox-ai「下载并配置」**自动幂等注入**，所有用户一致生效。
 
 **新会话同步扩展到全模型（1.1.49）**：1.1.48 的「新建会话同步」只覆盖了 DeepSeek。1.1.49 起，狐狸 AI 的 `fox_new_session` 信号同样透传到 **ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai** 等其余文本适配器——各适配器在输入框就绪后调用共享助手 `startNewSession(page, meta)`，按站点「New chat / 新对话 / 新建对话」按钮或链接点击重置浏览器侧会话，找不到则安全跳过。实现上新增 `backend/utils/page.js` 的 `startNewSession` 通用助手并加入 `utils/index.js` 导出，fox-ai「下载并配置」时**自动幂等注入**到所有上游适配器（以功能是否就位判定，重复执行不会重复注入）；DeepSeek 仍走 1.1.48 的专属内联补丁。这样无论你用哪个模型，狐狸 AI 新建会话后 Web 侧都会一起归零、不再错位；WebAI2API 侧 ping 噪音去除在 1.1.48 已对所有文本协议统一生效。
-<arg_key:6124c78e>replace_all</arg_key:6124c78e>
-<arg_value:6124c78e>false
 
-**WebAI2API 接入：Agent 文件能力完整修复（1.1.14）**：网页接入（WebAI2API，本质是模拟用户点击、在网页上对话）的模型此前无法像原生 API 那样真正调用工具读写文件——它会输出 `read_file("路径")` 这类函数样式、或用「我已使用 write_file 创建了…」这类完成式叙述冒充执行、或只输出方案征求确认，fox-ai 都收不到可解析调用。本版对 text 协议解析链与主循环做了系统修复：① **无文件夹兜底工作区根**——未开 VS Code 文件夹时自动用配置目录作「虚拟工作区根」（`foxAi.workspace.fallbackDir` 显式指定，或复用已注册的 `foxAi.webai2api.projectDir`），文件工具的相对路径也能解析；② **函数调用语法容错**——识别 `read_file("路径")` / `write_file("路径","内容")` 等函数样式并转为真实调用（参数须引号字符串，`write_file` 首参须像路径防顺序写反，`edit_file`/`delete_file` 参数顺序不可靠不自动猜，写/删/执行仍走审批与预览）；③ **「声称已调用」检测**——完成式叙述（「已使用/已调用/我用 + 工具名」）且无任何调用时回灌修正提示；④ **首轮锁死 get_tools**——新增工具 `get_tools` 按需检索（关键词过滤，返回每个工具的必填参数与 `<foxtool>` 调用示例），system 不再全量塞入 86 个工具 schema，模型第一步必须用固定格式调用一次 get_tools 锚定格式、之后按需查工具（开关 `foxAi.agent.toolGuide`：`auto` 仅 WebAI2API 等 textOnly 模型启用 / `on` 全部文本协议强制 / `off` 关闭，普通 text 模型默认保持全量手册以享前缀缓存）；⑤ **「只说不做」拦截**——输出方案/请求确认（「请确认是否执行」「确认后我将写入」）且无调用时回灌「直接执行」；⑥ **多块同名调用全执行**——修复 `parseTextCalls` 按工具名去重导致一轮内多个 `write_file` 只执行第一个的 bug，明确标签来源的同名调用全部执行，模糊来源仍去重防误判。以上检测均限定 text 协议，native（原生 function calling）/chat 模型完全不受影响；对 WebAI2API 内所有模型（DeepSeek / ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai）统一生效，无需按模型分别适配。
+**WebAI2API 接入：Agent 文件能力完整修复（1.1.15）**：网页接入（WebAI2API，本质是模拟用户点击、在网页上对话）的模型此前无法像原生 API 那样真正调用工具读写文件——它会输出 `read_file("路径")` 这类函数样式、或用「我已使用 write_file 创建了…」这类完成式叙述冒充执行、或只输出方案征求确认，fox-ai 都收不到可解析调用。本版对 text 协议解析链与主循环做了系统修复：① **无文件夹兜底工作区根**——未开 VS Code 文件夹时自动用配置目录作「虚拟工作区根」（`foxAi.workspace.fallbackDir` 显式指定，或复用已注册的 `foxAi.webai2api.projectDir`），文件工具的相对路径也能解析；② **函数调用语法容错**——识别 `read_file("路径")` / `write_file("路径","内容")` 等函数样式并转为真实调用（参数须引号字符串，`write_file` 首参须像路径防顺序写反，`edit_file`/`delete_file` 参数顺序不可靠不自动猜，写/删/执行仍走审批与预览）；③ **「声称已调用」检测**——完成式叙述（「已使用/已调用/我用 + 工具名」）且无任何调用时回灌修正提示；④ **首轮锁死 get_tools**——新增工具 `get_tools` 按需检索（关键词过滤，返回每个工具的必填参数与 `<foxtool>` 调用示例），system 不再全量塞入 86 个工具 schema，模型第一步必须用固定格式调用一次 get_tools 锚定格式、之后按需查工具（开关 `foxAi.agent.toolGuide`：`auto` 仅 WebAI2API 等 textOnly 模型启用 / `on` 全部文本协议强制 / `off` 关闭，普通 text 模型默认保持全量手册以享前缀缓存）；⑤ **「只说不做」拦截**——输出方案/请求确认（「请确认是否执行」「确认后我将写入」）且无调用时回灌「直接执行」；⑥ **多块同名调用全执行**——修复 `parseTextCalls` 按工具名去重导致一轮内多个 `write_file` 只执行第一个的 bug，明确标签来源的同名调用全部执行，模糊来源仍去重防误判。以上检测均限定 text 协议，native（原生 function calling）/chat 模型完全不受影响；对 WebAI2API 内所有模型（DeepSeek / ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai）统一生效，无需按模型分别适配。
+
+同为 1.1.15 的体验优化：⑦ **动态上下文按内容去重（只在内容变化时发一次）**——textOnly（WebAI2API 网页版）下，每轮重复的大块动态上下文（【深度思考】【当前环境】【长期记忆】等）改为**内容哈希去重**：对实际会注入的文本做指纹比对，内容与本会话上次注入完全一致则本轮**直接不注入**——不是「每 N 轮发一次」，而是**严格「只有内容变化才发一次」**（切思考开关、换文件、记忆更新、环境变更时指纹变化、立即重发，保证模型始终持有最新状态）。由于 WebAI2API 网页自带会话历史、之前发过的块模型始终能看见，同内容块不注入也不会丢失信息；恢复旧会话（重启服务/切换会话）时还会自动预扫描历史里已有的动态块并记录指纹，恢复后同样不再重复首发。普通 text 模型（DeepSeek/本地）仍每轮注入并烤回源，前缀缓存红利不受影响；⑧ **首轮精简**——textOnly 首轮若模型只输出分析而无任何工具调用，直接移除该轮无价值 assistant 消息再回灌 get_tools，让任务从第一轮起就进入真实调用，不再「一问一答」空转；⑨ **特色工具引导**——get_tools 指引新增规则：复杂任务善用规划（create_plan_task/set_plan_tasks）、子代理（spawn_subagent）、沙盒自测（run_in_sandbox）、只读自检（security_audit）、跨会话回忆（allow_session_access）、配图（generate_image）等说明书功能，避免只会 read/write；⑩ **工具参数本地容错**——WebAI2API 网页渲染会把 JSON 字符串值里的 `\n` 变成真换行、吞掉反斜杠（如 `c:\Users` 的 `\U` 变成非法转义）、把 `\"` 渲染成裸引号，导致工具参数反复被拒、白白浪费对话轮次；本版在参数校验时先做**本地修复**（未转义换行/制表符→转义、裸引号→转义、非法反斜杠转义→字面量），修复成功直接执行工具、不再回灌模型重试，从根上避免这类轮数浪费；⑪ **get_tools 清单精简**——工具参数表从多行 JSON 模板改为紧凑单行（`"参数名": 类型 必填/可选 说明`），调用示例占位值统一用「…」单字符，避免示例里的换行/引号被网页渲染破坏后模型照抄出错，同时大幅缩减回灌体积；⑫ **恢复旧会话不再重复强制 get_tools**——重启服务/切换回之前会话时，自动扫描历史：只要已有 get_tools 的成功结果记录（text 协议下的 `[工具 get_tools 的结果]` 消息、或 native 协议下的 tool 消息），即视为「工具清单已获取」，跳过首轮强制回灌，不再多问一遍（若历史里只有调用没有结果、或全新会话，仍会正常强制，保守不误放）；⑬ **长期记忆自动沉淀防噪音**——会话结束时自动沉淀「用户偏好/项目约定」的规则，会先过滤协议噪音（工具调用块、系统回灌提示、工具报错 JSON、动态上下文标记等）——WebAI2API 场景把网页对话全文粘贴进来时，这些系统痕迹不再被误当成「用户偏好」写进长期记忆（宁可少收、不可错收），真实偏好与约定照常沉淀。
+
+**工具调用符号自定义映射（1.1.15，防网页风控封号）**：固定的 `<foxtool>` 调用标签在网页（WebAI2API）对话中太显眼，容易被风控识别出"自动化工具调用"而封号。1.1.15 新增**符号映射配置**：配置文件为**工作区 `.fox-ai/tool-tag-map.json`**（优先）或**用户级 `~/.fox-ai/tool-tag-map.json`**，格式 `{ "open": "[[tool:%name%]]", "close": "[[/tool]]" }`（`%name%` 为工具名占位，符号可任意自定义，如 `【工具:%name%】`、`{@tool %name%@}`）。配置后：① 系统提示、get_tools 返回的工具示例、首轮引导全部改用自定义符号渲染，模型在网页上照抄的也是自定义符号，不再出现统一 `<foxtool>` 标签；② fox-ai 解析前先把自定义符号**归一化为内部标准调用**再执行，功能与默认完全一致；③ 留空或删除配置文件则用默认 `<foxtool>` 标签，行为不变。示例配置已写入 `~/.fox-ai/tool-tag-map.json`（`[[tool:%name%]]` / `[[/tool]]`），可自行修改或改回 `{}` 停用。另：WebAI2API 网页模型回复中的图片/视频暂不回传 fox-ai 面板（适配器只抓文本），如需下载请直接到对应网页浏览器操作；狐狸 AI 本地/云端生图、识图通道不受影响。
+
+**带行号的写入预览与自检锚点（1.1.15）**：文件工具的审批预览（`edit_file` / `write_file` 改动卡片）与审查/自检摘要统一改为**带 1 索引行号的 diff**——删除行标「原文件行号」、新增行标「新文件行号」，行号错位处用「原→新」标注（如 `13→14│`，表示该行内容在编辑后从第 13 行挪到第 14 行）。模型与用户一眼就能看出「想让第 15 行变成 X、实际落到第 14/16 行」这类**落点偏差**，自检环节也能据此发现并修正，而不是只看增删行数就通过。同时 `read_file` 的行号改为**总行数定宽**（不再是结束行号定宽），避免行号位数在文件中部跳动导致模型把前导空格误读成偏移而数错行。
+
+**审计日志统一落盘（1.1.15）**：环境与插件面板的「审计日志」此前依赖 VS Code 的 `context.logUri`（exthost 日志目录）定位，该目录在无文件夹 / WebAI2API / 被轮转清理时可能为空或不可写，导致审计日志**从未落盘、面板永远显示「无记录」**。1.1.15 起统一改为写入 `~/.fox-ai/logs/`（与扩展其他日志同目录，任意环境可写）：`runtime-audit.log`（运行时安装/下载/改 PATH）、`bridge-audit.log`（扩展桥接命令调用）、`kb-organize.log`（知识库整理），面板「刷新」即读该目录，运行过安装/桥接/整理动作后即可看到完整审计记录。
 
 本说明书面向最终使用者，说明如何安装、配置并正确使用本扩展的各项功能。有关实现细节与历史变更，请以源代码与发布说明为准。
 
@@ -62,10 +68,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-1.1.14.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.15.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-1.1.14.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-1.1.15.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏使用狐狸图标（`media/fox.svg`），扩展详情页使用新头像图标（`media/fox-icon.png`）。
@@ -179,6 +185,7 @@
 - **查看/编辑**：命令 **“狐狸 AI：打开记忆文件”**（首次使用会生成空文件）。
 - **存储位置**：`globalStorage/fox-ai/memory/memory.json`。
 - **机制**：记忆内容作为【长期记忆】段落注入系统提示词，使智能体在多次对话间保持一致。
+- **自动沉淀**：会话结束时，扩展会从对话中规则式抽取「用户纠正 / 明确约定 / 偏好声明」自动入库。抽取时会自动过滤协议噪音——工具调用块、系统回灌提示、工具报错 JSON、动态上下文标记等系统痕迹不会被误当成“你的偏好”写进记忆（WebAI2API 场景下把网页对话全文粘贴进输入框也不会污染长期记忆），真实偏好照常沉淀。
 
 ### 6.8 用户自建技能
 
@@ -348,6 +355,10 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 长期记忆按**主题文件**组织，可手动编辑、跨会话持久、按相关性自动注入。主题分类：项目约定 / 用户偏好 / 踩坑教训 / 架构决策 / 操作流程 / 领域知识等。工具 `save_memory`（支持 `topic` 参数自动归类）、`get_memory`（按主题或相关性取回）。命令面板 **「狐狸 AI：打开主题记忆」** 浏览记忆目录。
 
+- **存储位置**：`globalStorage/fox-ai/memory-topics/MEMORY.md`（索引）+ `topics/<slug>.md`（各主题文件，可手改）。
+- **自动沉淀防噪音**：会话结束的自动沉淀会过滤协议噪音（工具调用块、系统回灌提示、工具报错 JSON、动态上下文标记等），WebAI2API 全文粘贴也不会污染记忆；真实偏好与约定照常入库。
+- **注入去重**：主题记忆按相关性注入时与动态上下文共用「内容哈希去重」——检索结果与本会话上次注入一致则不重复注入，记忆文件更新或话题切换导致结果变化才重新注入。
+
 ---
 
 ### 6.26 项目规则自动读取（Project Rules）
@@ -451,6 +462,9 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 冲突感知 | `foxAi.conflictWatch.enabled` |
 | 本地自动化 | `foxAi.automations.enabled` / `foxAi.automations.storagePath` / `foxAi.automations.webhookPort` / `foxAi.automations.webhookSecret` |
 | Headless / CI | `foxAi.headless.enabled` / `foxAi.headless.provider` / `foxAi.headless.baseUrl` / `foxAi.headless.apiKey` / `foxAi.headless.model` / `foxAi.headless.apiMode` / `foxAi.headless.transport` / `foxAi.headless.temperature` / `foxAi.headless.maxTokens` / `foxAi.headless.timeout` |
+| WebAI2API | `foxAi.webai2api.autoStart` / `foxAi.webai2api.mirror` / `foxAi.webai2api.projectDir` / `foxAi.webai2api.proxy` |
+| 工具引导 | `foxAi.agent.toolGuide`（auto / on / off，控制 get_tools 首轮锁死） |
+| 工具符号映射 | 工作区 `.fox-ai/tool-tag-map.json` 或 `~/.fox-ai/tool-tag-map.json`（`{ "open": ..., "close": ... }`） |
 
 ---
 
@@ -484,7 +498,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 智能体在完成任务时可调用的工具（部分）：
 
-`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` `search_codebase` `index_codebase` `spawn_subagent` `run_background_agent` `background_jobs` 等。
+`read_file` `list_dir` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` `search_codebase` `index_codebase` `spawn_subagent` `run_background_agent` `background_jobs` `get_tools` 等。
 
 > 智能体工作准则要求：用户要求“读 / 看 / 打开 / 检查某文件”时，必须立即调用 `read_file` 读取真实内容，不凭记忆猜测或编造。
 
@@ -511,6 +525,11 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 让 AI 画图没反应 | 生图是独立通道，需开启 `foxAi.imageGen.enabled` 并配置生图模型 |
 | 生成的图片不是我想要的 | 属生图模型质量问题；抓取逻辑已加固，可更换生图模型 |
 | 对话里的图片重开窗口后消失 | 图片已做持久化存档，重开自动恢复；若丢失请检查 `foxAi.sessions.storagePath` |
+| WebAI2API 网页对话里动态块反复出现 | 1.1.15 已实现「内容哈希去重 + 会话级只发一次」：内容不变不重复注入（网页自带历史、模型始终可见）；换文件/切思考开关/记忆更新后会自动带最新内容 |
+| 重启服务后旧会话又强制调 get_tools | 1.1.15 已修复：恢复会话自动识别历史里已有的 get_tools 记录，跳过重复强制 |
+| 长期记忆里混入“不要重复错误”等系统提示 | 1.1.15 已修复：自动沉淀会过滤工具调用块/回灌提示/JSON 报错等协议噪音，不再误当用户偏好入库 |
+| 让 AI 写第 N 行、结果写偏到第 N-1/N+1 行，预览/自检没发现 | 1.1.15 已修复：审批预览与自检摘要改为带 1 索引行号的 diff（删除行标原行号、新增行标新行号、错位处「原→新」），落点偏差一眼可见；`read_file` 行号改为总行数定宽，不再因位数跳动数错行 |
+| 环境与插件面板的审计日志什么也不显示 | 1.1.15 已修复：审计日志不再依赖 `context.logUri`（可能为空/被清理），统一写入 `~/.fox-ai/logs/`（runtime-audit.log / bridge-audit.log / kb-organize.log），面板「刷新」即读该目录；运行过运行时安装、扩展桥接、知识库整理后即可看到记录 |
 
 ---
 
@@ -547,6 +566,12 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 **Q6：怎么让狐狸 AI 帮我画图？**
 需在设置中开启生图通道：把 `foxAi.imageGen.enabled` 设为 `true`，并配置一个生图模型（provider / baseUrl / apiKey / model）。配置好后直接说“画一个 XX”即可，生成的图可一键保存到本地，且会话重开不丢失。详见 6.17。
 
+**Q7：为什么 WebAI2API 网页版对话里，工具参数偶尔会被拒绝？**
+网页渲染会把 JSON 里的 `\n` 变成真换行、吞掉反斜杠（如 `c:\Users` 变非法转义）、把 `\"` 渲染成裸引号。1.1.15 起扩展会在本地修复这些被破坏的转义，修复成功直接执行、不再回灌模型重试，这类轮数浪费已基本消除。
+
+**Q8：网页版对话里的【狐狸AI·动态上下文】大块还会每轮重复吗？**
+不会。1.1.15 起动态上下文按内容哈希去重：内容与本会话上次一致就不重复注入（网页自带历史、模型始终可见），只有内容变化（切思考开关、换文件、记忆更新、环境变更）才发一次；重启服务恢复旧会话也不会重复首发。
+
 ---
 
 ## 附录：前缀缓存优化（Prompt Cache）
@@ -559,7 +584,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - **DeepSeek 专用适配（text 协议）**：DeepSeek 的原生 function calling 会把 `tools` 字段序列化在 messages 之后、不参与前缀缓存，导致工具 schema 每轮原价计费、命中率封顶在约 85%。因此扩展对 DeepSeek 默认走 **text 协议**，把工具定义写进 system（可缓存），长任务命中率可达约 98%；需要原生 function calling 时把 `foxAi.agent.toolProtocol` 设为 `native`。
 - **工具集固化**：非 DeepSeek 云端模型始终发送全量工具定义，并按函数名排序固化序列化顺序，避免 `tools` 字段抖动破坏前缀。
 - **缓存命中监控**：从各协议响应的 `usage` 中抽取缓存命中 token，计算「本轮命中率」与「会话累计命中率」并通过 `cacheStats` 事件与状态栏上报；同时计算请求前缀（system+tools）的 SHA 指纹，一旦与本轮会话首次不一致即告警，若上一轮有命中而本轮骤降为 0 亦告警。
-- **缓存预热（可选）**：设置 `foxAi.cacheWarmup.enabled = true` 后，新会话首轮会先发一个只含 system+tools、`max_tokens` 极小的请求，把「铁打前缀」提前灌进服务商缓存。默认关闭，以免产生额外调用。
+- **缓存预热（可选）**：设置 `foxAi.cacheWarmup.enabled = true` 后，新会话首轮会先发一个只含 system+tools、`max_tokens` 极小的请求，把「铁打前缀」提前灌进服务商缓存。默认关闭，以免产生额外调用。注：WebAI2API 文本协议自动跳过预热（浏览器自带会话历史，无 API 前缀缓存需求）。
 
 ---
 

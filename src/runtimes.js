@@ -304,14 +304,11 @@ async function extractArchive(file, destDir) {
   });
 }
 
-// ---- 审计日志 ----
+// ---- 审计日志（统一落到 ~/.fox-ai/logs，避免 context.logUri 为空/被清理导致日志从未落盘） ----
+const _auditRuntime = require('./auditLog').auditRuntime;
+/** 兼容旧签名 auditLog(context, action, detail)——context 不再用于定位日志目录 */
 function auditLog(context, action, detail) {
-  try {
-    const dir = context && context.logUri ? context.logUri.fsPath : path.join(os.tmpdir(), 'fox-ai');
-    fs.mkdirSync(dir, { recursive: true });
-    const line = `[${new Date().toISOString()}] ${action} ${detail ? JSON.stringify(detail) : ''}\n`;
-    fs.appendFileSync(path.join(dir, 'runtime-audit.log'), line);
-  } catch (_) { /* 审计失败不阻断主流程 */ }
+  return _auditRuntime(action, detail);
 }
 
 // ---- PATH 配置（只改用户级 PATH，自动备份，可回滚） ----
