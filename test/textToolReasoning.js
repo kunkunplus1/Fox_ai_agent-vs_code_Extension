@@ -171,6 +171,36 @@ function check(name, fn) {
     assert.strictEqual(calls[0].name, 'mcp__playwright__browser_navigate');
   });
 
+  console.log('\n[1.1.39 闭合标签感知 / 溢出回传 / 记忆别名]');
+  check('参数 JSON 内嵌 </foxtool> 字面量不被提前截断', () => {
+    const text = '<foxtool name="write_file">{"path":"a.html","content":"<div></foxtool>尾巴"}</foxtool>';
+    const calls = session.parseTextCalls(text, session._toolNameSet());
+    assert.strictEqual(calls.length, 1, '应恰好解析到 1 个调用，实际 ' + calls.length);
+    assert.strictEqual(calls[0].name, 'write_file');
+    assert.ok(calls[0].rawArgs.includes('</foxtool>尾巴'), '参数 body 应完整含内嵌闭合标签，实际：' + calls[0].rawArgs);
+  });
+  check('参数 JSON 内嵌 HTML 标签（<b>）不被过激截断', () => {
+    const text = '<foxtool name="edit_file">{"path":"x.md","content":"<b>粗体</b>"}</foxtool>';
+    const calls = session.parseTextCalls(text, session._toolNameSet());
+    assert.strictEqual(calls.length, 1);
+    assert.ok(calls[0].rawArgs.includes('<b>粗体</b>'), '参数应完整保留 HTML：' + calls[0].rawArgs);
+  });
+  check('单轮超过 5 个工具调用时标记 _truncated', () => {
+    // 用不同名工具避免触发同名去重；第 6 个应触发截断标记
+    const names = ['read_file', 'write_file', 'edit_file', 'list_dir', 'search_text', 'open_file'];
+    let text = '';
+    for (let i = 0; i < names.length; i++) text += `<foxtool name="${names[i]}">{"path":"f${i}.txt"}</foxtool>\n`;
+    const calls = session.parseTextCalls(text, session._toolNameSet());
+    assert.strictEqual(calls.length, 5, '应只取前 5 个，实际 ' + calls.length);
+    assert.strictEqual(calls._truncated, true, '应标记截断');
+  });
+  check('get_memory 别名 recall_memory 可被工具注册表解析', () => {
+    const toolsMod = require('../src/tools');
+    const t = toolsMod.getTool('recall_memory');
+    assert.ok(t, 'getTool(recall_memory) 应命中');
+    assert.strictEqual(t.name, 'get_memory', '别名应解析到 get_memory');
+  });
+
   console.log('\n[文本协议 reasoning 工具标签]');
 
   const r = await session.run();

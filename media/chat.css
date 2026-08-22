@@ -157,7 +157,7 @@ body {
   min-height: 0;
   overflow: hidden;
 }
-}
+
 
 .spacer { flex: 1; }
 .hidden { display: none !important; }
@@ -824,6 +824,12 @@ body[data-vscode-theme-kind="vscode-dark"] .msg.assistant .bubble {
 .plan-pending-list li { margin: 4px 0; line-height: 1.55; }
 .plan-pending-list .plan-icon { margin-right: 4px; }
 .plan-pending-list .plan-empty { opacity: .62; list-style: none; margin-left: -18px; }
+/* 「✓ 标记完成」按钮（计划项右侧）+ 已完成态淡出 */
+.plan-pending-list .plan-mark-btn { margin-left: 6px; font-size: 11px; padding: 1px 8px; opacity: .85; }
+.plan-pending-list .plan-mark-btn:hover { opacity: 1; }
+.plan-pending-list .plan-done-mark { margin-left: 6px; font-size: 11px; color: var(--fox-accent); opacity: .75; }
+.plan-pending-list .plan-item-done { opacity: .7; }
+.plan-pending-list .plan-item-done b { text-decoration: line-through; }
 .plan-pending-actions { display: flex; gap: 9px; margin-bottom: 9px; }
 .plan-pending-modify { display: flex; flex-direction: column; gap: 7px; }
 .plan-pending-modify textarea {
@@ -866,6 +872,19 @@ body[data-vscode-theme-kind="vscode-dark"] .msg.assistant .bubble {
 }
 .btn.primary:hover { background: var(--vscode-button-hoverBackground); transform: translateY(-1px); box-shadow: var(--fox-shadow-sm); }
 .btn.primary:active { transform: translateY(0); }
+
+/* —— 「确认执行 / 提交修改」点击后的锁定态：已点过、别再点 —— */
+.mini.locked, .btn.locked {
+  cursor: not-allowed;
+  opacity: .55;
+  filter: grayscale(.3);
+  transform: none !important;
+  box-shadow: none !important;
+  background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, .25)) !important;
+  color: var(--vscode-foreground) !important;
+}
+.mini.locked:hover, .btn.locked:hover { transform: none !important; box-shadow: none !important; }
+.mini:disabled, .btn:disabled { cursor: not-allowed; }
 
 /* —— 发送按钮：狐狸身份主 CTA，暖色渐变 + 流光 + 按压回弹 —— */
 .composer .btn.primary {

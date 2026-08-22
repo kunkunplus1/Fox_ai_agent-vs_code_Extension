@@ -56,8 +56,8 @@ async function getDiagnostics(args) {
 /** 当前编辑器状态：活动文件、选区、打开的标签 */
 async function getEditorContext() {
   const parts = [];
-  const root = ws.rootPath();
-  parts.push('工作区根目录：' + (root || '(未打开文件夹)'));
+  const root = ws.workspaceLabel();
+  parts.push('工作区根目录：' + root);
   parts.push('操作系统：' + process.platform);
 
   const editor = vscode.window.activeTextEditor;
@@ -154,17 +154,16 @@ async function getForwardedPorts(args) {
 
 /** 给系统提示词用的简短环境快照 */
 async function environmentBrief() {
-  const root = ws.rootPath();
+  const root = ws.workspaceLabel();
   const editor = vscode.window.activeTextEditor;
   const lines = [
     `操作系统：${process.platform}`,
-    `工作区：${root || '(未打开文件夹)'}`
+    `工作区：${root}`
   ];
   if (editor) {
     lines.push(`当前打开：${ws.relative(editor.document.uri)}（${editor.document.languageId}）`);
-    if (!editor.selection.isEmpty) {
-      lines.push(`用户选中了第 ${editor.selection.start.line + 1}-${editor.selection.end.line + 1} 行`);
-    }
+    // 注：原「用户选中了第 X-Y 行」已移除——它每轮随选中变化、对模型价值极低，
+    // 却导致环境块每轮字节变化 → 前缀缓存 miss（对齐 DSH「变了才更新」）。
   }
   const errCount = vscode.languages
     .getDiagnostics()

@@ -31,10 +31,48 @@ function registerDiffProvider(context) {
   );
 }
 
+/**
+ * 兜底工作区根目录：当 VS Code 未打开任何文件夹时，用配置里的目录作为「虚拟工作区根」，
+ * 让网页接入（WebAI2API）、本地模型等「无文件夹」场景也能像原生 API 那样主动读/写文件。
+ *
+ * 优先级：
+ *   1) foxAi.workspace.fallbackDir —— 显式指定，最优先（推荐给任意 provider 用）
+ *   2) foxAi.webai2api.projectDir —— WebAI2API 已注册配置，未开文件夹时自动复用其项目目录
+ *
+ * 仅接受「真实存在、是目录、且非系统敏感路径」的目录，否则返回 null（保持原行为，相对路径仍需绝对路径）。
+ * 安全：系统敏感路径永远禁止写入（isSystemPath），工作区外的写/删仍触发三重确认（isOutsideWorkspace）。
+ */
+function fallbackRoot() {
+  try {
+    const cfg = vscode.workspace.getConfiguration('foxAi');
+    const candidates = [
+      (cfg.get('workspace.fallbackDir') || '').trim(),
+      (cfg.get('webai2api.projectDir') || '').trim()
+    ];
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const p = path.resolve(raw);
+      if (fs.existsSync(p) && fs.statSync(p).isDirectory() && !isSystemPath(p)) {
+        return vscode.Uri.file(p);
+      }
+    }
+  } catch (_) { /* 配置读取异常不影响主流程 */ }
+  return null;
+}
+
 function workspaceRoot() {
   const folders = vscode.workspace.workspaceFolders;
-  if (!folders || !folders.length) return null;
-  return folders[0].uri;
+  if (folders && folders.length) return folders[0].uri;
+  // 未打开文件夹：尝试配置的兜底根目录（如 WebAI2API 项目目录），让无文件夹场景也能用文件工具
+  return fallbackRoot();
+}
+
+/** 工作区显示名：开了文件夹显示根路径；未开文件夹但配了兜底根显示「(兜底工作区根) 路径」 */
+function workspaceLabel() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders && folders.length) return folders[0].uri.fsPath;
+  const fb = fallbackRoot();
+  return fb ? '(兜底工作区根) ' + fb.fsPath : '(未打开文件夹)';
 }
 
 function rootPath() {
@@ -774,6 +812,7 @@ module.exports = {
   DIFF_SCHEME,
   registerDiffProvider,
   workspaceRoot,
+  workspaceLabel,
   rootPath,
   resolveUri,
   isOutsideWorkspace,

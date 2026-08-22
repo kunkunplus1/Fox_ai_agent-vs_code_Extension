@@ -91,6 +91,39 @@ const TOOLS = [
     run: (a) => ws.searchText(a)
   },
   {
+    name: 'get_tools',
+    kind: 'read',
+    title: (a) => `查询工具清单（${a.query || '全部'}）`,
+    description:
+      '查询当前可用的工具列表、参数与调用格式。**开始任何任务前，第一步必须调用本工具**获取工具清单；之后也可随时用 query 按关键词检索（如"文件""搜索""记忆""执行命令"）。detail="full" 返回完整参数说明，默认 brief（名称+描述+必填参数+调用示例）。本工具返回的内容里会附每个工具的 <foxtool> 调用示例，请严格照抄格式。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '检索关键词（可选），如"文件读写""搜索""执行命令""记忆"' },
+        detail: { type: 'string', enum: ['brief', 'full'], description: 'brief=简要（默认），full=完整参数说明' }
+      }
+    },
+    run: (a) => {
+      const q = String((a && a.query) || '').trim();
+      const detail = (a && a.detail) === 'full' ? 'full' : 'brief';
+      let list = TOOLS;
+      if (q) {
+        const lq = q.toLowerCase();
+        list = TOOLS.filter((t) => {
+          const props = (t.parameters && t.parameters.properties) || {};
+          const hay = (t.name + ' ' + (t.description || '') + ' ' + Object.keys(props).join(' ')).toLowerCase();
+          return hay.includes(lq);
+        });
+      }
+      if (!list.length) {
+        return `没有匹配「${q}」的工具。全部可用工具：${TOOLS.map((t) => t.name).join('、')}`;
+      }
+      const lines = list.map((t) => renderToolGuideLine(t, detail));
+      return `共 ${list.length} 个工具（每条附 <foxtool> 调用示例，严格照抄格式）：\n\n` + lines.join('\n\n') +
+        '\n\n【调用格式】\n<foxtool name="工具名">\n{"参数名": "参数值"}\n</foxtool>\n写完 </foxtool> 后立即停止输出，等待工具结果。';
+    }
+  },
+  {
     name: 'write_file',
     kind: 'edit',
     title: (a) => `写入 ${a.path || ''}`,
@@ -305,6 +338,7 @@ const TOOLS = [
   },
   {
     name: 'get_memory',
+    aliases: ['recall_memory'], // 1.1.39：兼容模型拼错/记混的工具名，别名统一解析到本工具
     kind: 'read',
     title: (a) => (a.query ? `回忆「${a.query}」` : '回忆全部记忆'),
     description: '检索跨会话长期记忆。带 query 时按主题相关性 + 关键字召回；query 为空时返回各主题概况（有哪些主题、各多少条）。用于确认之前是否记过某件事、或主动回忆项目约定与踩过的坑。',
@@ -563,7 +597,11 @@ const TOOLS = [
       const store = c && c.planTasks;
       if (!store) return '任务清单存储不可用';
       const item = store.update(a.id, { subject: a.subject, description: a.description, status: a.status });
-      if (!item) return `找不到任务 #${a.id}`;
+      if (!item) {
+        // 强引导：模型经常传错 id（记不住随机 id），又没传 subject 让兜底匹配救回来。
+        // 失败时直接告诉它「别再试 update 了，改用 set_plan_tasks 整表替换」。
+        return `找不到任务 #${a.id}（id 已过期或记错）。不要再用 update_plan_task 反复重试同一个 id——请改用 set_plan_tasks 一次性传完整 [{ content, status }] 列表做整表替换，set_plan_tasks 不依赖 id。`;
+      }
       return `任务 #${item.id} 已更新为 ${item.status}：${item.subject}`;
     }
   },
@@ -610,6 +648,37 @@ const TOOLS = [
       const ok = store.remove(a.id);
       if (!ok) return `找不到任务 #${a.id}`;
       return `已删除任务 #${a.id}`;
+    }
+  },
+  {
+    name: 'set_plan_tasks',
+    kind: 'edit',
+    title: () => '整体更新任务清单',
+    description:
+      '一次性覆盖整个项目任务清单（整表替换）。传入完整任务列表，每项含 content（任务一句话描述）与 status（pending/in_progress/completed）。不需要任务 id——适合在「标记某步完成、调整计划、重新梳理全部步骤」时一次性给出最新全量清单，避免逐条 update_plan_task 记不住 id 导致更新失败。',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: '完整的最新任务列表，每项 { content, status }。',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: '任务内容（一句话，全清单内不重复）' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: '状态' }
+            },
+            required: ['content']
+          }
+        }
+      },
+      required: ['todos']
+    },
+    run: (a, c) => {
+      const store = c && c.planTasks;
+      if (!store) return '任务清单存储不可用';
+      const counts = store.replaceAll(a.todos);
+      return `已整体更新任务清单：${counts.pending} 待办、${counts.inProgress} 进行中、${counts.completed} 已完成。`;
     }
   },
   {
@@ -1077,7 +1146,14 @@ function webSearchTool() {
   };
 }
 
-const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
+const BY_NAME = new Map();
+for (const t of TOOLS) {
+  BY_NAME.set(t.name, t);
+  // 1.1.39：注册工具别名（如 get_memory ↔ recall_memory），让 getTool 能按别名解析
+  if (Array.isArray(t.aliases)) {
+    for (const al of t.aliases) BY_NAME.set(al, t);
+  }
+}
 
 function allTools() {
   const list = TOOLS.slice();
@@ -1343,6 +1419,34 @@ function toTextManual(query, cfg) {
     });
     return `● ${t.name}：${t.description}\n  参数：\n{\n${argLines.join('\n')}\n}`;
   }).join('\n\n');
+}
+
+/**
+ * get_tools 检索结果的单工具渲染：名称 + 描述 + 必填参数 + <foxtool> 调用示例。
+ * brief = 名称+描述+必填参数+示例；full = 追加完整参数表。
+ * 示例中的参数值用占位符，模型照抄结构、替换为真实值即可（格式锚定核心）。
+ */
+function renderToolGuideLine(t, detail) {
+  const props = (t.parameters && t.parameters.properties) || {};
+  const req = (t.parameters && t.parameters.required) || [];
+  const reqSet = new Set(req);
+  const head = `● ${t.name}：${t.description || ''}`;
+  let body = '';
+  if (detail === 'full' && Object.keys(props).length) {
+    const rows = Object.keys(props).map((k) => {
+      const p = props[k];
+      return `    "${k}": ${p.type === 'integer' || p.type === 'number' ? '数字' : p.type === 'boolean' ? 'true/false' : '"字符串"'}  // ${reqSet.has(k) ? '必填' : '可选'} ${p.description || ''}`;
+    });
+    body += `\n  参数：\n{\n${rows.join('\n')}\n}`;
+  } else if (req.length) {
+    body += `\n  必填参数：${req.join('、')}`;
+  }
+  // 调用示例：用必填参数拼 <foxtool> 占位 JSON
+  const exampleArgs = req.length
+    ? '{' + req.map((k) => `"${k}": "…"`).join(', ') + '}'
+    : '{}';
+  body += `\n  调用示例：\n<foxtool name="${t.name}">\n${exampleArgs}\n</foxtool>`;
+  return head + body;
 }
 
 function titleOf(name, args) {

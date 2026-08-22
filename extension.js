@@ -1346,6 +1346,19 @@ function activate(context) {
       if (t.name === term.TERMINAL_NAME) term.clearTerminalRef();
     })
   );
+
+  /* ---- WebAI2API「随 VS Code 自启」：激活时若已开启且目录已配置，静默启动服务 ---- */
+  try {
+    if (config.conf().get('webai2api.autoStart', false)) {
+      const w2aDir = String(config.conf().get('webai2api.projectDir') || '').trim();
+      if (w2aDir) {
+        const envViewMod = require('./src/envView');
+        envViewMod.isWebAI2APIServerRunning()
+          .then((running) => { if (!running) envViewMod.startWebAI2APIService(w2aDir, () => {}); })
+          .catch(() => {});
+      }
+    }
+  } catch (_) { /* 自启失败不阻断扩展激活 */ }
 }
 
 function updateStatusBar() {
@@ -1360,6 +1373,8 @@ function updateStatusBar() {
 
 function deactivate() {
   if (chatProvider) { try { chatProvider.dispose(); } catch (_) {} }
+  // 停止扩展自身启动的 WebAI2API 服务（仅持有引用时；用户手动启动的不动）
+  try { require('./src/envView').stopWebAI2APIService(); } catch (_) {}
 }
 
 module.exports = { activate, deactivate };

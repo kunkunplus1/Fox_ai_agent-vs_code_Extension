@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.13",
+  "version": "1.1.14",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -594,6 +594,7 @@
               "moonshot",
               "siliconflow",
               "openrouter",
+              "webai2api",
               "custom"
             ],
             "enumDescriptions": [
@@ -606,6 +607,7 @@
               "月之暗面 Kimi",
               "硅基流动 SiliconFlow",
               "OpenRouter",
+              "WebAI2API（网页版安全接入）",
               "自定义 OpenAI 兼容服务"
             ],
             "description": "%foxai.n117%"
@@ -799,6 +801,42 @@
             "default": true,
             "markdownDescription": "%foxai.n264%",
             "order": 23
+          },
+          "foxAi.webai2api.autoStart": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "随 VS Code 启动 WebAI2API 本地服务（需先在环境面板「🌐 WebAI2API」完成下载并配置）。",
+            "order": 24
+          },
+          "foxAi.webai2api.mirror": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "WebAI2API 源码克隆镜像前缀（可选）。国内访问 GitHub 困难时，可填 ghproxy 类镜像（如 https://ghproxy.com/），克隆时将作为前缀拼到官方仓库地址前重试；留空则用官方 GitHub。",
+            "order": 25
+          },
+          "foxAi.webai2api.projectDir": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "WebAI2API 项目目录（由「下载并配置」自动记录，用于环境面板回填与「随 VS Code 启动」定位服务）。",
+            "order": 26
+          },
+          "foxAi.webai2api.proxy": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "WebAI2API 初始化下载代理地址（可选）。如 http://127.0.0.1:7890；留空自动探测（环境变量 → 系统代理 → 本机常见端口）。",
+            "order": 27
+          },
+          "foxAi.webai2api.autoSecondary": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "启动 WebAI2API 服务（有头模式）后，若检测到副屏（如手机 USB 副屏 Spacedesk），自动把 Camoufox 浏览器窗口移到副屏居中，主屏保持干净。",
+            "order": 28
+          },
+          "foxAi.workspace.fallbackDir": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "未打开 VS Code 文件夹时的「兜底工作区根目录」。设为真实存在的目录后，WebAI2API / 本地模型等无文件夹场景也能像原生 API 那样主动 read_file / write_file / list_dir（相对路径以此目录为根）。留空则无文件夹时相对路径仍需用绝对路径；若已配置 WebAI2API 项目目录，会自动复用它作为兜底根。系统敏感路径会被忽略。",
+            "order": 29
           },
           "foxAi.failover": {
             "type": "object",
@@ -1834,6 +1872,22 @@
               "始终使用文本协议（适合不支持 tools 的本地小模型）"
             ],
             "description": "%foxai.n239%"
+          },
+          "foxAi.agent.toolGuide": {
+            "type": "string",
+            "default": "auto",
+            "order": 4.05,
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "enumDescriptions": [
+              "仅 WebAI2API 等网页接入模型启用（首轮锁死先调 get_tools 按需检索工具，不再全量塞工具手册）",
+              "所有文本协议模型都强制启用工具按需检索",
+              "关闭，恢复旧行为（完整工具手册写进 system）"
+            ],
+            "markdownDescription": "工具手册「按需检索」模式（1.1.14）：启用后 system 不再塞入全部工具 schema，模型第一步必须先调用 `get_tools` 检索可用工具（固定格式，格式锚定 + 省 token），之后按需查询。"
           },
           "foxAi.agent.providerProfile": {
             "type": "string",

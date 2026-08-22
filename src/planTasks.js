@@ -57,7 +57,15 @@ class PlanTaskStore {
   }
 
   list() {
-    return this.items.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+    // 稳定排序：状态分组（in_progress 最前 → pending 中间 → completed 沉底），
+    // 同类内按创建时间升序，避免「按 updatedAt 降序」导致任务随每次更新乱跳、completed 被顶到最前。
+    const rank = { in_progress: 0, pending: 1, completed: 2 };
+    return this.items.slice().sort((a, b) => {
+      const ra = rank[a.status] !== undefined ? rank[a.status] : 1;
+      const rb = rank[b.status] !== undefined ? rank[b.status] : 1;
+      if (ra !== rb) return ra - rb;
+      return (a.createdAt || 0) - (b.createdAt || 0);
+    });
   }
 
   /** 新增任务；如果 rawContext 非空且缺少 subject/description，会按配置调用 AI 总结 */
@@ -101,7 +109,14 @@ class PlanTaskStore {
 
   /** 更新任务（subject / description / status） */
   update(id, changes) {
-    const it = this.items.find((x) => x.id === id);
+    changes = changes || {};
+    let it = this.items.find((x) => x.id === id);
+    // 兜底：模型幻觉/记错 id 时，若同时提供了 subject，按 subject（trim 后相等）模糊匹配，
+    // 避免「找不到任务」导致已完成步骤被标成没完成（状态更新丢失）。
+    if (!it && changes.subject) {
+      const subj = String(changes.subject || '').trim();
+      if (subj) it = this.items.find((x) => String(x.subject || '').trim() === subj);
+    }
     if (!it) return null;
     if (changes.subject !== undefined) it.subject = String(changes.subject || '').trim() || it.subject;
     if (changes.description !== undefined) it.description = String(changes.description || '').trim();
@@ -140,6 +155,59 @@ class PlanTaskStore {
       return true;
     }
     return false;
+  }
+
+  /**
+   * 整表替换（DSH todo_write 语义）：模型传完整 [{ content, status }] 列表，
+   * 本清单直接以该列表为准——不依赖任何 id，彻底规避「模型记不住 id → 更新失败/重复创建」。
+   * - 空 content 跳过；重复 content 去重（保留首个）
+   * - content 截断到 200 字符（与 create 方法的 subject+description 上限对齐，防超长内容撑爆存储）
+   * - 同 content 的旧任务复用其 id/createdAt（仅更新 status），保持 id 稳定、不产生重复项
+   * - 不在新列表里的旧任务被移除
+   * - 数组长度上限 200（防模型刷海量 todo 撑爆 plan-tasks.json）
+   * 返回 { pending, inProgress, completed } 计数。
+   */
+  replaceAll(todos) {
+    const arr = Array.isArray(todos) ? todos : [];
+    const now = Date.now();
+    const seen = new Set();
+    const next = [];
+    const MAX_CONTENT = 200;     // 单条 content 上限（字符）
+    const MAX_ITEMS = 200;       // 列表条数上限
+    for (const t of arr) {
+      if (next.length >= MAX_ITEMS) break; // 防刷爆
+      const content = String((t && t.content) || '').trim().slice(0, MAX_CONTENT);
+      if (!content) continue;
+      if (seen.has(content)) continue;
+      seen.add(content);
+      const status = Object.values(STATUS).includes(t && t.status) ? t.status : STATUS.PENDING;
+      const old = this.items.find((x) => String(x.subject || '').trim() === content);
+      if (old) {
+        next.push(Object.assign({}, old, {
+          status,
+          completedAt: status === STATUS.COMPLETED ? (old.completedAt || now) : null,
+          updatedAt: now
+        }));
+      } else {
+        next.push({
+          id: 'pt' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+          subject: content,
+          description: '',
+          status,
+          createdAt: now,
+          completedAt: status === STATUS.COMPLETED ? now : null,
+          updatedAt: now
+        });
+      }
+    }
+    this.items = next;
+    this._persist();
+    this._notify();
+    return {
+      pending: next.filter((x) => x.status === STATUS.PENDING).length,
+      inProgress: next.filter((x) => x.status === STATUS.IN_PROGRESS).length,
+      completed: next.filter((x) => x.status === STATUS.COMPLETED).length
+    };
   }
 
   nextStatus(id) {
@@ -195,7 +263,7 @@ class PlanTaskStore {
   /** 生成注入系统提示词的 Markdown 摘要 */
   renderForPrompt() {
     if (!this.items.length) return '';
-    const sorted = this.items.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+    const sorted = this.list();
     const lines = ['当前项目的可见任务清单（请按状态推进，完成后及时更新）：'];
     let chars = 0;
     for (const it of sorted) {

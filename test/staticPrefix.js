@@ -61,14 +61,13 @@ console.log('\n[1] _collectStableParts 拼接规则（技能/结构/任务/扁�
 const collected = session._collectStableParts('FLAT_BODY');
 check('返回数组且含【用户技能】', () => assert.ok(collected.some((p) => p === '【用户技能】\nSKILL_BODY'), JSON.stringify(collected)));
 check('含【项目结构】', () => assert.ok(collected.some((p) => p === '【项目结构】\nPROJ_BODY'), JSON.stringify(collected)));
-check('含【项目任务清单】', () => assert.ok(collected.some((p) => p === '【项目任务清单】\nPLAN_BODY'), JSON.stringify(collected)));
+check('不含【项目任务清单】(已移出稳定块，改由 list_plan_tasks 按需查询)', () => assert.ok(!collected.some((p) => p.startsWith('【项目任务清单】')), JSON.stringify(collected)));
 check('含【长期记忆】(扁平)', () => assert.ok(collected.some((p) => p === '【长期记忆】\nFLAT_BODY'), JSON.stringify(collected)));
-check('顺序为 技能→结构→任务→长期记忆', () => {
+check('顺序为 技能→结构→长期记忆', () => {
   const i1 = collected.findIndex((p) => p.startsWith('【用户技能】'));
   const i2 = collected.findIndex((p) => p.startsWith('【项目结构】'));
-  const i3 = collected.findIndex((p) => p.startsWith('【项目任务清单】'));
   const i4 = collected.findIndex((p) => p.startsWith('【长期记忆】'));
-  assert.ok(i1 >= 0 && i2 > i1 && i3 > i2 && i4 > i3, JSON.stringify(collected));
+  assert.ok(i1 >= 0 && i2 > i1 && i4 > i2, JSON.stringify(collected));
 });
 check('rules/mode 因跳过不出现', () => {
   assert.ok(!collected.some((p) => p.includes('CLAUDE.md') || p.includes('【Agent 模式')));

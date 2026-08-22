@@ -32,11 +32,14 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 
-// 动态附录哨兵：易变块（知识/环境/主题记忆/锚点/时间/审查）每轮重注，用此哨兵防多步循环重复叠加。
+// 动态附录哨兵：易变块（知识/环境/主题记忆/锚点/时间）每轮重注，用此哨兵防多步循环重复叠加。
 const DYN_MARK = '狐狸AI·动态上下文';
 // 稳定上下文哨兵：规则/技能/结构/任务/人格/扁平记忆等跨轮稳定块，首轮注入一次并烤回源，
 // 之后随历史沉淀进缓存、每轮命中，不再每轮重烤成 miss。独立哨兵避免与易变块互相误判。
 const STABLE_MARK = '狐狸AI·稳定上下文';
+// 审查意见哨兵：每 step 随审查批次变化的临时修正建议，作为独立 append-only user 消息注入、
+// 不烤回源、不进稳定前缀，避免污染 varAppendix（否则工具调用之间前缀断裂）。
+const REVIEW_MARK = '狐狸AI·审查意见';
 
 // —— 会话级缓存统计累加器（模块级，keyed by sessionId）——
 // AgentSession 每轮用户提问都会重建，导致 this._cacheSession* 每轮归零；若直接用它算
@@ -47,6 +50,27 @@ function _accCache(key) {
   let a = sessionCacheStats.get(key);
   if (!a) { a = { cached: 0, prompt: 0, completion: 0 }; sessionCacheStats.set(key, a); }
   return a;
+}
+
+// —— query 指纹与重叠率（易变块「变了才更新」缓存判据，对齐 DSH）——
+// 中文按相邻二元组、英文按词、数字按连续串，组成 token 集合；忽略顺序、去重。
+function _qFingerprint(q) {
+  const s = String(q || '').toLowerCase();
+  const cjk = s.match(/[\u4e00-\u9fff]/g) || [];
+  const words = s.match(/[a-z0-9]+/g) || [];
+  const toks = new Set();
+  for (let i = 0; i < cjk.length - 1; i++) toks.add(cjk[i] + cjk[i + 1]);
+  for (const w of words) toks.add(w);
+  if (cjk.length === 1) toks.add(cjk[0]);
+  return toks;
+}
+// 重叠率 = 交集 / min(两集合大小)。用 min 而非并集，短 query（"继续"）与长 query 少量重合时
+// 也能判为「同一话题」而不误重检。返回值 0~1。
+function _qOverlap(a, b) {
+  if (!a || !b || !a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / Math.min(a.size, b.size);
 }
 
 // —— 模块级 LLM 并发限流 ——
@@ -65,6 +89,44 @@ const llmLimiter = createLimiter(MAX_CONCURRENT_LLM);
 const TOOL_OPEN = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
 const TOOL_BLOCK = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/(fox:?tool|fox-tool|tool)>/gi;
 const TOOL_END = '</fox:tool>';
+
+/**
+ * 从 from 位置起找与开标签 tagName 配对的闭合标签，跳过参数 JSON 字符串值内部的闭合标签。
+ * （1.1.39 闭合标签感知：模型在工具参数里传 HTML 片段时，字符串里的 </foxtool> 不再被误判为块结束）
+ * @returns {number} 闭合标签 '<' 的索引；找不到返回 -1
+ */
+function findTagCloseIn(text, from, tagName) {
+  let inStr = null; // '"' / "'" / null：当前是否在 JSON 字符串内
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = ch; continue; }
+    if (ch === '<') {
+      const mm = /<\/(fox:?tool|fox-tool|tool)>/i.exec(text.slice(i, i + 24));
+      if (mm && mm[1].toLowerCase() === tagName.toLowerCase()) return i;
+    }
+  }
+  return -1;
+}
+
+/** 扫描 <foxtool name="..">…</foxtool> 块（含 <fox:tool>/<fox-tool>/<tool>），闭合标签感知 */
+function extractFoxToolBlocks(text) {
+  const blocks = [];
+  const openRe = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/gi;
+  let m;
+  while ((m = openRe.exec(text)) !== null) {
+    const tag = m[1];
+    const end = findTagCloseIn(text, openRe.lastIndex, tag);
+    if (end < 0) break; // 无配对闭合（流被截断）→ 后续交给截断兜底
+    blocks.push({ name: m[2], body: text.slice(openRe.lastIndex, end) });
+    openRe.lastIndex = end + tag.length + 3; // 跳过闭合标签 '</' + tag + '>'
+  }
+  return blocks;
+}
 
 /** 写一条调试日志到 ~/.fox-ai/logs/agent-<name>.log，失败静默忽略 */
 function writeAgentLog(name, lines) {
@@ -115,6 +177,9 @@ function selectBackend(cfg) {
  */
 function modelSupportsNativeTools(cfg) {
   if (cfg.transport === 'anthropic') return true;
+  // 网页版安全接入（WebAI2API 等浏览器自动化端点）不支持 function calling，
+  // 必须走 text 协议（模型输出 <fox:tool> 标签，本地解析执行）。
+  if (cfg.meta && cfg.meta.textOnly) return false;
   const model = String(cfg.model || '').toLowerCase();
   const provider = String(cfg.provider || '').toLowerCase();
   // 本地服务默认不走 native：llama.cpp / Ollama / LM Studio 等多数部署需要 --jinja 等
@@ -410,7 +475,7 @@ ${structured}${nativeSearchHint}${citationGuard}
 9. 当用户询问当前时间、日期、天气、新闻、最新版本、实时数据等时效性信息时，必须调用 current_time 或 web_search 工具获取信息后再回答。绝对禁止直接说"我无法获取当前时间"或"我没有实时信息"。
 10. 可复用的固定流程可用 create_skill 沉淀成用户技能，下次 use_skill 激活；**若技能已存在（list_skills 可见）或刚激活过，绝对不要再 create_skill 同名技能**，直接按其指导执行。
 11. 若你启动或指导用户使用了需要终端交互的程序（例如由 use_skill 激活的交互式脚本、游戏、REPL），必须在让用户输入后调用 get_terminal_output 读取终端最新输出，再根据输出继续交互；不要假设你知道用户输入了什么。
-12. 多步骤项目任务先用 create_plan_task 拆成可见清单（pending/in_progress/completed），每步用 update_plan_task 更新；用户问“进度”“还剩哪些”用 list_plan_tasks。**已通过 use_skill 激活的技能不要当任务去 create_skill**，直接执行并用 create_plan_task 记录步骤。
+12. 多步骤项目任务先用 create_plan_task 拆成可见清单（pending/in_progress/completed）；**强烈推荐用 set_plan_tasks 一次性给出完整清单做整表替换**（标记完成、调整计划时一律用它）——它不需要任务 id，彻底避免「记不住 id → 找不到任务 → 状态没改」的坑。**禁止再用 update_plan_task 反复重试同一 id**——如果 update_plan_task 返回「找不到任务 #xxx」，必须立即改用 set_plan_tasks 整表替换，不要重试同 id。**唯一允许** update_plan_task 的场景：你要精确改单条 subject/description（不依赖状态）。用户问“进度”“还剩哪些”用 list_plan_tasks。**已通过 use_skill 激活的技能不要当任务去 create_skill**，直接执行并用 create_plan_task 记录步骤。
 13. 编码类任务收尾时，除自动语法校验（node --check/写后诊断），还应主动 run_command 跑项目测试（package.json test / pytest / go test / cargo test）；无测试则至少跑一次构建或类型检查，结果写入最终总结。
 14. 系统提示词中的【本地知识库参考】已包含用户整理好的知识库文件内容，回答相关问题时请优先基于其中信息，不要调用 find_files / search_text 去工作区“找知识库文件”，也不要因检索关键词未命中就声称没有知识库。
 15. 保持谨慎：动手前先想清影响范围，优先可逆最小改动；删除/覆盖/移动/重命名文件及 rm -rf、git reset --hard 等不可逆命令务必先确认后果（autoApprove 关闭时先征得用户同意）。声称“完成”前必须用工具核实结果（get_diagnostics/跑测试/读回文件），不要凭假设说成功；拿不准先问清楚再动手。
@@ -419,7 +484,7 @@ ${structured}${nativeSearchHint}${citationGuard}
 18. 自我验证：声称“完成”前先自检——结论是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题；剔除不准确或冗余信息。
 19. 安全自检双盲校验：security_audit 结果仅供参考，**禁止作为修复唯一依据**；据自检修复后必须再调用 referee_review 对比语义差异，若判定「修复前后等价」（疑似误报）则**强制挂起转人工**。
 20. 子代理编排：多条互不相干的支线、或子任务要翻十几个文件时，用 spawn_subagent 派出去（子代理有独立上下文，你只收到结论，省 token 更快）。角色：explorer 只读 / coder 改代码 / reviewer 挑错 / tester 跑命令 / researcher 联网 / planner 拆解。task 必须自包含，背景写进 context，有依赖用 depends_on。**别滥用**：一两次工具调用能搞定的自己做。
-21. 后台任务：仅当用户**明确要求异步**（「后台帮我做 X」）或任务极耗时时，才用 run_background_agent 丢后台；丢完立刻回复「已在后台处理」，**不要**原地反复查询。后台在 git 仓库自动开独立分支、不碰你正在编辑的文件，非 git 降级只读；结束后结论不会自动出现，用户问起用 background_jobs(action=get) 取回。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：多步骤任务先用 create_plan_task 列出完整计划，再调用 present_plan 提交确认；调用 present_plan 后必须停止，等待用户确认。确认后逐步执行，每步用 update_plan_task 标记；执行中需调整计划（增删步骤/改目标）时，先改好计划再调用 revise_plan 说明原因，等用户再次确认后继续。` : '') + codingRules + extSection + (mcpGuide ? '\n\n' + mcpGuide : '');
+21. 后台任务：仅当用户**明确要求异步**（「后台帮我做 X」）或任务极耗时时，才用 run_background_agent 丢后台；丢完立刻回复「已在后台处理」，**不要**原地反复查询。后台在 git 仓库自动开独立分支、不碰你正在编辑的文件，非 git 降级只读；结束后结论不会自动出现，用户问起用 background_jobs(action=get) 取回。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：多步骤任务先用 create_plan_task 列出完整计划，再调用 present_plan 提交确认；调用 present_plan 后必须停止，等待用户确认。确认后逐步执行，每步用 set_plan_tasks 整表更新状态（或 update_plan_task 单条标记）；执行中需调整计划（增删步骤/改目标）时，先用 set_plan_tasks 改好计划再调用 revise_plan 说明原因，等用户再次确认后继续。` : '') + codingRules + extSection + (mcpGuide ? '\n\n' + mcpGuide : '');
 
   // 本地小模型精简版：去掉重型工作准则（多模态/技能/子代理/后台/MCP 自写）、MCP_AUTHORING_GUIDE，
   // 只保留编码铁律 + 8 条最关乎工具正确调用的核心准则，降低指令跟随负担。
@@ -448,6 +513,39 @@ ${structured}
 
 
   if (protocol === 'text') {
+    // 1.1.14：工具手册「按需检索」模式。textOnly（WebAI2API 网页接入）默认启用：
+    // 不再把 86 个工具的完整 schema 塞进 system（模型不遵守还容易上下文污染），
+    // 改为「首轮锁死必须先调 get_tools」——第一轮就用 <foxtool> 固定格式调用一次检索工具，
+    // 锚定格式后按需查工具。普通 text 模型（本地/DeepSeek）保持全量手册（可缓存、命中率优）。
+    const tgMode = cfg.toolGuideMode || 'auto';
+    const useGuide = tgMode === 'on' || (tgMode === 'auto' && cfg.meta && cfg.meta.textOnly);
+    if (useGuide) {
+      return `${withProfile}
+
+【调用工具的方式】
+你没有原生函数调用，必须用下面的固定格式调用工具，一次只调用一个。系统只认 <foxtool> 块：
+
+<foxtool name="工具名">
+{"参数名": "参数值"}
+</foxtool>
+
+规则：
+1. 【第一步·锁死】开始任何任务前，你的第一条回复必须且只能是下面这一个工具调用（先获取可用工具清单，再决定怎么做）：
+<foxtool name="get_tools">
+{}
+</foxtool>
+   在成功调用 get_tools 拿到工具清单之前，系统不会执行任何其他工具；若第一轮没有输出该调用，系统会回灌提示要求你重试。
+2. 之后想用某个工具时，先按需调用 get_tools（query 填关键词，如"文件""搜索""执行命令"）检索它的参数与 <foxtool> 调用示例，再照抄格式调用；拿不准有什么工具就随时再查。
+3. 工具块必须独立成段，里面是合法 JSON。写完 </foxtool> 后立刻停止输出，等待工具结果。
+4. 如果文本中没有任何 <foxtool> 块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
+5. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出 <foxtool> 块，不要额外解释。
+6. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
+7. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、不要把它写进代码块围栏、不要模拟系统提示/日志/记忆沉淀、更不要用「我已使用 write_file 创建了…」这类叙述代替执行——那些都不会触发任何执行。调用工具唯一可靠的写法就是 <foxtool> 块。
+8. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用 <foxtool> 块调用工具执行下一步；有多套方案就选最合理的直接做。系统会把每一步的真实执行与结果展示出来，只有遇到真正无法决定或危险的操作才询问用户。
+
+【常用工具速记】（完整清单与参数请调用 get_tools 检索）：
+read_file 读文件 · write_file 写文件 · edit_file 改文件 · list_dir 列目录 · find_files 找文件 · search_text 搜文本 · run_command 执行命令 · get_tools 查工具`;
+    }
     return `${withProfile}
 
 【调用工具的方式】
@@ -462,6 +560,9 @@ ${structured}
 2. 如果文本中没有任何 <foxtool> 块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
 3. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出 <foxtool> 块，不要额外解释。
 4. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
+5. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、也不要把它写进代码块围栏、更不要模拟系统提示/日志/记忆沉淀——那些不会被识别成工具调用（个别情况下系统会尽力识别函数调用样式作为兜底，但参数顺序按工具定义 path 在前，容易出错）。调用工具唯一可靠的写法就是 <foxtool> 块。
+6. 严禁用自然语言「声称已调用」代替执行：不要输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述——系统没有收到任何调用块时，这些陈述**不会触发任何执行**，会被判定为无效并回灌修正提示。想执行就输出 <foxtool> 块，别无他法。
+7. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用 <foxtool> 块调用工具执行下一步；有多套方案就选最合理的直接做，系统会把每一步的真实执行与结果展示出来，只有真正无法决定或危险的操作才询问用户。
 
 【可用工具】
 ${tools.toTextManual(queryText, cfg)}`;
@@ -500,6 +601,13 @@ class AgentSession {
     // 一旦因原生工具协议被服务端拒绝（如 MCP 大 schema 触发 400）而降级到文本协议，
     // 本会话后续轮次都保持文本协议，避免每轮先 400 再重试（见 run() 降级分支）。
     this._forceText = false;
+    // 1.1.14：声称调用但无实际调用的回灌修正计数（限 2 次，防死循环）
+    this._claimNudges = 0;
+    // 1.1.14：get_tools 首轮强制——是否已获取工具清单、强制回灌计数
+    this._toolGuideFetched = false;
+    this._guideNudges = 0;
+    // 1.1.14：只说不做/请求确认的回灌计数（限 2 次）
+    this._askNudges = 0;
     this.stepCount = 0;
     // 单条回复因 max_tokens 截断时，自动发「继续」重新调用的次数计数（防无限循环）
     this._continuesUsed = 0;
@@ -543,6 +651,10 @@ class AgentSession {
     this._cachePrevHitRate = null;      // 上一轮命中率（用于「命中骤降」告警）
     this._cachePrevRequested = false;
     this._cacheWarmed = false;          // 预热是否已做过
+    this._webResetSent = false;         // WebAI2API 文本协议：新建会话的重置信号是否已发过
+    // 易变块指纹缓存（对齐 DSH「变了才更新」）：会话级缓存 RAG/主题记忆等 query 驱动块的
+    // 结果，query 无实质变化时复用旧字节，避免每轮重检 → 每轮 miss 数千 token（命中率 71% 的主因）。
+    this._dynCache = { kb: null, topicMem: null, env: null, diag: null };
     // 长期记忆（跨会话记住用户偏好/约定/教训）
     const gsDir = this.context ? this.context.globalStorageUri.fsPath : require('os').homedir();
     const c = config.conf();
@@ -1254,11 +1366,9 @@ class AgentSession {
       const projCtx = this._buildProjectContext();
       if (projCtx) parts.push('【项目结构】\n' + projCtx);
     } catch (_) {}
-    // 项目任务清单：当前可见任务，稳定
-    try {
-      const planTaskText = this.planTasks.renderForPrompt();
-      if (planTaskText) parts.push('【项目任务清单】\n' + planTaskText);
-    } catch (_) {}
+    // 注：「项目任务清单」已移出稳定块——它的状态（pending/in_progress/completed）每轮随模型推进变化，
+    // 若留在稳定块则 system 前缀每轮漂移、整段缓存失效（命中率低的元凶之一）。
+    // 任务清单现状由模型按需用 list_plan_tasks 查询（系统提示词已引导），对齐 DSH「todo 是工具、不进前缀」。
     // Agent 模式人格：非默认模式才注入（code 模式一字不加），稳定
     if (this.mode) {
       try {
@@ -1454,10 +1564,26 @@ class AgentSession {
 
   // ===== 铁打前缀：system 只放「绝对静态」的基础系统提示词；其余内容分两类 =====
   let baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol, queryText);
-  // 知识库检索：向量模型（语义）启用时走异步召回，未启用时内部等价于旧的同步 BM25 路径。
-  // 失败一律回退，绝不阻塞主流程。
-  const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
-  let knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
+  // ===== RAG / 主题记忆「按需注入」（对齐 DSH 工具式 RAG 的前缀缓存核心）=====
+  // 关键认知：RAG 每轮注入 = 每轮把 4000+ token 拼进请求尾部 = 每轮纯 miss（命中率 71% 主因）。
+  // DSH 的做法是「知识库检索是工具，模型按需调用」——不进每轮请求前缀。
+  // 这里折中：只在【首轮】或【话题明显切换】时注入一次并烤回源（模型此后可从历史回看），
+  // 同话题后续轮次【完全不注入】，避免每轮重复 miss。话题切换用 query 指纹重叠率判定。
+  const qFp = _qFingerprint(queryText);
+  const isShortQuery = String(queryText || '').trim().length < 10;
+  const topicSwitched = (fp, c) => !c || (!isShortQuery && _qOverlap(fp, c.fp) < 0.2);
+
+  // 知识库检索（RAG）：首轮 / 话题切换才注入，同话题后续轮次不注入
+  let knowledgeText = '';
+  {
+    const c = this._dynCache.kb;
+    if (topicSwitched(qFp, c)) {
+      const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
+      knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
+      this._dynCache.kb = { fp: qFp, text: knowledgeText };
+    }
+    // else：同话题后续轮次，knowledgeText 保持空，不注入（RAG 已在历史里，模型可回看）
+  }
 
   // 扁平长期记忆（稳定，仅随记忆文件变化）→ 进稳定块；主题记忆（查询相关，易变）→ 进易变块
   let flatMemory = '';
@@ -1465,8 +1591,13 @@ class AgentSession {
   let topicMem = '';
   try {
     if (this.topicMemory) {
-      const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
-      if (rel && rel.text) topicMem = rel.text;
+      const c = this._dynCache.topicMem;
+      if (topicSwitched(qFp, c)) {
+        const rel = this.topicMemory.loadRelevant(queryText, { maxTopics: 3 });
+        topicMem = (rel && rel.text) || '';
+        this._dynCache.topicMem = { fp: qFp, text: topicMem };
+      }
+      // else：同话题后续轮次，topicMem 保持空，不注入
     }
   } catch (_) {}
 
@@ -1572,8 +1703,8 @@ class AgentSession {
         // 稳定块（规则/技能/结构/任务/人格/扁平记忆）首轮注入一次、烤回源历史后随轮命中，
         // 用独立 stable 哨兵包裹，不进 system、不放大系统前缀（避免 1.1.20 缓存预算回退）。
         const system = baseSystem;
-        // 易变附录（每轮重注）
-        const varAppendix = dynParts.concat(reviewInjectText || []).filter(Boolean).join('\n\n');
+        // 易变附录（每轮用户提问稳定，含 RAG/环境/报错/主题记忆等，不含每 step 变化的审查意见）
+        const varAppendix = dynParts.filter(Boolean).join('\n\n');
         // 稳定块已前移进 system 前缀（见上方 _stableBlock 拼接），此处不再注入 user 消息。
         const preparedHistory = await this.prepareHistory();
         if (varAppendix) {
@@ -1583,6 +1714,13 @@ class AgentSession {
           // 每个 user 边界缓存断裂、RAG/记忆/环境等大块每轮纯 miss。烤回后该 user 消息逐字节冻结，
           // 后续轮次作为历史命中前缀缓存，把每轮必 miss 的大块变成「仅首次出现时 miss、之后全命中」。
           this._bakeAppendixIntoSource(varAppendix, DYN_MARK);
+        }
+        // 审查意见（每 step 随审查批次变化）**不进 varAppendix**——否则 varAppendix 每 step 漂移，
+        // 工具调用之间的前缀断裂（命中率到不了 harness「第三次调用 99%」）。改为独立 append-only
+        // user 消息追加到请求末尾：作为「新内容」自然 miss，不破坏稳定前缀，也不烤回源（审查意见是
+        // 临时的修正建议，不该沉淀进历史）。
+        if (reviewInjectText) {
+          preparedHistory.push({ role: 'user', content: this._wrapAppendix(reviewInjectText, REVIEW_MARK) });
         }
         // 遥测用上下文快照（与下发内容一致，不进模型）
         const memoryText = (topicMem || '') + (flatMemory ? (topicMem ? '\n\n' : '') + flatMemory : '');
@@ -1620,8 +1758,13 @@ class AgentSession {
             // 由主循环统一注入到最后一条 user 消息，绝不写回 system —— system 始终等于
             // baseSystem，铁打不变、可缓存。
             baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol) + (this._stableBlock ? '\n\n' + this._stableBlock : '');
-            const kbSys2 = await this._augmentWithKnowledge(baseSystem, queryText);
-            knowledgeText = this.kbInjectedSegment(kbSys2, baseSystem);
+            // 复用首轮已缓存的 RAG 结果（同轮 query 未变），不重复检索、不重复 miss
+            if (this._dynCache.kb && this._dynCache.kb.text) {
+              knowledgeText = this._dynCache.kb.text;
+            } else {
+              const kbSys2 = await this._augmentWithKnowledge(baseSystem, queryText);
+              knowledgeText = this.kbInjectedSegment(kbSys2, baseSystem);
+            }
             this.emit('notice', {
               text: '当前模型不支持原生函数调用，已自动切换为文本协议模式继续。'
             });
@@ -1650,11 +1793,27 @@ class AgentSession {
             ? this.parseTextCalls(textSource, this._toolNameSet())
             : [];
 
+        // 单轮工具调用数超限（1.1.39）：把「被截断」的事实回传模型，不再静默丢弃。
+        // 模型会以为超出的调用已执行，实际丢了 → 必须显式提示，让它继续逐个输出。
+        if (Array.isArray(calls) && calls._truncated) {
+          const truncated = calls._truncated;
+          delete calls._truncated; // 元信息不进执行队列
+          if (calls.length) {
+            this.messages.push({
+              role: 'user',
+              content: `[系统提示] 你上一轮一次性输出了超过 ${truncated} 个工具调用，超出的部分已被丢弃。请严格遵守「一次只调用一个工具」：先观察已执行结果，然后继续逐个输出下一个 <foxtool> 块。`
+            });
+            this.emit('notice', { text: `检测到单轮工具调用超过 ${truncated} 个，已提示模型逐个执行` });
+          }
+        }
+
         // —— 本地弱模型辅助模式（1.1.17）：闭环校验 + 自动修复 ——
         // 文本协议下，解析出的工具调用先做 JSON Schema 校验（类型/必填/枚举）。
         // 失败不发错误，而是把具体报错作为「反思提示」追加进下一轮 payload 让模型自我修正，
         // 最多重试 2~3 次；连续失败转降级模式（仅执行校验通过的调用），绝不卡死。
-        if (this.protocol === 'text' && this._weakLocal && calls.length) {
+        // 1.1.39：textOnly（WebAI2API 网页版接入）同样启用参数校验，畸形 JSON 有闭环兜底。
+        const textNeedsArgCheck = this._weakLocal || (this.cfg && this.cfg.meta && this.cfg.meta.textOnly);
+        if (this.protocol === 'text' && textNeedsArgCheck && calls.length) {
           const checked = this._validateTextCalls(calls);
           if (checked.invalid.length) {
             if (this._weakArgRetries < this._weakArgMax) {
@@ -1710,6 +1869,50 @@ class AgentSession {
         }
 
         if (!calls.length) {
+          // 1.1.14：拦截「声称已调用工具但实际无任何调用」的角色扮演式输出。
+          // 网页接入（WebAI2API）模型在 1.1.14 函数样式容错之后，学会了连函数样式都不输出，
+          // 直接用「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述冒充执行。
+          // 系统没收到任何可解析调用（既无 <foxtool> 也无 read_file("路径") 样式）→ 没有任何操作发生。
+          // 这里回灌修正提示，迫使模型输出真实调用；限 2 次避免死循环。
+          // 1.1.14：仅对 text 协议生效——native（原生 function calling）/chat 模型有原生工具通道或本就不带工具，
+          // 正常回答里出现「请确认…」「我将执行…」属于普通对话，不应被这套文本兜底误拦。
+          if (this.protocol === 'text' && (this._claimNudges || 0) < 2 && this._detectClaimedTool(textSource)) {
+            this._claimNudges = (this._claimNudges || 0) + 1;
+            this.messages.push({
+              role: 'user',
+              content: `[系统] 你刚才声称已使用某个工具（如 write_file / list_dir / read_file），但系统没有收到任何工具调用——既没有 <foxtool> 块，也没有 read_file("路径") 这类函数调用样式，因此没有任何文件操作真正发生。请立即用 <foxtool> 块输出你要执行的真实工具调用，一次只调用一个；在输出真实调用之前，系统不会执行任何操作。`
+            });
+            this.emit('notice', { text: `检测到模型「声称已调用工具但无实际调用」（第 ${this._claimNudges}/2 次），已回灌修正提示，要求输出真实 <foxtool> 调用` });
+            appendLog('agent', `[claim-nudge] 声称调用但无实际调用，回灌修正 (${this._claimNudges}/2)`);
+            continue;
+          }
+          // 1.1.14：textOnly（WebAI2API）首轮锁死——必须先调 get_tools 获取工具清单。
+          // 若本会话尚未成功执行过 get_tools 且本轮仍无任何调用，回灌强制其输出固定格式调用，限 2 次。
+          const needGuide = !this._toolGuideFetched && this.cfg && this.cfg.meta && this.cfg.meta.textOnly
+            && (this.cfg.toolGuideMode === 'on' || this.cfg.toolGuideMode === 'auto');
+          if (needGuide && (this._guideNudges || 0) < 2) {
+            this._guideNudges = (this._guideNudges || 0) + 1;
+            this.messages.push({
+              role: 'user',
+              content: `[系统] 本任务的第一步必须先调用 get_tools 获取可用工具清单（这是固定格式要求）。你刚才没有输出任何工具调用。请立即只输出下面这一个 <foxtool> 调用块，不要附加任何解释：\n\n<foxtool name="get_tools">\n{}\n</foxtool>`
+            });
+            this.emit('notice', { text: `已强制模型先调用 get_tools 获取工具清单（第 ${this._guideNudges}/2 次）` });
+            appendLog('agent', `[guide-nudge] textOnly 首轮未调 get_tools，强制回灌 (${this._guideNudges}/2)`);
+            continue;
+          }
+          // 1.1.14：拦截「只说不做 + 请求确认」——模型输出方案/征求确认（"请确认是否执行""确认后我将写入"）
+          // 却没有输出任何工具调用。回灌"直接执行"提示，限 2 次避免死循环。
+          // 1.1.14：仅 text 协议生效，native/chat 不误拦（理由同上）。
+          if (this.protocol === 'text' && (this._askNudges || 0) < 2 && this._detectAskOnly(textSource)) {
+            this._askNudges = (this._askNudges || 0) + 1;
+            this.messages.push({
+              role: 'user',
+              content: `[系统] 你刚才只输出了方案或请求确认，没有输出任何工具调用。请**直接**用 <foxtool> 块调用工具执行下一步（一次只调用一个）；若有多套方案，选最合理的直接做，不要先征求用户确认——系统会把每一步的真实执行与结果展示出来。只有遇到真正无法决定或危险的操作才询问用户。`
+            });
+            this.emit('notice', { text: `检测到模型「只说不做/请求确认」（第 ${this._askNudges}/2 次），已回灌提示要求直接执行` });
+            appendLog('agent', `[ask-nudge] 只说不做/请求确认，回灌直接执行 (${this._askNudges}/2)`);
+            continue;
+          }
           // final 阶段：禁止再触发工具调用，把最终答案统一推送进主正文
           this._inFinalPhase = true;
           this.state = 'done';
@@ -2520,11 +2723,21 @@ class AgentSession {
     const b = selectBackend(targetCfg);
     const useResp = b.responses;
 
+    // WebAI2API 文本协议（浏览器自动化）：
+    //  1) 不发送 warmup 的 "ping" 探测——它会作为真实聊天消息打进 DeepSeek，污染上下文、浪费 token；
+    //  2) 新会话首条消息携带 fox_new_session 信号，让远端点击「新对话」重置浏览器会话。
+    const isWebText = !!(targetCfg.meta && targetCfg.meta.textOnly);
+    if (isWebText && !this._webResetSent && isPrimary) {
+      opt.extraBody = Object.assign({}, opt.extraBody, { fox_new_session: true });
+      this._webResetSent = true;
+    }
+
     // 缓存预热（默认关闭，设置 foxAi.cacheWarmup.enabled 开启）：新会话首轮先发一个
     // 只含 system+tools、max_tokens=1 的请求，把「铁打前缀」提前灌进服务商缓存，
     // 使随后真实的（大体量）请求能直接命中前缀缓存。
+    // 注：WebAI2API 文本协议不走 API 前缀缓存（本质是浏览器自动化），且 warmup 的 "ping" 会变成真实聊天消息，故跳过。
     const warmupEnabled = (() => { try { return config.conf().get('cacheWarmup.enabled', false); } catch (_) { return false; } })();
-    if (warmupEnabled && !this._cacheWarmed && isPrimary && this._cacheCapability && this._cacheCapability.supported) {
+    if (warmupEnabled && !this._cacheWarmed && isPrimary && this._cacheCapability && this._cacheCapability.supported && !isWebText) {
       await this._warmupCache(opt, useResp, b, targetCfg);
     }
 
@@ -2924,33 +3137,39 @@ class AgentSession {
     const out = [];
     const text = String(content || '');
     const seen = new Set();
-    const push = (name, rawArgs) => {
+    // exact=true：明确标签来源（<foxtool>/<function>/函数样式）不去重——模型一次输出多个
+    // write_file 块（如连续写多份教材文件）时，1.1.14 之前被 seen 按工具名去重，只有第一个
+    // 执行、其余静默丢弃，模型还以为都写了。模糊来源（JSON 扫描/截断兜底）仍去重防误判。
+    const push = (name, rawArgs, exact) => {
       if (!name) return;
       const n = String(name).trim();
       if (!n) return;
       const key = n.toLowerCase();
-      if (seen.has(key)) return;
+      if (!exact) {
+        if (seen.has(key)) return;
+        seen.add(key);
+      }
       // 已知工具名过滤：避免把随机 JSON 对象误判成工具调用（增强③防误触）
       if (knownTools && knownTools.length && !knownTools.includes(key)) return;
-      seen.add(key);
       out.push({ id: 'text_' + out.length, name: n, rawArgs: rawArgs || '' });
     };
     writeAgentLog('textcalls', [`parseTextCalls input len=${text.length}`, `head=${text.slice(0, 300).replace(/\s+/g, ' ')}`, `known=${knownTools ? knownTools.length : 'none'}`]);
 
     // 1) <foxtool name="..">...</foxtool> / <fox:tool> / <tool>
-    TOOL_BLOCK.lastIndex = 0;
-    let m;
-    while ((m = TOOL_BLOCK.exec(text)) !== null) {
-      push(m[2], m[3]);
-      if (out.length >= 5) break;
+    //    闭合标签感知（1.1.39）：扫描时跳过参数 JSON 字符串值内部的闭合标签，
+    //    避免「工具参数里含 </foxtool> 字样」被提前截断导致参数解析失败。
+    for (const blk of extractFoxToolBlocks(text)) {
+      push(blk.name, blk.body, true);
+      if (out.length >= 5) { out._truncated = true; break; }
     }
 
     // 2) <function name="..">...</function> 风格（部分模型按 OpenAI 工具调用格式吐标签）
     if (out.length < 5) {
       const FN = /<function\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/function>/gi;
+      let m;
       while ((m = FN.exec(text)) !== null) {
-        push(m[1], m[2]);
-        if (out.length >= 5) break;
+        push(m[1], m[2], true);
+        if (out.length >= 5) { out._truncated = true; break; }
       }
     }
 
@@ -2973,7 +3192,7 @@ class AgentSession {
           args = JSON.stringify(rest);
         }
         push(nm, args);
-        if (out.length >= 5) break;
+        if (out.length >= 5) { out._truncated = true; break; }
       }
     }
 
@@ -2983,8 +3202,56 @@ class AgentSession {
       const open = OPEN_ANY.exec(text);
       if (open) {
         const name = open[2]; // 统一把工具名放在第 2 组，避免 <function> 与 <foxtool> 分组错位
-        const body = text.slice(open.index + open[0].length).replace(/<[^>]+>[\s\S]*$/, '').trim();
+        // 1.1.39：只截到「本工具块的自然边界」（下一处工具开标签之前），
+        // 不再用「正文中任意 < 之后全吞」的过激规则，避免参数 JSON 里含 <tag>/比较表达式被误截。
+        const rest = text.slice(open.index + open[0].length);
+        const nextOpen = /<(foxtool|fox:tool|fox-tool|tool|function)\s+name\s*=/i.exec(rest);
+        const body = (nextOpen ? rest.slice(0, nextOpen.index) : rest)
+          .replace(/<\/(foxtool|fox:tool|fox-tool|tool|function)>[\s\S]*$/, '').trim();
         if (body) push(name, body);
+      }
+    }
+
+    // 5) 函数调用语法容错（1.1.14）：网页接入（WebAI2API）等模型不遵守 <foxtool> 协议，
+    //    改为输出 read_file("路径") 这类伪调用（甚至放进代码块围栏）——之前被当作普通文本，
+    //    模型「以为」自己调了工具、继续角色扮演，实际一个都没执行。这里把它们解析为真实调用：
+    //    让「假装读取」变成「真正执行」，打破模拟循环。
+    //    安全设计：只映射参数顺序明确的工具（read 类单参 + run_command 单参 + write_file 双参），
+    //    且参数必须都是引号字符串；edit_file/delete_file 参数顺序不可靠，不自动猜（等 <foxtool>）。
+    //    写/删/exec 仍走审批 + 预览，误判也有安全门兜底。
+    if (!out.length && knownTools && knownTools.length) {
+      const FN_ARG = {
+        read_file: ['path'],
+        list_dir: ['path'],
+        find_files: ['pattern'],
+        search_text: ['query'],
+        run_command: ['command'],
+        write_file: ['path', 'content']
+      };
+      // 长名优先，避免 read_file 被 read 之类前缀误匹配（工具名都是字母数字下划线，正则安全）
+      const nameAlt = knownTools.slice().sort((a, b) => b.length - a.length).join('|');
+      const fnRe = new RegExp('\\b(' + nameAlt + ')\\s*\\(([^)]*)\\)', 'gi');
+      let fm;
+      while ((fm = fnRe.exec(text)) !== null) {
+        const nm = String(fm[1]).toLowerCase();
+        const map = FN_ARG[nm];
+        if (!map) continue;
+        // 提取括号内所有引号字符串参数
+        const strs = [];
+        const strRe = /["']([^"']*)["']/g;
+        let sm;
+        while ((sm = strRe.exec(fm[2])) !== null) strs.push(sm[1]);
+        if (strs.length < map.length) continue; // 参数不足，不猜（避免把自然语言提及误判为调用）
+        // write_file 防呆：若第 1 个参数不像路径（很可能是 content/path 顺序写反），不猜，
+        // 避免把正文当文件名写错位置；read 类/run_command 无此风险。
+        if (nm === 'write_file' && !/^[a-zA-Z]:[\\/]|[\\/]|\.\w+$/.test(strs[0])) continue;
+        const argsObj = {};
+        map.forEach((k, i) => { argsObj[k] = strs[i]; });
+        push(nm, JSON.stringify(argsObj), true);
+        if (out.length >= 5) { out._truncated = true; break; }
+      }
+      if (out.length) {
+        writeAgentLog('textcalls', [`parseTextCalls 容错: 函数调用样式命中 ${out.map((c) => c.name).join(',')}`]);
       }
     }
 
@@ -2992,12 +3259,53 @@ class AgentSession {
     return out;
   }
 
-  /** 已知工具名集合（小写），供 parseTextCalls 过滤误判 */
+  /** 已知工具名集合（小写），供 parseTextCalls 过滤误判；含工具别名（如 get_memory 的 recall_memory） */
   _toolNameSet() {
     try {
       const list = (typeof tools !== 'undefined' && tools.allTools) ? tools.allTools() : [];
-      return (list || []).map((t) => String(t.name).toLowerCase());
+      const names = (list || []).map((t) => String(t.name).toLowerCase());
+      // 1.1.39：纳入 aliases，模型用别名调用（如 recall_memory）不会被 knownTools 过滤丢弃
+      for (const t of (list || [])) {
+        if (Array.isArray(t.aliases)) {
+          for (const a of t.aliases) names.push(String(a).toLowerCase());
+        }
+      }
+      return names;
     } catch (_) { return []; }
+  }
+
+  /**
+   * 1.1.14：检测「声称已调用工具但实际无调用」的角色扮演句式。
+   * 网页接入模型常输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述，
+   * 却没有输出任何可解析的调用（既无 <foxtool> 也无 read_file("路径") 函数样式）。
+   * 保守设计：只匹配「完成式 + 工具名」句式（已使用/已调用/我用/成功调用/工具名+已执行），
+   * 不匹配教学式的一般陈述（如「使用 write_file 可以写入文件」）。
+   */
+  _detectClaimedTool(text) {
+    const t = String(text || '');
+    const TOOL = '(?:read_file|write_file|edit_file|list_dir|find_files|search_text|delete_file|run_command|get_diagnostics|get_editor_context|save_memory|get_memory|open_file)';
+    const MARK = '(?:[`*_~「」"\' ]*)'; // 容忍反引号/星号等代码标记（模型常用 `write_file` 包裹）
+    const re = new RegExp(
+      '(?:已(?:经)?|成功(?:地)?)(?:使用|调用|用)\\s*(?:了)?\\s*' + MARK + TOOL + '\\b' +   // 已使用/成功调用 + 工具
+      '|我用\\s*' + MARK + TOOL + '\\b' +                                                    // 我用 + 工具
+      '|' + MARK + TOOL + '\\s*(?:已|已经|成功)\\s*(?:执行|完成|写入|读取|创建|删除|列出|打开|修改)?',  // 工具 + 已完成式
+      'i'
+    );
+    return re.test(t);
+  }
+
+  /**
+   * 1.1.14：检测「只说不做 + 请求确认」的输出。模型在声称检测回灌后，学会改用
+   * 「修正方案如下…请确认是否执行」「确认后我将立即写入」这类预告/征求确认句式，
+   * 把"调用工具"当成"等用户点头后才会发生的事"，实际一个调用都没有。
+   * 保守设计：必须同时满足 ① 请求确认/预告执行强信号 ② 提到工具名或执行动作词，才判定。
+   */
+  _detectAskOnly(text) {
+    const t = String(text || '');
+    const ask = /(?:请(?:您|你)?确认|是否执行|确认(?:后|一下)|可以吗|好吗|要不要|我(?:将|准备|会)(?:立即|马上|接下来)?(?:使用|调用|执行|写入|创建|修改|把)|建议(?:您|你)?(?:先)?(?:确认|同意)|等(?:您|你)?(?:确认|同意)|执行(?:此|这个)?(?:方案|修正)|方案如下|修正方案|我的方案)/i;
+    if (!ask.test(t)) return false;
+    const act = /(read_file|write_file|edit_file|list_dir|find_files|search_text|delete_file|run_command|get_tools)|(写入|创建|修改|覆盖|删除|执行|移动|读取)/i;
+    return act.test(t);
   }
 
   /**
@@ -3162,7 +3470,7 @@ class AgentSession {
    */
   _loopGuardCheck(name, args) {
     // 这些工具本身就是「反复小步推进」的语义，重复调用是正常的，不参与循环检测
-    const EXEMPT = new Set(['update_plan_task', 'present_plan', 'revise_plan', 'save_memory', 'checkpoint_create']);
+    const EXEMPT = new Set(['update_plan_task', 'set_plan_tasks', 'present_plan', 'revise_plan', 'save_memory', 'checkpoint_create']);
     if (EXEMPT.has(name)) return null;
 
     if (!this._toolSigHistory) this._toolSigHistory = [];
@@ -3256,6 +3564,27 @@ class AgentSession {
     if (name === 'read_file' && args && args.path) {
       if (!this._readFileHistory) this._readFileHistory = [];
       const sig = readFileSig(args.path, args);
+      // cacheDedup（只读工具结果会话内去重，对齐 DSH「工具结果极小」）：同一文件「同区间」且
+      // 「内容未变」（mtime/size 签名相同）时，第二次起返回极短占位，不把完整文件内容重新塞进上下文，
+      // 缩小每轮不可缓存的增量、拉高命中率。文件被改动（mtime/size 变）视为新调用，绝不返回旧内容。
+      const dedupEnabled = (() => { try { return config.conf().get('cacheDedup.enabled', true); } catch (_) { return true; } })();
+      if (dedupEnabled) {
+        let contentSig = '';
+        try {
+          const st = fs.statSync(args.path);
+          if (st) contentSig = Math.floor(st.mtimeMs) + ':' + st.size;
+        } catch (_) {}
+        if (contentSig) {
+          const key = sig + '|' + contentSig;
+          if (this._readFileHistory.some((r) => r.key === key)) {
+            const range = (args.start_line || args.end_line || args.start_char || args.end_char) ? '（指定区间）' : '（全文）';
+            this.pushToolResult(callId, name,
+              `文件 ${args.path} ${range}内容未变，本会话已读取过（见上方），无需重复读取，请直接基于已读内容继续。`,
+              true, { reason: '重复读取未变更文件（已去重）', suggest: '内容与之前一致，直接使用已读内容。' });
+            return;
+          }
+        }
+      }
       const recent = this._readFileHistory.slice(-6).filter((r) => r.sig === sig).length;
       if (recent >= 3) {
         const range = (args.start_line || args.end_line || args.start_char || args.end_char)
@@ -3557,6 +3886,8 @@ class AgentSession {
       }
 
       const output = await tools.execute(name, args, execCtx);
+      // 1.1.14：get_tools 成功执行即视为「工具清单已获取」，解除首轮强制
+      if (name === 'get_tools') this._toolGuideFetched = true;
       this.emit('toolEnd', { id: uiId, ok: true, output });
       // 本地联网搜索类工具（web_fetch / browser / mcp 抓取类 / 原生 web_search 等）的返回里若含网址，
       // 抽出来喂给前端 harvest，使回答里的引用角标能带上可点击链接（与官方联网搜索同机制）。
@@ -3649,10 +3980,21 @@ class AgentSession {
           this._artifacts.push({ name, path: args.path, op: artifactOp, added: ds.added, removed: ds.removed });
         }
       }
-      // 记录 read_file 调用（用于去重）—— 成功执行后存档，按「路径+区间」签名区分，避免不同区间被误判为重复
+      // 记录 read_file 调用（用于去重）—— 成功执行后存档，按「路径+区间」签名区分，避免不同区间被误判为重复；
+      // key 额外带 mtime/size 内容签名，供 cacheDedup 判断「文件是否被改动过」（改了则视为新调用，绝不返回旧内容）。
       if (name === 'read_file' && args && args.path) {
         if (!this._readFileHistory) this._readFileHistory = [];
-        this._readFileHistory.push({ path: args.path, sig: readFileSig(args.path, args), time: Date.now() });
+        let contentSig = '';
+        try {
+          const st = fs.statSync(args.path);
+          if (st) contentSig = Math.floor(st.mtimeMs) + ':' + st.size;
+        } catch (_) {}
+        this._readFileHistory.push({
+          path: args.path,
+          sig: readFileSig(args.path, args),
+          key: readFileSig(args.path, args) + '|' + contentSig,
+          time: Date.now()
+        });
         if (this._readFileHistory.length > 12) this._readFileHistory.shift();
       }
       this.pushToolResult(callId, name, finalOutput, false, okMeta);
@@ -3843,7 +4185,10 @@ class AgentSession {
     if (mode === 'all') return 'approve';
     if (mode === 'edit' && kind !== 'exec') return 'approve';
     if (mode === 'read' && kind === 'read') return 'approve';
-    if (typeof this.ui.requestApproval !== 'function') return 'approve';
+    // 越权风控（1.1.39）：没有审批 UI 时绝不静默放行高危操作（写/执行/删除）。
+    // 只读类在上面已放行；其余一律返回 reject（由 handleToolCall 拦截并回传模型），
+    // 宁可少做不可越权——UI 缺失属架构异常，不能退化为「默认放行」。
+    if (typeof this.ui.requestApproval !== 'function') return kind === 'read' ? 'approve' : 'reject';
 
     this.state = 'awaiting-approval';
     this.emit('state', { state: 'awaiting-approval' });

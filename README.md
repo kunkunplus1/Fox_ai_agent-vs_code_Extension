@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.13
+> **版本**：1.1.14
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -12,10 +12,39 @@
 
 狐狸 AI 智能体（以下简称“本扩展”）是一款运行于 Visual Studio Code 的本地智能体扩展。其核心定位为：在开发者的工作区内，以智能体（Agent）模式自主完成读文件、修改代码、执行命令、查看运行报错等工程任务，并在全流程中提供暂停、继续、取消等过程控制能力。
 
-本扩展支持以下两类模型接入方式：
+本扩展支持以下三类模型接入方式：
 
 1. **本地推理引擎**：llama.cpp、Ollama、LM Studio 等本地化部署的推理服务。
 2. **云端 API 服务**：DeepSeek、智谱 GLM、通义千问、Kimi、硅基流动、OpenRouter 等国内合规 API 服务，以及 OpenAI 兼容接口、Anthropic Claude 等海外模型。
+3. **网页版（安全接入，走 WebAI2API）**：想用 DeepSeek / Gemini / ChatGPT / Claude / 豆包 / LMArena 等网页版免费额度、又不想碰「逆向接口被封号」的风险时，推荐本地部署一个 [WebAI2API](https://github.com/foxhui/WebAI2API)（Camoufox 浏览器自动化 + 拟人化交互，最接近真实用户、最不易被封）。**可直接在狐狸 AI「环境面板 → WebAI2API」点「下载并配置」一键完成**（自定义目录 + 百分比进度 + 可中途停止，自动生成鉴权密钥并填入服务商；若 GitHub 访问不畅，可在「镜像前缀」处填 ghproxy 类镜像如 https://ghproxy.com/，将自动用镜像重试；若 `npm run init` 下载 Camoufox 等大文件卡在 `ECONNRESET`，可在「代理」框填你的代理地址（如 `http://127.0.0.1:7890`，留空则自动探测系统代理/本机端口）走代理下载，避开直连 GitHub Release CDN 被重置；**1.1.37 起**：① 停止 / 关闭 VS Code 时会同步彻底清理 npm/node 子进程树，不再有「停了还在后台跑、日志继续记」的残留；② init 进度按 `\r` 分段精确解析，面板百分比更准确；③ 若网络实在下不动大文件，可自行下载 `camoufox-135.0.1-beta.24-win.x86_64.zip` 放到项目 `data/temp/camoufox.zip`（或直接解压到 `camoufox/` 目录），重新「下载并配置」会自动识别并跳过下载；**1.1.38 起**：④ **多线程安全下载**——无代理时扩展会自动用「分段并发下载」（Range 分 8 个连接抓取 Camoufox / GeoLite / Node 等大文件，分片断点续传、逐片重试、按序合并、字节数完整性校验，下载更快更稳）；有代理时仍走代理下载。**部署方式固定为源码部署**（git clone + npm install + npm run init），**不使用 Docker**（项目自带的 Dockerfile/Compose 为上游提供，扩展不采用；需要 Docker 的仅是扩展内置的「代码沙盒」可选功能、与 WebAI2API 无关），随后点 **「▶ 启动服务 / ⏹ 停止服务」** 一键管理本地服务（启动时自动检测端口冲突并提示，可勾选「随 VS Code 启动」让服务开机自启；首次使用需在项目目录跑一次 `npm start -- -login` 登录网页账号）；部署后在服务商列表选「WebAI2API（网页版安全接入）」即可。手动部署则 apiKey 填 `config.yaml` 里的 `auth`，baseUrl 默认 `http://localhost:3000/v1`。注意：网页版不支持原生函数调用，工具调用走文本协议（`<fox:tool>` 标签），可靠性略低于 API 版。
+
+**WebAI2API / 文本协议深度优化（1.1.39）**：① **越权风控**：无审批 UI 时高危操作（写文件/执行命令/删除）默认拒绝、不再默认放行——UI 缺失属架构异常，宁可少做不可越权；② **工具调用解析**：`<foxtool>` 块改为闭合标签感知（工具参数 JSON 内嵌 `</foxtool>` / HTML 标签不再被提前截断导致参数解析失败）；单轮超过 5 个工具调用不再静默丢弃，而是回传模型逐个执行；模型在正文里讲解 `</fox:tool>` 格式时不再误判为工具调用结束而截断（独立成段才算）；③ **参数闭环校验**：textOnly（WebAI2API 网页版）接入同样启用 JSON Schema 校验，畸形参数自动反馈模型自我修正；④ **记忆**：`get_memory` 增加别名 `recall_memory`，模型拼错/记混工具名也能正常解析执行；⑤ **WebAI2API 服务鉴权**：本地项目 `auth.js` 改用 `crypto.timingSafeEqual` 常量时间比较，防时序侧信道。
+
+**全用户一致生效（1.1.40）**：此前「init.js 已就绪跳过下载」「auth.js 鉴权加固」是改在**单台机器项目里**的，其他用户重新 clone 拿上游原版就失效。1.1.40 起 fox-ai 在「下载并配置」时**自动给项目注入幂等补丁**（`scripts/init.js` 已就绪跳过下载 + `src/server/middlewares/auth.js` timingSafeEqual），且预下载的 Camoufox zip 会**自动解压并补 version.json**——无论 clone 到什么版本、什么用户，点「下载并配置」都能完整享受多线程加速 + 不重复下载 505MB + 鉴权加固，补丁幂等可重复执行、重新 clone 自动重打。
+
+**配置项补齐（1.1.41）**：修复「没有注册配置 foxAi.webai2api.projectDir，无法写入用户设置」——`foxAi.webai2api.projectDir`（安装目录自动记录）与 `foxAi.webai2api.proxy`（代理地址）此前未在扩展 manifest 注册导致持久化失败，现已补注册；「下载并配置」完成后安装目录会正确写入用户设置，环境面板下次打开自动回填、可正常「随 VS Code 启动」。
+
+**有头模式 + 手机 USB 副屏（1.1.42）**：WebAI2API 服务默认**有头模式**启动（`headless: false`，Camoufox 浏览器窗口可见，登录/验证码可人工操作，比无头更不易被网站风控）。为避免浏览器窗口占住主屏：① 手机装 Spacedesk 客户端、电脑装 Spacedesk Server，**USB 数据线**连接后手机会作为一块扩展副屏出现；② 启动服务后扩展**自动检测副屏并把 Camoufox 窗口移到副屏居中**（可设 `foxAi.webai2api.autoSecondary` 关闭自动移动）；③ 也可随时点面板「📱 移到副屏」一键手动移动；④ **停止服务时主屏/副屏一并清理**——浏览器窗口随进程树关闭，手机副屏无残留，面板会给出明确提示。副屏功能仅 Windows 生效。
+
+**指纹生成修复（1.1.43）**：修复 WebAI2API 浏览器初始化失败「Failed to generate a consistent fingerprint after 10 attempts」导致服务进入安全模式（OpenAI API 不可用）——根因是上游 `launcher.js` 的屏幕约束（1280-1366×720-768 宽高双限）与 `fingerprint-generator@2.1.78` 联合采样不兼容（10 次必败，无约束/放宽约束稳定成功）。扩展在「下载并配置」时自动把约束放宽到 1280-1920×720-1080（幂等补丁，所有用户生效）。同时修复「移到副屏」PowerShell 输出变量的转义 bug。
+
+**playwright-core 版本锁定（1.1.44）**：修复浏览器初始化失败 `Protocol error (Browser.setDefaultViewport): Found property "<root>.viewport.isMobile"...`——上游 `package.json` 声明 `"playwright-core": "^1.57.0"`，npm install 会装最新版（如 1.62.1），新版 setDefaultViewport 参数含 `isMobile`，Camoufox 135 内置 Juggler 协议不识别。扩展在「下载并配置」时（**npm install 之前**）自动把 playwright-core 锁定为 pnpm-lock 的精确版本 **1.57.0**（幂等补丁），规避该不兼容；WebUI 登录需填 `data/config.yaml` 里的 `auth` 值（API Token，sk- 开头）。
+
+**鼠标分身与面板增强（1.1.45）**：WebAI2API 在副屏模拟真人点击时，主屏真实鼠标一动会让浏览器窗口失焦/触发真实 hover、打断自动化流程。① **🖱 鼠标分身开关**：给 Camoufox 窗口设置「点击穿透」（WS_EX_LAYERED+WS_EX_TRANSPARENT）——真实鼠标从窗口上滑过/点击全部穿透、浏览器收不到任何真实事件，Playwright 合成鼠标照常工作 → 副屏模拟与主屏鼠标互不干扰；**登录账号等需手动操作时先关闭该开关**。② **🔑 复制 Token 按钮**：一键把 `config.yaml` 的 `auth` 复制到剪贴板并弹气泡，WebUI 登录不用再翻文件。③ **📷 预览副屏**：截取副屏当前画面在主屏面板显示，随时可看浏览器状态。④ 移到副屏改用 `SetWindowPos` + 二次位置确认，修复 Firefox 恢复窗口位置导致「移了又弹回主屏」的问题。
+
+**移除副屏功能 + 默认 DeepSeek（1.1.46）**：① **移除「鼠标分身 / 副屏预览 / 移到副屏」三个功能**——实测 WS_EX_LAYERED 点击穿透会破坏 Firefox 渲染（窗口缩小成一条像素线），鼠标跨副屏切换也受影响，按用户要求全部移除（恢复普通有头模式，浏览器窗口在主屏、Playwright 合成鼠标正常工作）；「🔑 复制 Token」保留。② **默认模型改为 DeepSeek**——上游默认 worker 适配器是 lmarena（arena.ai 常被 Cloudflare 拦截 HTTP 403），「下载并配置」时自动把 `config.example.yaml` 默认适配器改为 `deepseek_text`；已有部署可在 `data/config.yaml` 把 worker `type` 改为 `deepseek_text` 后重启服务。
+
+**DeepSeek 复用当前对话（1.1.47）**：修复 fox-ai 每次对话都触发 DeepSeek "New chat"导致上下文全断——`deepseek_text` 适配器原本每次都 `goto(主页)` 把当前对话换成新对话。改为：先在当前页面等输入框（5 秒超时），找不到才 goto 主页兜底——首次启动走主页建立对话，之后 DeepSeek URL 固定为 `/a/chat/s/{sid}` 持续在同一对话内继续消息；与狐狸 AI 的多轮工具调用自然衔接，DeepSeek 侧也能看到完整上下文。 **「▶ 启动服务 / ⏹ 停止服务」** 一键管理本地服务（启动时自动检测端口冲突并提示，可勾选「随 VS Code 启动」让服务开机自启；首次使用需在项目目录跑一次 `npm start -- -login` 登录网页账号）；部署后在服务商列表选「WebAI2API（网页版安全接入）」即可。手动部署则 apiKey 填 `config.yaml` 里的 `auth`，baseUrl 默认 `http://localhost:3000/v1`。注意：网页版不支持原生函数调用，工具调用走文本协议（`<fox:tool>` 标签），可靠性略低于 API 版。
+
+   **Node 版本要求（已自动化）**：WebAI2API 依赖 `better-sqlite3` 等原生模块，需 **Node 22 / 20 / 18 LTS**（有官方预编译，无需本地 C++ 编译）。扩展在「下载并配置」与「启动服务」时会**自动选择 / 下载合适的 Node**：① 优先用环境变量 PATH 中的 LTS Node（22/20/18）；② 其次用上次已自动下载并缓存的 Node（位于 `~/.fox-ai/node/`）；③ 若都没有，则**自动从 nodejs.org 下载 Node 22 LTS（约 30MB，仅需一次）并解压到 `~/.fox-ai/node/` 后使用**。整个过程无需你手动安装或切换 Node；仅当自动下载因网络不可达（无法访问 nodejs.org）而失败时，才需你手动安装 [Node 22 LTS](https://nodejs.org) 并加入 PATH 后重试。**代理 / 证书**：若处于会做 TLS 拦截的代理环境（Git 能连但 Node 报 `unable to verify the first certificate`），扩展会在「安装」「初始化」「启动服务」进程自动注入 `NODE_TLS_REJECT_UNAUTHORIZED=0`（仅本进程、不动系统/用户配置）以跳过证书校验、正常下载预编译二进制，从而无需本地 C++ 编译、也无需安装 Python 或 Visual Studio。
+
+**会话同步 + 去掉 ping 噪音（1.1.48）**：① **新建会话同步到 Web 侧**：此前狐狸 AI 点「新建会话」后，WebAI2API 浏览器里的 DeepSeek 仍停留在上一轮对话，上下文错位。1.1.48 起，狐狸 AI 在「新建会话后首条消息」自动携带 `fox_new_session` 信号，经 WebAI2API 的 routes/queue 透传到 `deepseek_text` 适配器，适配器读到后点击 DeepSeek「新对话」按钮，让浏览器侧会话与狐狸 AI 一起归零（按钮找不到则自动跳过、不影响正常对话）。② **去掉 warmup 的 ping 噪音**：此前开启「缓存预热（cacheWarmup）」时，扩展会向模型发一条 `ping` 探测消息把前缀灌进缓存——这对真实 API 无害，但经 WebAI2API 文本协议会被当成真实聊天消息打进 DeepSeek、污染上下文、浪费 token。1.1.48 起对 WebAI2API 文本协议（浏览器自动化）**跳过该 ping 预热**（文本协议本就不走 API 前缀缓存），对话里不再凭空多一条 ping。上述 WebAI2API 侧补丁（deepseek_text 新会话重置 + routes/queue 透传）同样由 fox-ai「下载并配置」**自动幂等注入**，所有用户一致生效。
+
+**新会话同步扩展到全模型（1.1.49）**：1.1.48 的「新建会话同步」只覆盖了 DeepSeek。1.1.49 起，狐狸 AI 的 `fox_new_session` 信号同样透传到 **ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai** 等其余文本适配器——各适配器在输入框就绪后调用共享助手 `startNewSession(page, meta)`，按站点「New chat / 新对话 / 新建对话」按钮或链接点击重置浏览器侧会话，找不到则安全跳过。实现上新增 `backend/utils/page.js` 的 `startNewSession` 通用助手并加入 `utils/index.js` 导出，fox-ai「下载并配置」时**自动幂等注入**到所有上游适配器（以功能是否就位判定，重复执行不会重复注入）；DeepSeek 仍走 1.1.48 的专属内联补丁。这样无论你用哪个模型，狐狸 AI 新建会话后 Web 侧都会一起归零、不再错位；WebAI2API 侧 ping 噪音去除在 1.1.48 已对所有文本协议统一生效。
+<arg_key:6124c78e>replace_all</arg_key:6124c78e>
+<arg_value:6124c78e>false
+
+**WebAI2API 接入：Agent 文件能力完整修复（1.1.14）**：网页接入（WebAI2API，本质是模拟用户点击、在网页上对话）的模型此前无法像原生 API 那样真正调用工具读写文件——它会输出 `read_file("路径")` 这类函数样式、或用「我已使用 write_file 创建了…」这类完成式叙述冒充执行、或只输出方案征求确认，fox-ai 都收不到可解析调用。本版对 text 协议解析链与主循环做了系统修复：① **无文件夹兜底工作区根**——未开 VS Code 文件夹时自动用配置目录作「虚拟工作区根」（`foxAi.workspace.fallbackDir` 显式指定，或复用已注册的 `foxAi.webai2api.projectDir`），文件工具的相对路径也能解析；② **函数调用语法容错**——识别 `read_file("路径")` / `write_file("路径","内容")` 等函数样式并转为真实调用（参数须引号字符串，`write_file` 首参须像路径防顺序写反，`edit_file`/`delete_file` 参数顺序不可靠不自动猜，写/删/执行仍走审批与预览）；③ **「声称已调用」检测**——完成式叙述（「已使用/已调用/我用 + 工具名」）且无任何调用时回灌修正提示；④ **首轮锁死 get_tools**——新增工具 `get_tools` 按需检索（关键词过滤，返回每个工具的必填参数与 `<foxtool>` 调用示例），system 不再全量塞入 86 个工具 schema，模型第一步必须用固定格式调用一次 get_tools 锚定格式、之后按需查工具（开关 `foxAi.agent.toolGuide`：`auto` 仅 WebAI2API 等 textOnly 模型启用 / `on` 全部文本协议强制 / `off` 关闭，普通 text 模型默认保持全量手册以享前缀缓存）；⑤ **「只说不做」拦截**——输出方案/请求确认（「请确认是否执行」「确认后我将写入」）且无调用时回灌「直接执行」；⑥ **多块同名调用全执行**——修复 `parseTextCalls` 按工具名去重导致一轮内多个 `write_file` 只执行第一个的 bug，明确标签来源的同名调用全部执行，模糊来源仍去重防误判。以上检测均限定 text 协议，native（原生 function calling）/chat 模型完全不受影响；对 WebAI2API 内所有模型（DeepSeek / ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai）统一生效，无需按模型分别适配。
 
 本说明书面向最终使用者，说明如何安装、配置并正确使用本扩展的各项功能。有关实现细节与历史变更，请以源代码与发布说明为准。
 
@@ -33,10 +62,10 @@
 
 ## 三、安装与激活
 
-1. 获取扩展包 `fox-ai-1.1.13.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.14.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 在 Visual Studio Code 中打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`）。
 3. 点击扩展视图右上角的 `…`（更多操作），选择 **“从 VSIX 安装”**。
-4. 在文件选择对话框中定位并选中 `fox-ai-1.1.13.vsix`。
+4. 在文件选择对话框中定位并选中 `fox-ai-1.1.14.vsix`。
 5. 安装完成后按提示 **重新加载（Reload）** 窗口以激活扩展。
 
 > 说明：本扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。活动栏使用狐狸图标（`media/fox.svg`），扩展详情页使用新头像图标（`media/fox-icon.png`）。
@@ -130,6 +159,8 @@
 ### 6.5 规划确认模式（Plan-and-Execute）
 
 多步骤任务默认会先列出完整计划并提交计划卡片，您点击 **“确认执行”** 后智能体才正式执行；执行中如需调整计划，必须先说明原因并再次确认。此模式可在设置 `foxAi.planAndExecute.enabled` 中关闭（关闭后退回“边思考边执行”模式）。
+
+任务清单的状态（未开始 / 进行中 / 已完成）由智能体实时维护：它可用 `set_plan_tasks` 一次性给出完整清单做整表替换（无需记住任务 id，避免状态更新丢失、出现“已完成却标成未完成”），也可用 `update_plan_task` 单条微调；任务栏按「进行中 → 未开始 → 已完成」稳定排序，已完成项沉底。
 
 ### 6.6 自动代码审查
 

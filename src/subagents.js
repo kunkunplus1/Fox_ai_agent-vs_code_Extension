@@ -37,13 +37,33 @@ const MAX_MEMBERS = 8;              // 单次编排最多派生几个子代理
 const MAX_SUMMARY = 2400;           // 单个子代理回传主代理的结论上限（字）
 const MAX_TOOL_OUTPUT = 4000;       // 子代理内部单次工具输出上限（字）
 
-/** 永远不允许子代理使用的工具（防递归派生 / 防越权改配置） */
+/**
+ * 永远不允许子代理使用的工具。
+ * 分两类（对照 DSH 的 capability shrinking + approval=never）：
+ * 1) 防递归派生 / 防越权改全局配置
+ * 2) 全局状态写入类：长期记忆、项目任务清单、后台代理派生/操控——
+ *    这些是主代理职责，子代理调它们 = 越权改主代理的全局状态。
+ *    子代理只该交付结论给主代理，由主代理决定是否落进长期记忆/任务清单/后台任务。
+ */
 const GLOBAL_DENY = new Set([
+  // 递归派生 / 全局配置
   'spawn_subagent',
   'create_mcp_server',
   'create_skill',
   'present_plan',
-  'revise_plan'
+  'revise_plan',
+  // 长期记忆（跨会话全局状态）
+  'save_memory',
+  'get_memory',
+  // 项目任务清单（主代理职责的可见 checklist）
+  'create_plan_task',
+  'update_plan_task',
+  'set_plan_tasks',
+  'remove_plan_task',
+  'list_plan_tasks',
+  // 后台代理派生/操控（避免子代理→后台→子代理的间接递归 + 越权取消主代理的后台任务）
+  'run_background_agent',
+  'background_jobs'
 ]);
 
 const COMMON_RULES = `

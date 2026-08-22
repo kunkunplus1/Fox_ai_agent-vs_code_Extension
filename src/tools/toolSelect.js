@@ -28,7 +28,7 @@ const CORE_ALWAYS = new Set([
   // 否则开启 dynamicSubset 后原生 function calling 里这些工具「看不到」也就调不了，
   // 导致能力①规划执行分离、能力⑤分层记忆、用户技能、MCP 静默失效。
   'create_skill', 'use_skill',
-  'create_plan_task', 'update_plan_task', 'list_plan_tasks',
+  'create_plan_task', 'update_plan_task', 'list_plan_tasks', 'set_plan_tasks',
   'save_memory', 'get_memory',
   'write_organize', 'read_organize',
   // 生图通道：generate_image 的工具名与中文 query「画/生成图片」几乎不可能语义命中，

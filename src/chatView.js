@@ -137,7 +137,12 @@ class ChatViewProvider {
     this.planTasks = new PlanTaskStore(context.globalStorageUri.fsPath, {
       context,
       customDir: vscode.workspace.getConfiguration('foxAi').get('planTasks.storagePath', ''),
-      onChange: () => this._pushPlanTasks()
+      onChange: () => {
+        this._pushPlanTasks();
+        // 同步刷新「环境与插件」面板的「任务」标签页——任务管理器现在合并 taskManager + planTasks 两个数据源，
+        // planTasks 变化时（用户/模型新建/标记任务）必须让任务列表实时反映，否则面板卡在「（没有任务）」。
+        try { const { notifyTaskListChanged } = require('./envView'); notifyTaskListChanged(this); } catch (_) {}
+      }
     });
     /** 额外的可移动对话面板（WebviewPanel） */
     this.panels = new Set();
@@ -1556,6 +1561,12 @@ class ChatViewProvider {
     if (prevPlanTaskId) session._planTaskId = prevPlanTaskId;
     if (prevPlanned) session._planned = true;
     if (prevPlanPending) session._planPending = true;
+    // ★ 前缀缓存关键：稳定块 / 易变块缓存跨「继续」/下次提问保持。
+    // AgentSession 每次提问都新建（实例属性会被构造函数重置），但稳定块（技能/结构/规则/人格/记忆）
+    // 与易变块缓存（RAG/主题记忆指纹）必须跨提问冻结，否则 system 前缀每次提问都重算 → 每次提问全 miss。
+    // 复刻 prev 的 _stableBlock 与 _dynCache，保证同一会话内 system 前缀字节稳定、RAG 不重复注入。
+    if (prev && prev._stableBlock !== undefined) session._stableBlock = prev._stableBlock;
+    if (prev && prev._dynCache) session._dynCache = prev._dynCache;
     this.session = session;
     this.pushStatus('running');
     // 自动化桥：把当前会话的后台 agent 入口注册给 extension 的调度/触发回调复用

@@ -27,9 +27,64 @@ const mcpCatalog = require('./mcpCatalog');
 const sandbox = require('./sandbox');
 const DisposableBag = require('./disposableBag');
 const mcpAuthor = require('./tools/mcpAuthor'); // 用户自写 MCP 的磁盘目录清理
+const webai2api = require('./webai2api'); // WebAI2API 下载与配置（网页版免费模型接入）
 
 let _panel = null;
 let _initialTab = 'env';
+let _webai2apiAbort = null; // 正在进行的 WebAI2API 下载配置任务（用于中途停止）
+let _webai2apiServer = null; // 正在运行的 WebAI2API 服务子进程（用于停止）
+let _webai2apiManualStop = false; // 是否「主动停止」触发的退出（避免 stop 与 onExit 重复推送消息）
+
+/** 解析 WebAI2API 项目目录：优先持久化的 projectDir，其次输入框 installDir 拼接，最后返回空 */
+function resolveWebAI2APIProjectDir(inputDir) {
+  const c = vscode.workspace.getConfiguration('foxAi');
+  const persisted = String(c.get('webai2api.projectDir') || '').trim();
+  if (persisted && fs.existsSync(path.join(persisted, 'package.json'))) return persisted;
+  const d = String(inputDir || '').trim();
+  if (d) {
+    const pd = path.join(d, webai2api.REPO_NAME);
+    if (fs.existsSync(path.join(pd, 'package.json'))) return pd;
+  }
+  return persisted || null; // 即便 package.json 缺失也返回，让调用方给明确报错
+}
+
+/**
+ * 启动 WebAI2API 服务（供面板按钮与「随 VS Code 自启」共用）。
+ * 返回是否成功进入运行态。projectDir 不存在/端口被占会返回 false 并给出原因。
+ */
+async function startWebAI2APIService(projectDir, send) {
+  if (!projectDir) { send('webai2apiServerError', { error: '未找到 WebAI2API 目录，请先「下载并配置」。' }); return false; }
+  if (!fs.existsSync(path.join(projectDir, 'package.json'))) { send('webai2apiServerError', { error: 'WebAI2API 源码不完整，请重新「下载并配置」。' }); return false; }
+  if (_webai2apiServer) { send('webai2apiServerError', { error: '服务已在运行中。' }); return false; }
+  if (await webai2api.isPortListening(3000)) {
+    const pid = webai2api.findPidByPort(3000);
+    send('webai2apiServerError', { error: '端口 3000 已被占用（PID ' + (pid || '未知') + '），服务可能已在运行。' });
+    return false;
+  }
+  send('webai2apiLog', { text: '▶ 启动 WebAI2API 服务（npm start）…' });
+  try {
+    _webai2apiManualStop = false;
+    const child = await webai2api.startServer(projectDir, {
+      onLog: (text) => send('webai2apiLog', { text: text.replace(/\s+$/, '') }),
+      onExit: (code, signal, err) => {
+        _webai2apiServer = null;
+        if (_webai2apiManualStop) { _webai2apiManualStop = false; return; } // 主动停止，stop 分支已推送消息
+        if (err) send('webai2apiServerError', { error: '服务启动失败：' + (err.message || err) });
+        else send('webai2apiServerStopped', { code, signal });
+      }
+    });
+    if (child) {
+      _webai2apiServer = child;
+      send('webai2apiServerStarted', { pid: child.pid });
+      return true;
+    }
+    return false;
+  } catch (e) {
+    _webai2apiServer = null;
+    send('webai2apiServerError', { error: String(e.message).split('\n')[0] });
+    return false;
+  }
+}
 
 function nonceStr() {
   let text = '';
@@ -104,6 +159,42 @@ function getHtml(context, webview) {
     </div>
     <p class="hint danger">⚠️ 所有下载仅允许来自内置官方源白名单，安装/改 PATH 前会弹窗确认，全程写入审计日志。</p>
     <div id="rt-list">${rtRows}</div>
+
+    <div class="card" style="margin-top:14px;">
+      <div class="rt-head"><b>🌐 WebAI2API（网页版免费模型接入）</b><span class="ver">安全 · 不易封</span></div>
+      <p class="hint">一键下载并配置 WebAI2API（Camoufox 浏览器自动化模拟真人），可免费使用 <b>DeepSeek / Gemini / ChatGPT / Claude / 豆包 / LMArena</b> 等网页版模型。</p>
+      <div class="row">
+        <label>安装位置</label>
+        <input id="webai2api-dir" style="flex:1;min-width:220px" placeholder="选择下载位置（将在其下创建 WebAI2API 目录）"/>
+        <button id="webai2api-pick-dir" class="pick-btn">选择目录</button>
+      </div>
+      <div class="row">
+        <label>镜像前缀<span class="hint" style="display:block;font-weight:normal">GitHub 不通时填，如 https://ghproxy.com/</span></label>
+        <input id="webai2api-mirror" style="flex:1;min-width:220px" placeholder="留空则用官方 GitHub"/>
+      </div>
+      <div class="row">
+        <label>代理<span class="hint" style="display:block;font-weight:normal">init 下载卡住时填，如 http://127.0.0.1:7890（留空自动探测）</span></label>
+        <input id="webai2api-proxy" style="flex:1;min-width:220px" placeholder="留空则自动探测系统代理/本机端口"/>
+      </div>
+      <div class="row">
+        <button id="webai2api-setup">下载并配置</button>
+        <button id="webai2api-stop" style="display:none">⏹ 停止</button>
+        <button id="webai2api-token" title="复制 WebUI 登录用 API Token（config.yaml 的 auth）到剪贴板">🔑 复制 Token</button>
+        <span class="status" id="webai2api-stage" style="flex:1;min-width:160px"></span>
+      </div>
+      <div id="webai2api-progress" style="display:none;margin:4px 0 10px;">
+        <div class="w2a-bar"><div class="w2a-fill" id="webai2api-fill" style="width:0%"></div></div>
+        <div class="hint" id="webai2api-pct" style="margin-top:4px">0%</div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="webai2api-start-server">▶ 启动服务</button>
+        <button id="webai2api-stop-server" style="display:none">⏹ 停止服务</button>
+        <span class="status" id="webai2api-server-status" style="flex:1;min-width:140px">○ 服务未运行</span>
+        <label style="width:auto"><input type="checkbox" id="webai2api-autostart"/> 随 VS Code 启动</label>
+      </div>
+      <div id="webai2api-log" style="display:none;margin-top:8px;"></div>
+    </div>
+
     <div class="card" style="margin-top:14px;">
       <div class="rt-head"><b>🧰 工具箱</b></div>
       <p class="hint">类似 PCL2 百宝箱：释放内存、清理狐狸 AI 自身产生的缓存与数据。</p>
@@ -547,12 +638,18 @@ function openEnvPanel(context, chatProvider, initialTab) {
 
     try {
       if (msg.type === 'init') {
+        const persistedProject = String(cfg.get('webai2api.projectDir') || '').trim();
         panel.webview.postMessage({
           type: 'init',
           root: cfg.get('runtimes.installRoot', ''),
           mirror: cfg.get('runtimes.mirror', 'auto'),
           elevation: cfg.get('runtimes.elevation', 'always'),
-          silent: cfg.get('bridge.silentAllowed', false)
+          silent: cfg.get('bridge.silentAllowed', false),
+          // 输入框表示「安装位置」（父目录），故回填 projectDir 的上级目录
+          webai2apiDir: persistedProject ? path.dirname(persistedProject) : '',
+          webai2apiMirror: cfg.get('webai2api.mirror', ''),
+          webai2apiProxy: cfg.get('webai2api.proxy', ''),
+          webai2apiAutoStart: cfg.get('webai2api.autoStart', false)
         });
         if (_initialTab && _initialTab !== 'env') {
           panel.webview.postMessage({ type: 'switchTab', tab: _initialTab });
@@ -586,6 +683,102 @@ function openEnvPanel(context, chatProvider, initialTab) {
         } catch (e) {
           panel.webview.postMessage({ type: 'installError', id: msg.id, error: String(e.message).split('\n')[0] });
         }
+      } else if (msg.type === 'pickWebAI2APIDir') {
+        const uris = await vscode.window.showOpenDialog({ canSelectFiles: false, canSelectFolders: true, canSelectMany: false, openLabel: '选择 WebAI2API 安装位置' });
+        if (uris && uris.length) panel.webview.postMessage({ type: 'webai2apiDir', dir: uris[0].fsPath });
+      } else if (msg.type === 'setWebAI2APIProxy') {
+        await cfg.update('webai2api.proxy', String(msg.value || '').trim(), vscode.ConfigurationTarget.Global);
+        panel.webview.postMessage({ type: 'webai2apiProxy', value: String(msg.value || '').trim() });
+      } else if (msg.type === 'setupWebAI2API') {
+        if (_webai2apiAbort) { panel.webview.postMessage({ type: 'webai2apiError', error: '已有下载配置任务进行中，请先停止或等待完成。' }); return; }
+        const dir = String(msg.dir || '').trim();
+        if (!dir) { panel.webview.postMessage({ type: 'webai2apiError', error: '请先选择安装位置。' }); return; }
+        const ctrl = new AbortController();
+        _webai2apiAbort = ctrl;
+        try {
+          const summary = await webai2api.setup({
+            installDir: dir,
+            mirror: String(msg.mirror || cfg.get('webai2api.mirror', '') || '').trim(),
+            proxy: String(msg.proxy || cfg.get('webai2api.proxy', '') || '').trim(),
+            signal: ctrl.signal,
+            onStage: (label) => panel.webview.postMessage({ type: 'webai2apiStage', text: label }),
+            onProgress: (percent, indeterminate) => panel.webview.postMessage({ type: 'webai2apiProgress', percent, indeterminate }),
+            onLog: (text) => panel.webview.postMessage({ type: 'webai2apiLog', text })
+          });
+          // 自动填入 WebAI2API 服务商的鉴权密钥（provider 专属 SecretStorage，不影响其他服务商）
+          await foxConfig.setApiKey(context, 'webai2api', summary.auth);
+          // 持久化项目目录，供「启动服务」按钮后续使用（重载窗口后也能找到）
+          await cfg.update('webai2api.projectDir', summary.projectDir, vscode.ConfigurationTarget.Global);
+          panel.webview.postMessage({ type: 'webai2apiDone', summary });
+        } catch (e) {
+          const em = String(e && e.message || e);
+          if (ctrl.signal.aborted || em === '已取消') {
+            panel.webview.postMessage({ type: 'webai2apiCancelled' });
+          } else {
+            panel.webview.postMessage({ type: 'webai2apiError', error: em.split('\n')[0] });
+          }
+        } finally {
+          _webai2apiAbort = null;
+        }
+      } else if (msg.type === 'stopWebAI2API') {
+        if (_webai2apiAbort) { _webai2apiAbort.abort(); panel.webview.postMessage({ type: 'webai2apiStage', text: '正在停止…' }); }
+      } else if (msg.type === 'webai2apiServerStatus') {
+        const running = _webai2apiServer ? true : await webai2api.isPortListening(3000);
+        panel.webview.postMessage({ type: 'webai2apiServerStatus', running });
+      } else if (msg.type === 'startWebAI2APIServer') {
+        const projectDir = resolveWebAI2APIProjectDir(msg.dir);
+        const send = (type, payload) => panel.webview.postMessage(Object.assign({ type }, payload));
+        // 「启动时自动检测端口冲突」：端口被占时找到占用者 PID，询问是否强杀后重启（仅面板按钮路径弹窗，自启路径静默）
+        if (projectDir && !_webai2apiServer && await webai2api.isPortListening(3000)) {
+          const pid = webai2api.findPidByPort(3000);
+          const choice = await vscode.window.showWarningMessage(
+            '端口 3000 已被占用（PID ' + (pid || '未知') + '），WebAI2API 服务可能已在别处运行。是否强制结束占用进程后重新启动？',
+            { modal: true }, '强制结束并启动', '取消'
+          );
+          if (choice === '强制结束并启动') {
+            webai2api.killPort(3000);
+            await new Promise((r) => setTimeout(r, 500)); // 等端口释放
+          } else {
+            panel.webview.postMessage({ type: 'webai2apiServerError', error: '已取消（端口 3000 仍被占用）。' });
+            return;
+          }
+        }
+        await startWebAI2APIService(projectDir, send);
+      } else if (msg.type === 'stopWebAI2APIServer') {
+        if (_webai2apiServer) {
+          _webai2apiManualStop = true;
+          webai2api.killTree(_webai2apiServer.pid);
+          _webai2apiServer = null;
+          panel.webview.postMessage({ type: 'webai2apiServerStopped', code: null, signal: 'SIGKILL' });
+        } else if (await webai2api.isPortListening(3000)) {
+          webai2api.killPort(3000);
+          panel.webview.postMessage({ type: 'webai2apiServerStopped', code: null, signal: 'SIGKILL' });
+        } else {
+          panel.webview.postMessage({ type: 'webai2apiServerError', error: '服务未在运行。' });
+        }
+      } else if (msg.type === 'requestWebAI2APIToken') {
+        // 从 config.yaml 读鉴权密钥 → 复制到剪贴板 → 气泡提示
+        try {
+          const dir = resolveWebAI2APIProjectDir(msg.dir);
+          if (!dir) { panel.webview.postMessage({ type: 'webai2apiTokenResult', ok: false, text: '未找到 WebAI2API 项目目录，请先「下载并配置」。' }); return; }
+          const cfgPath = path.join(dir, 'data', 'config.yaml');
+          if (!fs.existsSync(cfgPath)) { panel.webview.postMessage({ type: 'webai2apiTokenResult', ok: false, text: '未找到 config.yaml：' + cfgPath }); return; }
+          const yaml = fs.readFileSync(cfgPath, 'utf8');
+          const m = /^\s*auth:\s*(sk-[^\s#]+)/m.exec(yaml);
+          if (!m) { panel.webview.postMessage({ type: 'webai2apiTokenResult', ok: false, text: 'config.yaml 中未找到 auth 字段' }); return; }
+          const auth = m[1].trim();
+          await vscode.env.clipboard.writeText(auth);
+          panel.webview.postMessage({ type: 'webai2apiTokenResult', ok: true, text: 'Token 已复制到剪贴板（' + auth.slice(0, 12) + '…' + auth.slice(-6) + '），可在 WebUI 登录框粘贴。', auth });
+        } catch (e) {
+          panel.webview.postMessage({ type: 'webai2apiTokenResult', ok: false, text: '读取 Token 失败：' + (e.message || e) });
+        }
+      } else if (msg.type === 'setWebAI2APIAutoStart') {
+        await cfg.update('webai2api.autoStart', !!msg.value, vscode.ConfigurationTarget.Global);
+        panel.webview.postMessage({ type: 'webai2apiAutoStart', value: !!msg.value });
+      } else if (msg.type === 'setWebAI2APIMirror') {
+        const mv = String(msg.value || '').trim();
+        await cfg.update('webai2api.mirror', mv, vscode.ConfigurationTarget.Global);
+        panel.webview.postMessage({ type: 'webai2apiMirror', value: mv });
       } else if (msg.type === 'loadAudit') {
         const fs = require('fs');
         const p = require('path');
@@ -777,8 +970,34 @@ function openEnvPanel(context, chatProvider, initialTab) {
           panel.webview.postMessage({ type: 'kbStat', text: '已保存 ' + msg.provider + ' 的 API Key（本地 SecretStorage）' });
         }
       } else if (msg.type === 'loadTasks') {
+        // 两个数据源：① taskManager（Harness 长期记忆，记录每次对话/智能体任务的状态与步骤，存 ~/.fox-ai/tasks/index.json），
+        // ② planTasks（项目任务清单，用户日常看到的 s1-s9 那种，存 plan-tasks.json）—— 二者完全独立。
+        // 但用户实际操作中只看到 planTasks，taskManager 经常为空；现在合并两个数据源并标 source，
+        // 任务管理器面板始终能列出「项目任务」+「对话任务」，不会显示「（没有任务）」。
         const tm = chatProvider && chatProvider.taskManager;
-        if (tm) panel.webview.postMessage({ type: 'taskList', tasks: await tm.listTasks() });
+        const pt = chatProvider && chatProvider.planTasks;
+        const tasks = [];
+        if (tm) {
+          try {
+            for (const t of await tm.listTasks()) tasks.push(Object.assign({ source: 'harness' }, t));
+          } catch (_) {}
+        }
+        if (pt) {
+          try {
+            for (const t of (pt.list ? pt.list() : [])) {
+              tasks.push({
+                source: 'plan',
+                id: t.id, type: 'plan', title: t.subject,
+                state: t.status === 'in_progress' ? 'running' : (t.status === 'completed' ? 'completed' : 'queued'),
+                createdAt: t.createdAt, updatedAt: t.updatedAt, finishedAt: t.completedAt || null,
+                stepsCount: 0,
+                description: t.description || ''
+              });
+            }
+          } catch (_) {}
+        }
+        tasks.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+        panel.webview.postMessage({ type: 'taskList', tasks });
       } else if (msg.type === 'getTask') {
         const tm = chatProvider && chatProvider.taskManager;
         if (tm) {
@@ -1072,4 +1291,52 @@ function openEnvPanel(context, chatProvider, initialTab) {
   });
 }
 
-module.exports = { openEnvPanel, scanProject };
+module.exports = { openEnvPanel, scanProject, notifyTaskListChanged, startWebAI2APIService, isWebAI2APIServerRunning, stopWebAI2APIService };
+
+/** 判断 WebAI2API 服务是否在运行（供「随 VS Code 自启」前探测，避免重复启动） */
+async function isWebAI2APIServerRunning() {
+  if (_webai2apiServer) return true;
+  return webai2api.isPortListening(3000);
+}
+
+/** 停止 WebAI2API 服务（仅当扩展自己 spawn 过、持有引用时；供 deactivate 清理） */
+function stopWebAI2APIService() {
+  if (_webai2apiServer) {
+    _webai2apiManualStop = true;
+    webai2api.killTree(_webai2apiServer.pid);
+    _webai2apiServer = null;
+  }
+}
+
+/**
+ * 任务数据源（taskManager / planTasks）变化时调用 → 自动推一次 taskList 到环境面板
+ * （前提是环境面板已打开）。
+ * 调用方：chatView 的 planTasks onChange、taskManager 状态变更等。
+ */
+async function notifyTaskListChanged(chatProvider) {
+  if (!_panel || !chatProvider) return;
+  try {
+    const tm = chatProvider.taskManager;
+    const pt = chatProvider.planTasks;
+    const tasks = [];
+    if (tm && typeof tm.listTasks === 'function') {
+      try { for (const t of await tm.listTasks()) tasks.push(Object.assign({ source: 'harness' }, t)); } catch (_) {}
+    }
+    if (pt && typeof pt.list === 'function') {
+      try { for (const t of pt.list()) tasks.push(toPlanTask(t)); } catch (_) {}
+    }
+    tasks.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    _panel.webview.postMessage({ type: 'taskList', tasks });
+  } catch (_) {}
+}
+
+function toPlanTask(t) {
+  return {
+    source: 'plan',
+    id: t.id, type: 'plan', title: t.subject,
+    state: t.status === 'in_progress' ? 'running' : (t.status === 'completed' ? 'completed' : 'queued'),
+    createdAt: t.createdAt, updatedAt: t.updatedAt, finishedAt: t.completedAt || null,
+    stepsCount: 0,
+    description: t.description || ''
+  };
+}

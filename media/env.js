@@ -10,6 +10,8 @@
       post({ type: 'init' });
       bindTabs();
       bindForms();
+      // 查询 WebAI2API 服务运行状态（用于重载窗口后恢复显示）
+      post({ type: 'webai2apiServerStatus' });
     }
 
     function switchTab(tabName, notify) {
@@ -132,6 +134,82 @@
     else console.warn('[fox-ai env] missing element #' + id + ' for onchange');
   }
 
+  /* ---- WebAI2API 下载配置 UI ---- */
+  function w2aEl(id) { return document.getElementById(id); }
+  function w2aStage(text) { const el = w2aEl('webai2api-stage'); if (el) el.textContent = text; }
+  function w2aLog(text, cls) {
+    const el = w2aEl('webai2api-log');
+    if (!el) return;
+    if (el.style.display === 'none') el.style.display = '';
+    const line = document.createElement('div');
+    line.textContent = text;
+    if (cls === 'danger') line.style.color = 'var(--vscode-errorForeground,#f85149)';
+    else if (cls === 'ok') line.style.color = 'var(--vscode-charts-green,#3fb950)';
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+    while (el.children.length > 300) el.removeChild(el.firstChild);
+  }
+  function w2aToast(text) {
+    // 1.1.45：短暂气泡提示（如 Token 已复制）
+    try {
+      let el = document.getElementById('webai2api-toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'webai2api-toast';
+        el.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--vscode-editorWidget-background,#252526);color:var(--vscode-editorWidget-foreground,#ccc);border:1px solid var(--vscode-widget-border,#454545);padding:8px 16px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.4);z-index:9999;max-width:80%;font-size:13px;transition:opacity .3s';
+        document.body.appendChild(el);
+      }
+      el.textContent = text;
+      el.style.opacity = '1';
+      clearTimeout(el._t);
+      el._t = setTimeout(() => { el.style.opacity = '0'; }, 3500);
+    } catch (_) { /* 忽略 */ }
+  }
+  function w2aProgress(percent, indeterminate) {
+    const wrap = w2aEl('webai2api-progress');
+    const fill = w2aEl('webai2api-fill');
+    const pct = w2aEl('webai2api-pct');
+    if (wrap) wrap.style.display = '';
+    if (fill) {
+      if (indeterminate) {
+        fill.classList.add('indeterminate');
+        fill.style.width = '100%';
+      } else {
+        fill.classList.remove('indeterminate');
+        fill.style.width = Math.max(0, Math.min(100, percent || 0)) + '%';
+      }
+    }
+    if (pct) pct.textContent = indeterminate ? '进行中…' : ((percent || 0) + '%');
+  }
+  function w2aReset(running) {
+    const setup = w2aEl('webai2api-setup');
+    const stop = w2aEl('webai2api-stop');
+    const fill = w2aEl('webai2api-fill');
+    if (setup) setup.disabled = !!running;
+    if (stop) stop.style.display = running ? '' : 'none';
+    if (running) w2aProgress(0, false);
+    else if (fill) { fill.classList.remove('indeterminate'); fill.style.width = '0%'; }
+  }
+  function w2aShowLog() {
+    const el = w2aEl('webai2api-log');
+    if (el) { el.style.display = ''; el.textContent = ''; }
+  }
+  function w2aServerStatus(running) {
+    const status = w2aEl('webai2api-server-status');
+    const start = w2aEl('webai2api-start-server');
+    const stop = w2aEl('webai2api-stop-server');
+    if (running === null || running === undefined) {
+      if (status) { status.textContent = '启动中…'; status.style.color = ''; }
+      if (start) start.disabled = true;
+      if (stop) stop.style.display = 'none';
+      return;
+    }
+    if (status) status.textContent = running ? '● 服务运行中 (localhost:3000)' : '○ 服务未运行';
+    if (status) status.style.color = running ? 'var(--vscode-charts-green,#3fb950)' : '';
+    if (start) start.disabled = !!running;
+    if (stop) stop.style.display = running ? '' : 'none';
+  }
+
   function bindTabs() {
     const tabs = document.getElementById('tabs');
     if (!tabs) { console.warn('[fox-ai env] tabs element missing'); return; }
@@ -206,6 +284,38 @@
     onClick('pick-root', () => post({ type: 'pickRoot' }));
     onClick('optimize-memory', () => post({ type: 'optimizeMemory' }));
     onClick('cleanup-foxai', () => post({ type: 'cleanupFoxAi' }));
+
+    /* ---- WebAI2API 下载与配置 ---- */
+    onClick('webai2api-pick-dir', () => post({ type: 'pickWebAI2APIDir' }));
+    onClick('webai2api-setup', () => {
+      const dir = (document.getElementById('webai2api-dir').value || '').trim();
+      if (!dir) { w2aLog('⚠️ 请先选择安装位置', 'danger'); return; }
+      const mirrorVal = (document.getElementById('webai2api-mirror').value || '').trim();
+      const proxyVal = (document.getElementById('webai2api-proxy').value || '').trim();
+      w2aReset(true);
+      w2aStage('准备中…');
+      w2aShowLog();
+      post({ type: 'setupWebAI2API', dir, mirror: mirrorVal, proxy: proxyVal });
+    });
+    onClick('webai2api-stop', () => post({ type: 'stopWebAI2API' }));
+    onClick('webai2api-token', () => {
+      const dir = (document.getElementById('webai2api-dir').value || '').trim();
+      post({ type: 'requestWebAI2APIToken', dir });
+    });
+    onClick('webai2api-start-server', () => {
+      const dir = (document.getElementById('webai2api-dir').value || '').trim();
+      w2aServerStatus(null);
+      w2aShowLog();
+      w2aLog('正在启动服务…');
+      post({ type: 'startWebAI2APIServer', dir });
+    });
+    onClick('webai2api-stop-server', () => {
+      w2aLog('正在停止服务…');
+      post({ type: 'stopWebAI2APIServer' });
+    });
+    onChange('webai2api-autostart', (e) => post({ type: 'setWebAI2APIAutoStart', value: e.target.checked }));
+    onChange('webai2api-mirror', (e) => post({ type: 'setWebAI2APIMirror', value: e.target.value }));
+    onChange('webai2api-proxy', (e) => post({ type: 'setWebAI2APIProxy', value: e.target.value }));
     onChange('root', (e) => post({ type: 'setRoot', value: e.target.value }));
     onChange('mirror', (e) => post({ type: 'setMirror', value: e.target.value }));
     onChange('elevation', (e) => post({ type: 'setElevation', value: e.target.value }));
@@ -801,6 +911,10 @@
       if (m.mirror) document.getElementById('mirror').value = m.mirror;
       if (m.elevation) document.getElementById('elevation').value = m.elevation;
       if (m.silent !== undefined) document.getElementById('silent').checked = m.silent;
+      if (m.webai2apiDir) setVal('webai2api-dir', 'value', m.webai2apiDir);
+      if (m.webai2apiMirror) setVal('webai2api-mirror', 'value', m.webai2apiMirror);
+      if (m.webai2apiProxy) setVal('webai2api-proxy', 'value', m.webai2apiProxy);
+      if (m.webai2apiAutoStart !== undefined) setVal('webai2api-autostart', 'checked', !!m.webai2apiAutoStart);
     } else if (m.type === 'installed') {
       const card = document.querySelector('.card[data-rt="'+m.id+'"]');
       if (card) { card.querySelector('.status').textContent = '✓ ' + (m.version||''); card.querySelector('.install-btn').disabled = false; }
@@ -903,6 +1017,45 @@
           box.parentNode.insertBefore(note, box);
           setTimeout(() => { if (note.parentNode) note.parentNode.removeChild(note); }, 8000);
         }
+      } else if (m.type === 'webai2apiDir') {
+        setVal('webai2api-dir', 'value', m.dir || '');
+      } else if (m.type === 'webai2apiStage') {
+        w2aStage(m.text || '');
+      } else if (m.type === 'webai2apiProgress') {
+        w2aProgress(m.percent, !!m.indeterminate);
+      } else if (m.type === 'webai2apiLog') {
+        w2aLog(m.text || '');
+      } else if (m.type === 'webai2apiDone') {
+        w2aReset(false);
+        w2aStage('✅ 配置完成');
+        w2aProgress(100, false);
+        const d = m.summary || {};
+        w2aLog('WebAI2API 已配置在：' + (d.projectDir || ''), 'ok');
+        w2aLog('鉴权密钥已自动填入狐狸 AI 的「WebAI2API」服务商（SecretStorage）。', 'ok');
+        w2aLog('下一步：点下方「▶ 启动服务」，首次使用前先点一次「启动服务」后按提示运行 npm start -- -login 登录网页账号。');
+      } else if (m.type === 'webai2apiCancelled') {
+        w2aReset(false);
+        w2aStage('⏹ 已停止');
+        w2aLog('已中途停止（已下载内容保留，可再次点击「下载并配置」继续）。', 'danger');
+      } else if (m.type === 'webai2apiError') {
+        w2aReset(false);
+        w2aStage('❌ 失败');
+        w2aLog(m.error || '未知错误', 'danger');
+      } else if (m.type === 'webai2apiServerStatus') {
+        w2aServerStatus(!!m.running);
+      } else if (m.type === 'webai2apiServerStarted') {
+        w2aServerStatus(true);
+        w2aLog('✅ 服务已启动 (pid ' + m.pid + ')，监听 http://localhost:3000', 'ok');
+        w2aLog('首次使用需登录网页账号：点「停止服务」→ 在项目目录终端运行 npm start -- -login，登录后重新「启动服务」。');
+      } else if (m.type === 'webai2apiServerStopped') {
+        w2aServerStatus(false);
+        w2aLog('服务已停止。');
+      } else if (m.type === 'webai2apiTokenResult') {
+        w2aLog(m.text || '', m.ok ? 'ok' : 'danger');
+        if (m.ok) w2aToast(m.text || 'Token 已复制');
+      } else if (m.type === 'webai2apiServerError') {
+        w2aServerStatus(false);
+        w2aLog(m.error || '未知错误', 'danger');
       }
     } catch (err) {
       console.error('[fox-ai env] message handler error', err);

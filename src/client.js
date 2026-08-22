@@ -74,6 +74,21 @@ function shouldRedirect(status) {
 }
 
 /**
+ * stopMarker（如 </fox:tool>）是否以「独立成段」方式出现：
+ * 闭合标签之后必须是空白或文本结尾才算数，避免模型在正文里讲解工具格式时
+ * 把 </fox:tool> 当字面量写出来就误判为工具调用结束而截断整段输出（1.1.39）。
+ */
+function markerAppearsAsSegment(content, marker) {
+  let idx = 0;
+  while ((idx = content.indexOf(marker, idx)) !== -1) {
+    const afterIdx = idx + marker.length;
+    if (afterIdx >= content.length || /\s/.test(content[afterIdx])) return true;
+    idx = afterIdx;
+  }
+  return false;
+}
+
+/**
  * 把回调包一层：任何异常都不允许冒泡回 Node 的 HTTP 解析器。
  * 否则 llhttp 会把它报成 `Parse Error: JS Exception`，
  * 同时 VS Code 会弹「出现未知错误」，真正的错误反而被埋掉。
@@ -783,7 +798,7 @@ function streamChat(options) {
         if (deltaText) {
           content += deltaText;
           gatedOnDelta && gatedOnDelta(deltaText);
-          if (stopMarker && content.includes(stopMarker)) {
+          if (stopMarker && markerAppearsAsSegment(content, stopMarker)) {
             finishReason = 'tool_marker';
             try { bodyStream.destroy(); } catch (_) {}
             try { req.destroy(); } catch (_) {}

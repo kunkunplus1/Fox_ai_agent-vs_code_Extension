@@ -1379,10 +1379,17 @@
     const plan = msg.plan || [];
     const itemsHtml = plan.length
       ? plan.map((it) => {
-          const icon = it.status === 'completed' ? '✓' : it.status === 'in_progress' ? '🔄' : '○';
-          return '<li><span class="plan-icon">' + icon + '</span> ' +
+          const isDone = it.status === 'completed';
+          const icon = isDone ? '✓' : it.status === 'in_progress' ? '🔄' : '○';
+          // 每项加「✓ 标记完成」按钮：依赖模型记 id 不可靠时，用户能直接点确认，不卡死在「完成了却显示未完成」
+          const btn = isDone
+            ? '<span class="plan-done-mark">已 ✓</span>'
+            : '<button class="mini plan-mark-btn" data-act="toggle" data-id="' + escapeHtml(it.id) + '" title="' + t('标记此项为已完成') + '">✓ 标记完成</button>';
+          return '<li data-id="' + escapeHtml(it.id) + '" class="plan-item-li' + (isDone ? ' plan-item-done' : '') + '">' +
+            '<span class="plan-icon">' + icon + '</span> ' +
             '<b>' + escapeHtml(it.subject) + '</b>' +
-            (it.description ? ' — ' + escapeHtml(it.description) : '') + '</li>';
+            (it.description ? ' — ' + escapeHtml(it.description) : '') + ' ' +
+            btn + '</li>';
         }).join('')
       : '<li class="plan-empty">（计划为空，模型尚未用 create_plan_task 列出步骤）</li>';
     const box = document.createElement('div');
@@ -1401,13 +1408,51 @@
       '</div>';
     messagesEl.appendChild(box);
     scrollDown(true);
-    box.querySelector('#planConfirmBtn').addEventListener('click', () => {
+    // 1) 「确认执行」点击后立即给视觉反馈：换文字 + 禁用 + 锁定。任务实际已经在跑
+    //    （后端会推 state='running' / 'thinking'），但前端按钮自己不变态会让人觉得「没反应」。
+    // 2) 「提交修改」点击后也立刻 disable 按钮、清空输入框，避免重复提交；
+    //    等后端推进后，整个 plan-pending 容器会被新计划替换，无须再解锁。
+    const confirmBtn = box.querySelector('#planConfirmBtn');
+    confirmBtn.addEventListener('click', () => {
+      if (confirmBtn.dataset.locked === '1') return;
+      confirmBtn.dataset.locked = '1';
+      confirmBtn.disabled = true;
+      confirmBtn.classList.remove('primary');
+      confirmBtn.classList.add('locked');
+      confirmBtn.textContent = t('✅ 已确认，执行中…');
       vscode.postMessage({ type: 'planApprove' });
     });
-    box.querySelector('#planModifyBtn').addEventListener('click', () => {
-      const text = (box.querySelector('#planModifyInput').value || '').trim();
-      const full = text ? '【修改计划】' + text : '请重新规划并再次提交计划以待确认。';
+    const modifyBtn = box.querySelector('#planModifyBtn');
+    const modifyInput = box.querySelector('#planModifyInput');
+    modifyBtn.addEventListener('click', () => {
+      if (modifyBtn.dataset.locked === '1') return;
+      const text = (modifyInput.value || '').trim();
+      if (!text) {
+        modifyInput.focus();
+        return;
+      }
+      modifyBtn.dataset.locked = '1';
+      modifyBtn.disabled = true;
+      modifyBtn.textContent = t('⏳ 已提交');
+      modifyInput.disabled = true;
+      const full = '【修改计划】' + text;
       vscode.postMessage({ type: 'send', text: full });
+    });
+    // 3) 「✓ 标记完成」按钮（计划项右侧）：模型记不住任务 id 时，用户能直接点确认
+    //    不卡死在「实际完成了却显示未完成」。点击立即给本地视觉反馈 + 循环 toggle
+    //    状态（pending→in_progress→completed），后端 planTasks 面板会随之刷新。
+    box.querySelectorAll('.plan-mark-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.locked === '1') return;
+        const id = btn.dataset.id;
+        if (!id) return;
+        btn.dataset.locked = '1';
+        btn.disabled = true;
+        btn.textContent = t('已 ✓');
+        const li = btn.closest('.plan-item-li');
+        if (li) li.classList.add('plan-item-done');
+        vscode.postMessage({ type: 'planTaskToggle', id });
+      });
     });
   }
 

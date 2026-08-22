@@ -35,6 +35,14 @@ const PROVIDERS = {
     model: 'deepseek-chat',
     keyUrl: 'https://platform.deepseek.com/api_keys'
   },
+  webai2api: {
+    label: 'WebAI2API（网页版安全接入）',
+    detail: '本地 WebAI2API 服务（浏览器自动化模拟真人，最安全），默认 http://localhost:3000',
+    baseUrl: 'http://localhost:3000/v1',
+    model: 'deepseek',
+    textOnly: true,
+    docs: '部署 WebAI2API（Camoufox 浏览器自动化 + 拟人化交互，最不易被封），狐狸 AI 走 OpenAI 兼容端点接入：服务跑起来后，apiKey 填 config.yaml 里的 auth，baseUrl 默认 http://localhost:3000/v1。详见 README。'
+  },
   zhipu: {
     label: '智谱 GLM',
     detail: 'open.bigmodel.cn',

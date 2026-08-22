@@ -253,6 +253,9 @@ async function resolve(context) {
     maxSteps: c.get('agent.maxSteps', meta.local ? 8 : 12),
     maxContinues: c.get('agent.maxContinues', 3),
     toolProtocol: c.get('agent.toolProtocol', 'auto'),
+    // 1.1.14：工具手册「按需检索」模式。auto=仅 textOnly（WebAI2API 网页接入）启用；
+    // on=所有 text 协议强制启用；off=关闭（保留旧行为：完整工具手册写进 system）。
+    toolGuideMode: c.get('agent.toolGuide', 'auto'),
     // 厂商专属适配：auto（按 provider 自动选）/ deepseek / openai / claude / none / 自定义文本
     providerProfile: c.get('agent.providerProfile', 'auto'),
     // —— 本地弱模型辅助模式设置（1.1.17 / 1.1.19）——

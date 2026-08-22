@@ -31,6 +31,7 @@ const TOOLS = [
   { name: 'use_skill', description: '激活用户技能', parameters: {} },
   { name: 'update_plan_task', description: '更新计划任务状态', parameters: {} },
   { name: 'list_plan_tasks', description: '列出计划任务', parameters: {} },
+  { name: 'set_plan_tasks', description: '整表替换任务清单', parameters: {} },
   { name: 'get_memory', description: '获取长期记忆', parameters: {} },
   { name: 'write_organize', description: '写入知识库', parameters: {} },
   { name: 'read_organize', description: '读取知识库', parameters: {} },
