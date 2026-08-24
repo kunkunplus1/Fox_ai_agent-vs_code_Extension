@@ -546,7 +546,7 @@ function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
 ${structured}${nativeSearchHint}${citationGuard}
 
 【工作准则】
-1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。
+1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。**注意：系统已启用「未读禁止写」硬门控——本会话未 read_file 过的已存在文件，edit_file/write_file 会被直接拦截并回灌「请先读取」；所以对要改的文件务必先读，不要试图跳过。**
 2. 改动用 edit_file 做最小必要修改；只有新建文件或整体重写时才用 write_file。edit_file 支持 start_line/end_line 限定范围，以及 start_char/end_char 做字符级替换，优先用这些方式而不是重写整文件。
 3. old_text 必须与原文逐字符一致（含缩进与空行），并且在文件里唯一；可先用 read_file 读一段，再在该范围内替换。
 4. 执行命令必须是非交互式的（带上 -y、--yes 等），不要启动会一直挂着的进程（如开发服务器）。
@@ -4076,6 +4076,36 @@ class AgentSession {
             }
           }
         } catch (_) { /* 冲突感知异常不阻断正常写入 */ }
+      }
+
+      // ---- 未读禁止写（硬门控）：写已存在文件前必须已读过真实内容 ----
+      // 冲突感知只处理「读过之后文件变了」；本门控处理「压根没读过」——模型凭空臆测直接
+      // edit_file/write_file 覆盖，正是「堆屎山（代码层/结构层）」的头号来源。
+      // 规则：edit_file 必须已读；write_file 对已存在文件必须已读（新建文件无需读）。
+      // 配置 foxAi.conflictWatch.requireRead 默认 true；关掉即回到纯提示词软引导。
+      if (
+        config.conf().get('conflictWatch.requireRead', true) &&
+        (name === 'edit_file' || name === 'write_file')
+      ) {
+        try {
+          const cw = require('./conflictWatch');
+          const reqUri = ws.resolveUri(args.path, { allowOutside: true });
+          let reqStat = null;
+          try { reqStat = await vscode.workspace.fs.stat(reqUri); } catch (_) { reqStat = null; }
+          const needRead = name === 'edit_file' || (reqStat !== null);
+          if (needRead && !cw.hasRead(args.path)) {
+            const msg = '⚠️ 未读禁止写：你要修改的文件「' + args.path + '」在本会话中尚未被 read_file 读取过。'
+              + '为防凭空臆测覆盖、造成代码/结构越改越乱，本次 ' + name + ' 已拦截。'
+              + '请先用 read_file 读取该文件真实内容（如文件较大可带 start_line/end_line 分段读，或先 search_text 定位目标），确认现状后再修改。';
+            this.emit('toolEnd', { id: uiId, ok: false, output: msg, rejected: true });
+            this.pushToolResult(callId, name, msg, true, {
+              reason: '未读禁止写：该文件本会话尚未读过，先 read_file 再看手修改',
+              suggest: '先 read_file 读取真实内容，再决定改哪里；不要凭记忆或猜测直接覆盖。'
+            });
+            if (this.task) { try { await this.taskManager.appendStep(this.task.id, { kind: 'tool', name, decision: 'require-read', reason: msg }); } catch (_) {} }
+            return;
+          }
+        } catch (_) { /* 门控异常不阻断正常写入（与冲突感知一致） */ }
       }
 
       const output = await tools.execute(name, args, execCtx);

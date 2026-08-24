@@ -237,7 +237,9 @@ async function resolve(context) {
       forceCitation: c.get('guardrails.forceCitation', false)
     },
     planner: {
-      enabled: c.get('planner.enabled', false),
+      // 默认开启（auto 模式已按「是否多步骤任务」跳过单步，不浪费调用）：
+      // 从结构层强制「先规划后动手」，避免长链路边想边错、越改越乱堆屎山。
+      enabled: c.get('planner.enabled', true),
       mode: c.get('planner.mode', 'auto'),
       provider: c.get('planner.provider', ''),
       baseUrl: c.get('planner.baseUrl', ''),

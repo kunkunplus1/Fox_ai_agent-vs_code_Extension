@@ -157,7 +157,6 @@ body {
   min-height: 0;
   overflow: hidden;
 }
-}
 
 .spacer { flex: 1; }
 .hidden { display: none !important; }

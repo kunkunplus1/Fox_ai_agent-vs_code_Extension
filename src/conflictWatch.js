@@ -57,7 +57,17 @@ function check(path, mtime, size) {
   return { conflict: false };
 }
 
+/**
+ * 是否“读过/写过”该文件（存在快照即视为 agent 看过最新状态）。
+ * 用于「未读禁止写」硬门控：写已存在文件前，若从未读过则要求先 read_file，
+ * 从代码层强制「先了解再动手」，避免模型凭空臆测直接覆盖造成屎山。
+ * @param {string} path
+ */
+function hasRead(path) {
+  return !!path && _snap.has(path);
+}
+
 function invalidate() { _snap.clear(); }
 function cacheSize() { return _snap.size; }
 
-module.exports = { recordRead, noteWrite, check, invalidate, cacheSize, MAX_CACHE };
+module.exports = { recordRead, noteWrite, check, hasRead, invalidate, cacheSize, MAX_CACHE };
