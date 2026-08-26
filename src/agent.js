@@ -4753,9 +4753,62 @@ class AgentSession {
     const { appendLog } = require('./log');
     if (!as.enabled) return;
     const cw = this.cfg.contextWindow || 0;
-    const keep = Math.max(2, as.keepRecent || 6);
     const msgs = this.messages || [];
-    const compressible = msgs.length - keep;
+
+    // —— 1.1.18e：保留侧从「最近 N 条」升级为「token 预算」（对齐 DSH retainTokens）——
+    // DSH（deepseek-harness）compaction 默认 retainRatio=0.16：压缩时从尾部倒数累加 token，
+    // 够保留预算就停（并向前回退到不切断工具对边界），而不是固定保留最近 N 条消息。
+    // fox-ai 之前的 keepRecent 只按条数保留：工具输出可能一条就几 K token，条数够了但 token
+    // 可能还是巨多 → 低命中厂商（中转 cached≈0）每轮仍发大量历史、纯 miss 计费。
+    // 这里改为「token 预算保留」：默认保留最近 16%（retainTokens 未配置时按上下文窗口估算），
+    // 并让低命中厂商（连续低命中缓存）自动把保留预算收窄 60%~90%，每轮少发历史、少 miss。
+    const { estimateMessages } = contextUsage;
+    const keep = Math.max(2, as.keepRecent || 6);
+    // token 预算：显式 retainTokens 优先，否则取 keepRecent 条消息的 token 量（向后兼容），
+    // 否则按上下文窗口 16%（DSH retainRatio）估算，兜底 6k。
+    let retainTokens = 0;
+    if (as.retainTokens > 0) {
+      retainTokens = as.retainTokens;
+    } else if (as.keepRecent && as.keepRecent > 0) {
+      const tail = msgs.slice(Math.max(0, msgs.length - keep));
+      retainTokens = estimateMessages(tail);
+    } else if (cw > 0) {
+      retainTokens = Math.max(2000, Math.round(cw * 0.16));
+    } else {
+      retainTokens = 6000;
+    }
+    // 低命中厂商自动收窄（衔接 _onCacheUsage 的自适应预算逻辑）：
+    // 连续低命中轮次（缓存命中<5% 且 cached<100）时按阶梯把保留 token 预算收窄，
+    // 让中转厂商每轮少发历史；命中恢复后回弹到基础值。
+    const lowStreak = this._cacheLowHitStreak || 0;
+    if (lowStreak >= 2) {
+      const shrinkSteps = [0.6, 0.75, 0.9];
+      const shrink = shrinkSteps[Math.min(lowStreak - 2, shrinkSteps.length - 1)];
+      retainTokens = Math.max(1200, Math.round(retainTokens * (1 - shrink)));
+    }
+    // 保留预算至少留最近 2 条（防压缩时把刚发的话也裁掉）
+    const tailMin = estimateMessages(msgs.slice(Math.max(0, msgs.length - 2)));
+    retainTokens = Math.max(retainTokens, tailMin);
+    // 从尾部倒数累加 token 找「保留起点」（对齐 DSH selectCompactableRange：累计到 retainTokens）
+    let keepFrom = msgs.length;
+    let accTok = 0;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const t = estimateMessages([msgs[i]]);
+      if (accTok + t > retainTokens) break;
+      accTok += t;
+      keepFrom = i;
+    }
+    // 向前回退避免切断 tool 对（assistant(tool_calls)+tool 结果必须一起保留）
+    while (keepFrom > 0 && msgs[keepFrom - 1] && msgs[keepFrom - 1].role === 'tool') keepFrom--;
+    if (keepFrom > 0 && msgs[keepFrom - 1] && msgs[keepFrom - 1].role === 'assistant' && msgs[keepFrom - 1].tool_calls) {
+      const ids = new Set(msgs[keepFrom - 1].tool_calls.map((t) => t.id));
+      let i = keepFrom;
+      while (i < msgs.length && msgs[i] && msgs[i].role === 'tool' && ids.has(msgs[i].tool_call_id)) i++;
+      if (i > keepFrom) keepFrom = i; // 该 assistant 的 tool 结果都在保留区，整对保留
+    }
+    const compressible = keepFrom;
+    this._lastRetainTokens = retainTokens;
+    this._lastKeepFrom = keepFrom;
 
     // 触发条件（满足其一即可）：
     //  A. 配置了上下文窗口且占用超阈值（防超窗口）——默认阈值 0.75。
@@ -4787,6 +4840,10 @@ class AgentSession {
     }
     const usedPct = dataBefore ? Math.round(dataBefore.percentage) : 0;
     this._ctxStepSeq = (this._ctxStepSeq || 0) + 1;
+    // 1.1.18e：记录保留预算供日志/面板展示（对齐 DSH retainTokens 语义）
+    const retainInfo = as && (as.retainTokens || this._lastRetainTokens)
+      ? ` retain=${this._lastRetainTokens || as.retainTokens}`
+      : '';
     const statusStep = (title, detail) => this.emit('step', {
       id: 'ctx-' + Date.now() + '-' + this._ctxStepSeq,
       kind: 'system_status',

@@ -181,6 +181,7 @@
   "foxai.n182": "Enable \"context-overflow auto-compression\": when context usage exceeds a threshold, automatically compress earlier conversations into summaries with the organizing AI and write them to \"Knowledge Base-2\"; the agent then continues via local knowledge-base retrieval while immediately shrinking context.",
   "foxai.n183": "Compression trigger threshold (fraction of the context window). E.g. 0.9 means compress only when usage exceeds 90%. Depends on foxAi.contextWindow being set correctly (otherwise the percentage cannot be determined).",
   "foxai.n184": "How many recent conversation messages to keep after compression (the rest are compressed into Knowledge Base-2).",
+  "foxai.n184r": "How many recent conversation tokens to retain after compression (DSH retainTokens semantics; 0 = unset, falling back to 16% of context window or the keepRecent estimate; the budget auto-shrinks for low cache-hit providers).",
   "foxai.n185": "Knowledge Base-2 directory (where compression summaries are stored). Leave empty to default to C:\\\\Users\\\\asis\\\\.fox-ai\\\\knowledge-2\\\\, which the agent's knowledge-base retrieval reads; customizable but must be readable by the agent.",
   "foxai.n186": "Use BM25 scoring for knowledge-base retrieval (instead of pure keyword match) to improve relevance",
   "foxai.n187": "Number of most relevant chunks returned by RAG retrieval",
