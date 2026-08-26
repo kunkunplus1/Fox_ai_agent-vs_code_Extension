@@ -3098,6 +3098,32 @@ class AgentSession {
     // 否则 Anthropic 系 promptTokens 只含 miss，分子 cached 会顶出 >100% 的虚假累计命中率。
     acc.total += (typeof stats.totalTokens === 'number' && stats.totalTokens > 0) ? stats.totalTokens : (stats.cachedTokens + stats.promptTokens);
     const sessionHitRate = acc.total > 0 ? acc.cached / acc.total : 0;
+    // —— 1.1.18：自适应历史预算（对齐 DSH token-budget retention）——
+    // 硅基流动等中转厂商实测「前缀缓存命中率极低（cached≈0）」时，若仍按 DeepSeek 同款
+    // maxHistoryTokens 预算全量发历史，每轮都全量计费 → 消耗显著高于有缓存红利的厂商。
+    // 这里按「连续低命中轮次」动态收窄历史预算（默认上限 60k → 低命中第 1 轮 24k、第 2 轮 12k、
+    // 第 3 轮 6k，每轮少发历史少计费）；命中率回到 >40% 则立即回弹（对齐 DSH「预算保留随实际压力」）。
+    if (this._cacheAdaptiveInitial == null) {
+      this._cacheAdaptiveInitial = (this.cfg && this.cfg.maxHistoryTokens) || 60000;
+      this._cacheLowHitStreak = 0;
+    }
+    const lowHit = stats.hitRate < 0.05 && stats.cachedTokens < 100;
+    if (lowHit) {
+      this._cacheLowHitStreak = (this._cacheLowHitStreak || 0) + 1;
+      if (this._cacheLowHitStreak >= 2 && this.cfg) {
+        const steps = [24000, 12000, 6000];
+        const budget = steps[Math.min(this._cacheLowHitStreak - 2, steps.length - 1)];
+        if ((this.cfg.maxHistoryTokens || 60000) !== budget) {
+          this.cfg.maxHistoryTokens = budget;
+          this.emit('notice', { text: `⚠️ ${this._cacheCapability ? this._cacheCapability.provider : ''} 前缀缓存连续 ${this._cacheLowHitStreak} 轮低命中（<5%），已自动收窄历史预算至 ${budget} 以控制消耗；命中恢复后自动回弹。` });
+        }
+      }
+    } else {
+      this._cacheLowHitStreak = 0;
+      if (this.cfg && this._cacheAdaptiveInitial && (this.cfg.maxHistoryTokens || 0) !== this._cacheAdaptiveInitial) {
+        this.cfg.maxHistoryTokens = this._cacheAdaptiveInitial;
+      }
+    }
     const report = {
       conversationId: this.conversationId,
       prefixHash,
@@ -3110,7 +3136,9 @@ class AgentSession {
       sessionCachedTokens: acc.cached,
       sessionPromptTokens: acc.prompt,
       driftByHash,
-      hitDrop
+      hitDrop,
+      lowHitStreak: this._cacheLowHitStreak || 0,
+      adaptiveBudget: (this.cfg && this.cfg.maxHistoryTokens) || 0
     };
     this.emit('cacheStats', report);
     console.log('[fox-ai] prompt-cache stats', JSON.stringify(report));
@@ -3264,10 +3292,19 @@ class AgentSession {
             // 单 chunk 正则只能删完整闭合块 → 半截块会漏推成正文。算法：先把累积缓冲拼上增量，
             // 再看「完整闭合块」之外是否有未闭合开标签——如果有，整体压缓冲不推；
             // 否则推全部（剥掉完整闭合块与残留未闭合尾）。
+            // 1.1.18 步骤流：剥除工具块时保留 \u0002STEP:<name>\u0002 边界标记（与 stripToolBlocks 同款），
+            // 让前端把实时思考流切成「💭 思考 / 🖥️ 工具」分步卡片，而不是整段糊在一起。
+            // 1.1.18b：流式路径必须先 normalizeToolTags —— TOOL_BLOCK 只认 <fox:tool> XML 格式，
+            // 自定义符号 [[tool:name]]{json}[[/tool]] 不归一化会原样裸流到思考/回答气泡
+            //（stripToolBlocks 轮末有归一化，但流式 onDelta 漏了，用户实测仍看到工具调用原文）。
             const buf = (this._textStripBuf || '') + t;
-            const cleaned = buf.replace(TOOL_BLOCK, '').replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '').trim();
-            const rawNoClosed = buf.replace(TOOL_BLOCK, '');
-            const hasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rawNoClosed);
+            const norm = tools.normalizeToolTags(buf);
+            const cleaned = norm.replace(TOOL_BLOCK, (_m, _a, name) => '\u0002STEP:' + name + '\u0002')
+              .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '')
+              .replace(/\[\[tool:[\s\S]*$/i, '')
+              .trim();
+            const rawNoClosed = norm.replace(TOOL_BLOCK, '');
+            const hasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rawNoClosed) || /\[\[tool:[\s\S]*$/i.test(norm);
             if (hasOpen) {
               // 工具块还没闭合：把整段压入缓冲，等后续 chunk 闭合后再推正文
               this._textStripBuf = buf;
@@ -3305,11 +3342,15 @@ class AgentSession {
         // 1.1.16：text 协议此前被 protocol!=='text' 整体关掉实时推送（轮末一次性蹦出），
         // 现在 text 协议剥掉 <fox:tool> 块后也实时推思考增量；非流式 provider 不在此流式。
         // text 协议 reasoning 剥离（1.1.16）：同样维护跨 chunk 未闭合块缓冲，避免半截块漏推。
+        // 1.1.18b：与 onDelta 同款，先 normalizeToolTags 归一化自定义符号 [[tool:...]]，
+        // 否则思考过程里的工具调用标签会原文裸流到工作链思考卡。
         if (this.protocol === 'text') {
           const rBuf = (this._reasonStripBuf || '') + String(t || '');
-          const rCleaned = rBuf.replace(TOOL_BLOCK, '').replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '').trim();
-          const rRaw = rBuf.replace(TOOL_BLOCK, '');
-          const rHasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rRaw);
+          const rNorm = tools.normalizeToolTags(rBuf);
+          const rCleaned = rNorm.replace(TOOL_BLOCK, '').replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '')
+            .replace(/\[\[tool:[\s\S]*$/i, '').trim();
+          const rRaw = rNorm.replace(TOOL_BLOCK, '');
+          const rHasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rRaw) || /\[\[tool:[\s\S]*$/i.test(rNorm);
           if (rHasOpen) { this._reasonStripBuf = rBuf; return; }
           this._reasonStripBuf = '';
           t = rCleaned;
@@ -3684,10 +3725,26 @@ class AgentSession {
   }
 
   stripToolBlocks(content) {
-    return String(content || '')
-      .replace(TOOL_BLOCK, '')
-      .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '')
-      .trim();
+    let text = String(content || '');
+    // 先归一化用户自定义符号（tool-tag-map.json 的 [[tool:%name%]] / [[/tool]]，防网页风控的
+    // 自定义调用标签），归一化成内部标准 <foxtool> 再由 TOOL_BLOCK 剥离——否则模型输出的
+    // 「正文+[[tool:...]]{json}[[/tool]]」混合流里，自定义符号调用块会原文裸露到思考/回答气泡
+    //（1.1.18 修复：stripToolBlocks 之前只剥 <foxtool>，漏掉自定义符号）。
+    text = tools.normalizeToolTags(text);
+    // 1.1.18 步骤流：剥掉工具块的同时保留「步骤边界标记」，供前端把思考流切成
+    // 「💭 思考 / 🖥️ 工具」分步卡片（对齐 DSH 的 Think/Pwsh/Read 动作步骤节奏，
+    // 但用狐狸 AI 既有 step-item 时间线卡片体系，不照抄 DSH 终端样式）。
+    // 替换回调里用 TOOL_BLOCK 捕获的工具名（$2）生成私有控制符 —— 前端按此切段：
+    //   正文段 → step-text 思考卡；\u0002STEP:<name>\u0002 → step-tool 动作卡。
+    text = text
+      .replace(TOOL_BLOCK, (_m, _a, name) => '\u0002STEP:' + name + '\u0002')
+      .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '');
+    // 未配对自定义符号兜底：normalizeToolTags 只处理完整配对块，模型输出被截断时
+    //（有 [[tool: 无 [[/tool]]）归一化后仍是 [[tool: 原文，TOOL_BLOCK 与 <tool 尾巴正则都不匹配
+    //（不是 < 开头）。此时从第一个残留 [[tool: 处截断，保留头部正文，绝不让工具调用原文裸露。
+    const customIdx = text.search(/\[\[tool:/i);
+    if (customIdx !== -1) text = text.slice(0, customIdx);
+    return text.trim();
   }
 
   /** 本地启发式：query 是否像多步骤任务（避免每次调 planner） */
@@ -4796,9 +4853,64 @@ class AgentSession {
         const collapse = Math.max(1, compressible);
         const dropped = msgs.slice(0, collapse);
         msgs.splice(0, collapse);
+
+        // —— 1.1.18：本地折叠存档 + 语义要点提取（对齐 DSH checkpoint 思想）——
+        // 旧实现只 splice 丢消息 + 插一条无语义系统标记 → 模型完全不知道旧任务做了什么，
+        // 长任务折叠后模型只能看到「[本地折叠]」，导致对话「变成 @文件引用」（模型被迫让用户
+        // 贴文件/找不到旧内容）。现在：① 从被折叠消息提取语义要点（用户意图/工具调用/文件路径/
+        // 结论）；② 落盘折叠档案到 ~/.fox-ai/compacted/<sessionId>-<ts>.json；③ 折叠标记携带
+        // 要点摘要 + 档案路径，后续轮次模型能看到「旧任务做了什么、去哪检索」，不再一片空白。
+        let archivePath = '';
+        let summaryText = '';
+        try {
+          const points = [];
+          for (const m of dropped) {
+            if (!m || !m.role) continue;
+            const c = typeof m.content === 'string' ? m.content : m.content ? JSON.stringify(m.content) : '';
+            if (!c || !c.trim()) continue;
+            const s = c
+              .replace(/<foxtool[\s\S]*?<\/foxtool>/gi, '')
+              .replace(/\[\[tool:[\s\S]*?\[\/tool\]\]/gi, '')
+              .trim();
+            if (!s) continue;
+            if (m.role === 'user') points.push('用户: ' + s.slice(0, 160));
+            else if (m.role === 'assistant') points.push('结论: ' + s.slice(-240));
+            else if (m.role === 'tool') {
+              const name = String(m.name || m.toolName || '工具').slice(0, 30);
+              const paths = (s.match(/[A-Za-z]:\\[^\s"']+|(?:\/[\w.-]+){2,}/g) || []).slice(0, 4);
+              const pathHint = paths.length ? ' 文件:' + paths.join(',') : '';
+              points.push('工具[' + name + ']: ' + s.slice(0, 120) + pathHint);
+            }
+          }
+          if (points.length) {
+            const compactDir = path.join(os.homedir(), '.fox-ai', 'compacted');
+            if (!fs.existsSync(compactDir)) fs.mkdirSync(compactDir, { recursive: true });
+            const ts = Date.now();
+            archivePath = path.join(compactDir, (this.sessionId || 'session') + '-' + ts + '.json');
+            fs.writeFileSync(archivePath, JSON.stringify({
+              ts,
+              sessionId: this.sessionId || '',
+              reason: String(reason || '').slice(0, 80),
+              droppedCount: dropped.length,
+              summary: points.slice(0, 60),
+              rawDropped: dropped.map((m) => ({
+                role: m.role,
+                name: m.name || '',
+                content: String(m.content || '').slice(0, 2000)
+              }))
+            }, null, 2), 'utf8');
+            summaryText = points.slice(0, 30).map((p) => '· ' + p).join('\n');
+            appendLog('autoSummarize', '[fallback-local][archive] ' + archivePath + ' summaryPoints=' + points.length);
+          }
+        } catch (ae) {
+          appendLog('autoSummarize', '[fallback-local][archive-err] ' + String(ae && ae.message || ae));
+        }
+
         const note = {
           role: 'system',
-          content: `[本地折叠] 因自动压缩不可用（${reason.slice(0, 80)}），已在本机把最早的 ${dropped.length} 条对话就地折叠，以释放上下文空间。原始内容未做语义摘要，如需完整回顾请改用带有效 API Key 的上下文整理。`
+          content: `[本地折叠] 因自动压缩不可用（${reason.slice(0, 80)}），已在本机把最早的 ${dropped.length} 条对话就地折叠以释放上下文空间。`
+            + (archivePath ? `\n折叠档案：${archivePath}` : '')
+            + (summaryText ? `\n折叠前要点：\n${summaryText}` : '\n原始内容未做语义摘要（存档失败），如需完整回顾请改用带有效 API Key 的上下文整理。')
         };
         msgs.unshift(note);
         appendLog('autoSummarize', '[fallback-local] collapsed=' + dropped.length);

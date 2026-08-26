@@ -189,6 +189,34 @@
     });
     text = text.replace(/\u0005IC(\d+)\u0005/g, (m, i) => inlineCodes[Number(i)] || m);
 
+    // GFM 表格预扫描：把「表头行 + 分隔行 + 数据行」的连续表格块抽成占位符。
+    // 旧实现只在逐行循环里识别「下一行是分隔行」，表头前若是普通段落（正文+表格混排时常见），
+    // 表头行/分隔行早被段落缓冲吞掉，表格永不触发 → 整段变纯文本。预扫描与代码块同款：
+    // 无论前后是什么上下文，只要连续行构成表头+分隔+数据，就整体抽出。
+    // 注意前缀不可用 (?:^|\n)——会消费表格前换行，占位符粘在上一行行尾，
+    // 还原分支 ^\u0001TBL 永远匹配不到。表头组直接从块首匹配，天然独占一行。
+    const tables = [];
+    text = text.replace(/([ \t]*\|?[^\n|]+(?:\|[^\n|]+)+\|?[ \t]*)\n[ \t]*\|?[ \t:|\-]+\|?[ \t]*(?:\n[ \t]*\|?[^\n|]+(?:\|[^\n|]+)+\|?[ \t]*)*/g, (m, headSeg) => {
+      const lines = m.split('\n');
+      const head = splitRow(lines[0]);
+      if (!head.length || !isSepRow(lines[1])) return m; // 守卫：分隔行必须合法
+      const aligns = splitRow(lines[1]).map((c) => {
+        const left = c.startsWith(':'), right = c.endsWith(':');
+        return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
+      });
+      const al = (k) => (aligns[k] ? ' style="text-align:' + aligns[k] + '"' : '');
+      const rows = [];
+      for (let k = 2; k < lines.length; k++) {
+        const ln = lines[k].trim();
+        if (!ln || !ln.includes('|') || isSepRow(ln)) continue;
+        rows.push(splitRow(ln));
+      }
+      const thead = '<tr>' + head.map((c, k) => '<th' + al(k) + '>' + renderInline(c) + '</th>').join('') + '</tr>';
+      const tbody = rows.map((r) => '<tr>' + head.map((_, k) => '<td' + al(k) + '>' + renderInline(r[k] || '') + '</td>').join('') + '</tr>').join('');
+      tables.push('<table><thead>' + thead + '</thead><tbody>' + tbody + '</tbody></table>');
+      return '\u0001TBL' + (tables.length - 1) + '\u0001';
+    });
+
     const lines = text.split('\n');
     const html = [];
     let listType = null;
@@ -209,6 +237,9 @@
       const line = raw.replace(/\s+$/, '');
       const ph = line.match(/^\u0000CB(\d+)\u0000$/);
       if (ph) { flushPara(); closeList(); html.push(codeBlockHtml(blocks[Number(ph[1])])); continue; }
+      // 表格占位符还原：预扫描产物为独占行，直接还原成 <table>（先 flush 段落、关列表）
+      const tph = line.match(/^\u0001TBL(\d+)\u0001$/);
+      if (tph) { flushPara(); closeList(); html.push(tables[Number(tph[1])]); continue; }
       if (!line.trim()) { flushPara(); closeList(); continue; }
 
       // GFM 表格：表头行 + 下一行是分隔行时触发
@@ -233,19 +264,20 @@
         continue;
       }
 
-      const h = line.match(/^(#{1,6})\s+(.*)$/);
+      const h = line.match(/^(#{1,6})[ \t]*(.*)$/);
       if (h) { flushPara(); closeList(); html.push('<h' + h[1].length + '>' + renderInline(h[2]) + '</h' + h[1].length + '>'); continue; }
-      if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { flushPara(); closeList(); html.push('<hr>'); continue; }
+      // hr 兼容粘连文字（---建议顺序）：--- 后允许直接跟非空内容
+      if (/^\s*([-*_])\1{2,}[ \t]*(?:[^\s].*)?$/.test(line)) { flushPara(); closeList(); html.push('<hr>'); continue; }
       const q = line.match(/^>\s?(.*)$/);
       if (q) { flushPara(); closeList(); html.push('<blockquote>' + renderInline(q[1]) + '</blockquote>'); continue; }
-      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      const ul = line.match(/^\s*[-*+][ \t]*(.*)$/);
       if (ul) {
         flushPara();
         if (listType !== 'ul') { closeList(); html.push('<ul>'); listType = 'ul'; }
         html.push('<li>' + renderInline(ul[1]) + '</li>');
         continue;
       }
-      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+[.)][ \t]*(.*)$/);
       if (ol) {
         flushPara();
         if (listType !== 'ol') { closeList(); html.push('<ol>'); listType = 'ol'; }
@@ -580,13 +612,85 @@
     return null;
   }
 
-  // 渲染助手消息：先抽引用角标，再走 markdown（含公式/代码），最后把角标还原为 [n] 并追加来源列表
+  // 渲染助手消息：先抽引用角标，再走 markdown（含公式/代码），最后把角标还原为 [n] 并追加来源列表。
+  // 1.1.18b 复刻 DSH 样式：正文里若含 \u0002STEP:<name>\u0002 工具边界标记（后端 stripToolBlocks /
+  // onDelta 流式剥离时插入），按标记切段渲染成「💭 思考 / 🖥️ 工具」动作卡片流，不再把工具调用
+  // 原文或一大坨思考糊在正文里；无标记时保持原样 markdown。
   function renderAssistant(raw, fid) {
-    const { text, cites } = extractCitations(String(raw == null ? '' : raw));
+    // 最终回答气泡：先把 \u0002STEP:\u0002 边界标记切段；若整段无标记则原样渲染。
+    // 防御：即使后端漏剥，前端也兜底归一化自定义符号（[[tool:...]] → STEP）与 XML 工具块，
+    // 绝不让工具调用原文裸露在对话气泡里（历史 transcript 也可能残留旧格式）。
+    const _src = String(raw == null ? '' : raw);
+    // 兜底归一化顺序：先整体替换「自定义符号完整块」[[tool:name]]{json}[[/tool]] → STEP，
+    // 再处理无 JSON 的裸标签与 XML 块；[[/tool]] 关闭标记直接删除，避免残留孤立控制符/参数 JSON。
+    const src = _src
+      .replace(/\[\[tool:([A-Za-z0-9_]+)\]\]\s*\{[\s\S]*?\}\s*\[\[\/tool\]\]/gi, '\u0002STEP:$1\u0002')
+      .replace(/\[\[tool:([A-Za-z0-9_]+)\]\]/gi, '\u0002STEP:$1\u0002')
+      .replace(/\[\[\/tool\]\]/gi, '')
+      .replace(/<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>([\s\S]*?)<\/(fox:?tool|fox-tool|tool)>/gi, '\u0002STEP:$2\u0002')
+      .replace(/<\/?(fox:?tool|fox-tool|tool)[^>]*>/gi, '')
+      // 1.1.18c：STEP 标记后紧跟的裸 JSON 尾巴（流式打碎 / 未配对残留）——
+      // 「\u0002STEP:run_command\u0002{"command":...}」这种，完整块正则吃不到时就残留一段参数原文。
+      // 用括号配对扫描精确剥：从 STEP 后第一个 { 配平到对应 }（跳过字符串内的引号/括号），
+      // 只剥那个 JSON 对象，JSON 之后的思考正文原封不动。
+      .replace(/\u0002STEP:([A-Za-z0-9_:.-]+)\u0002\s*\{/g, (m, name, off, whole) => {
+        // 从匹配末尾（{ 之后）开始扫描：off 是匹配在 whole 中的绝对偏移，m.length 是匹配文本长度
+        let depth = 1, i = off + m.length, inStr = false, esc = false;
+        for (; i < whole.length; i++) {
+          const ch = whole[i];
+          if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+          }
+          if (ch === '"') { inStr = true; continue; }
+          if (ch === '{') depth++;
+          else if (ch === '}') { depth--; if (depth === 0) break; }
+        }
+        const end = depth === 0 ? i + 1 : whole.length; // 未闭合则剥到结尾
+        return '\u0002STEP:' + name + '\u0002' + whole.slice(end);
+      })
+      .replace(/\u0002STEP:[^\u0002]*$/g, ''); // 未闭合 STEP 尾巴兜底截断
+    const { text, cites } = extractCitations(src);
     // 补全链接：标签自带 > 搜索结果索引反查；并把来源存档到该消息，供点击角标取用（URL 晚到也会在重绘时回填）
     const resolved = cites.map((c) => ({ label: c.label, url: c.url || lookupCiteUrl(c.label), type: c.type, localPath: c.localPath }));
     recordSources(fid, resolved);
-    let html = renderMarkdown(text);
+    // DSH 式切段：文本段 → 💭 思考卡；工具段 → 🖥️ 动作卡；最后一段文本作为最终回答正文。
+    const segs = splitThinkingSteps(text);
+    let html;
+    if (segs.length <= 1) {
+      html = renderMarkdown(text);
+    } else {
+      const cards = [];
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        if (seg.kind === 'tool') {
+          const icon = STEP_ICON[seg.name] || '🛠️';
+          const label = TOOL_LABELS[seg.name] || seg.name.replace(/_/g, ' ');
+          // 1.1.18c DSH ToolRow 化：单行 [icon] 标题，去掉 head/badge 包装
+          cards.push(
+            '<div class="step-card step-tool">' +
+              '<span class="step-card-icon">' + icon + '</span>' +
+              '<span class="step-card-title">' + escapeHtml(label) + '</span>' +
+            '</div>'
+          );
+        } else if (i === segs.length - 1 && String(seg.text).trim()) {
+          // 最后一段文本 = 最终回答正文（不包卡片，正常 markdown）
+          html = renderMarkdown(seg.text);
+        } else if (String(seg.text).trim()) {
+          // 1.1.18c：思考段 = [💭] 图标 + 正文同行，去掉「思考」标题行
+          cards.push(
+            '<div class="step-card step-text">' +
+              '<span class="step-card-icon">💭</span>' +
+              '<div class="step-card-body">' + renderMarkdown(seg.text) + '</div>' +
+            '</div>'
+          );
+        }
+      }
+      if (html === undefined) html = '';
+      html = '<div class="assistant-steps">' + cards.join('') + '</div>' + html;
+    }
     html = html.replace(/\u0003CIT(\d+)\u0003/g, (m, i) => {
       const c = resolved[Number(i)] || { label: '', url: '' };
       const n = Number(i) + 1;
@@ -730,6 +834,104 @@
     }
     messagesEl.appendChild(wrap);
     return { wrap, bubble };
+  }
+
+  // —— 用户消息「修改并重发」：hover 操作条（✏️ 编辑 / ↻ 重发）——
+  // 对齐其他 agent 工作台（DSH / Claude Code）的用户消息 hover 交互：
+  // 编辑 = 气泡内 textarea 改原文，保存后把该条之后的历史截掉并用新文本重发；
+  // 重发 = 原文一键重发。后端 chatView 'resend' 负责截断 messages/transcript。
+  function addUserMsgActions(id, bubble, msg) {
+    const bar = document.createElement('div');
+    bar.className = 'user-actions';
+    const btnEdit = document.createElement('button');
+    btnEdit.className = 'mini ghost';
+    btnEdit.textContent = '✏️ ' + t('编辑');
+    btnEdit.title = t('修改这条消息后重新发送');
+    btnEdit.addEventListener('click', () => startEditUserMsg(id, bubble, msg));
+    const btnResend = document.createElement('button');
+    btnResend.className = 'mini ghost';
+    btnResend.textContent = '↻ ' + t('重发');
+    btnResend.title = t('重新发送这条消息');
+    btnResend.addEventListener('click', () => {
+      if (busy) { toast(t('狐狸 AI 正在运行，稍后再重发'), '⏳'); return; }
+      sendResend(id, bubble.dataset.raw || msg.text || '');
+    });
+    bar.appendChild(btnEdit);
+    bar.appendChild(btnResend);
+    // 插到角色标签与气泡之间，紧贴气泡右上角
+    const wrap = bubble.parentElement;
+    if (wrap) wrap.insertBefore(bar, bubble);
+  }
+
+  // 进入编辑态：气泡内容换成 textarea（预填原文），底部「取消 / 保存并重发」
+  function startEditUserMsg(id, bubble, msg) {
+    if (busy) { toast(t('狐狸 AI 正在运行，稍后再编辑'), '⏳'); return; }
+    if (bubble._editing) return;
+    bubble._editing = true;
+    const original = bubble.dataset.raw || msg.text || '';
+    bubble.innerHTML = '';
+    const ta = document.createElement('textarea');
+    ta.className = 'edit-textarea';
+    ta.value = original;
+    ta.rows = Math.max(2, original.split('\n').length);
+    const actions = document.createElement('div');
+    actions.className = 'edit-actions';
+    const btnCancel = document.createElement('button');
+    btnCancel.className = 'mini ghost';
+    btnCancel.textContent = t('取消');
+    btnCancel.addEventListener('click', () => {
+      bubble.innerHTML = '';
+      bubble.textContent = bubble.dataset.raw || '';
+      bubble._editing = false;
+      // 恢复附件展示
+      if (msg.attachments && msg.attachments.length) {
+        const att = document.createElement('div');
+        att.className = 'user-attachments';
+        att.innerHTML = msg.attachments.map((a) =>
+          '<span class="att-chip">' + (a.isImage ? '🖼 ' : '📄 ') + escapeHtml(a.name) + '</span>'
+        ).join('');
+        bubble.appendChild(att);
+      }
+    });
+    const btnSave = document.createElement('button');
+    btnSave.className = 'mini primary';
+    btnSave.textContent = t('保存并重发');
+    btnSave.addEventListener('click', () => {
+      const text = ta.value.trim();
+      if (!text) { ta.focus(); return; }
+      bubble._editing = false;
+      sendResend(id, text);
+    });
+    actions.appendChild(btnCancel);
+    actions.appendChild(btnSave);
+    bubble.appendChild(ta);
+    bubble.appendChild(actions);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
+
+  // 发送「修改并重发」：本地立即移除该气泡及其后所有 DOM（避免旧对话残留），
+  // 再通知后端截断历史并重新提问；后端会重放新的 user 气泡 + 新回答。
+  function sendResend(id, text) {
+    const wrap = id
+      ? messagesEl.querySelector('.msg.user[data-id="' + CSS.escape(id) + '"]')
+      : messagesEl.querySelector('.msg.user:last-child');
+    if (wrap) {
+      let node = wrap;
+      while (node) {
+        const next = node.nextElementSibling;
+        node.remove();
+        node = next;
+      }
+    }
+    // 本地清空该条之后可能残留的步骤/工具/思考状态（前端 DOM 已删，状态表也要同步清）
+    for (const k of Object.keys(live)) delete live[k];
+    for (const k of Object.keys(toolCards)) delete toolCards[k];
+    for (const k of Object.keys(stepItems)) delete stepItems[k];
+    for (const k of Object.keys(thinkingSteps)) delete thinkingSteps[k];
+    if (workchainList) workchainList.innerHTML = '';
+    updateWorkchainCount();
+    vscode.postMessage({ type: 'resend', id, text });
   }
 
   function renderAttachments() {
@@ -1304,6 +1506,37 @@
     if (patch && patch.status === 'running') scrollDown();
   }
 
+  // 工具名 → 可读动作名映射（对齐 DSH 的 Pwsh/Read 可读标签：工具不裸显示 list_dir，
+  // 而是显示「列出目录」这种动作卡标题，一眼看出模型在做什么）。
+  const TOOL_LABELS = {
+    list_dir: '📂 列出目录', find_files: '🔍 搜索文件', search_text: '🔍 搜索内容',
+    read_file: '📖 读取文件', write_file: '✏️ 写入文件', edit_file: '✏️ 编辑文件',
+    run_command: '🖥️ 执行命令', run_bash: '🖥️ 执行命令', execute: '🖥️ 执行',
+    get_tools: '🧰 获取工具', get_status: '📊 查看状态', plan_task: '📋 规划任务',
+    mcp: '🔌 MCP 工具', skill: '🧩 加载技能', web_fetch: '🌐 抓取网页',
+    web_search: '🔎 搜索网页', grep: '🔍 搜索代码', http: '🌐 HTTP 请求'
+  };
+  // 把「思考原文」按步骤边界标记切成「思考段 + 工具动作段」，返回分步卡片 HTML 片段。
+  // 对齐 DSH 的 Think/Pwsh/Read 动作步骤流：模型每次输出正文段落 = 一段「💭 思考」，
+  // 每次工具调用 = 一张「🖥️ 工具」动作卡（标题=可读动作名，参数折叠在卡内），时间线串联成工作链。
+  // 后端 stripToolBlocks 已把工具块替换成 \u0002STEP:<工具名>\u0002 私有标记（保留步骤边界但不裸露原文），
+  // 前端只按标记切段，绝不照抄 DSH 的终端日志样式 —— 全用狐狸 AI 既有 step-item 卡片体系。
+  function splitThinkingSteps(raw) {
+    const STEP_RE = /\u0002STEP:([^\u0002]+)\u0002/g;
+    const segs = [];
+    let last = 0, m;
+    while ((m = STEP_RE.exec(String(raw || ''))) !== null) {
+      const pre = String(raw).slice(last, m.index);
+      if (pre && pre.trim()) segs.push({ kind: 'text', text: pre });
+      segs.push({ kind: 'tool', name: m[1] });
+      last = m.index + m[0].length;
+    }
+    const tail = String(raw).slice(last);
+    if (tail && tail.trim()) segs.push({ kind: 'text', text: tail });
+    if (!segs.length && String(raw || '').trim()) segs.push({ kind: 'text', text: raw });
+    return segs;
+  }
+
   function updateThinkingStep(msg_id, type, data) {
     const ts = thinkingSteps[msg_id];
     if (!ts || !ts.el) return;
@@ -1332,8 +1565,38 @@
     if (ts.reasoning && String(ts.reasoning).trim()) {
       parts.push('<div class="thinking-section"><div class="thinking-section-title">已思考</div>' + renderReasoning(ts.reasoning) + '</div>');
     }
+    // 1.1.18 步骤流：把输出原文切成「💭 思考 / 🖥️ 工具动作」分步卡片（仿 DSH 步骤节奏，
+    // 用狐狸 AI 既有 step-item 体系），而不是整段糊成一个 thinking-section。
     if (ts.raw && String(ts.raw).trim()) {
-      parts.push('<div class="thinking-section"><div class="thinking-section-title">输出</div>' + renderAssistant(ts.raw) + '</div>');
+      const segs = splitThinkingSteps(ts.raw);
+      if (segs.length <= 1) {
+        // 无工具标记：保持原样单节「输出」，避免空转（单节时不做额外包装）
+        parts.push('<div class="thinking-section"><div class="thinking-section-title">输出</div>' + renderAssistant(ts.raw) + '</div>');
+      } else {
+        parts.push('<div class="workchain-steps">');
+        for (const seg of segs) {
+if (seg.kind === 'tool') {
+          const icon = STEP_ICON[seg.name] || GROUP_ICON.tool || '🛠️';
+          const label = TOOL_LABELS[seg.name] || seg.name.replace(/_/g, ' ');
+          // 1.1.18c DSH ToolRow：单行 [icon] + 标题，去 head/badge 包装
+          parts.push(
+            '<div class="step-card step-tool">' +
+              '<span class="step-card-icon">' + icon + '</span>' +
+              '<span class="step-card-title">' + escapeHtml(label) + '</span>' +
+            '</div>'
+          );
+        } else {
+          // 1.1.18c：思考段 [💭] icon 与正文同行，去「思考」标题行
+          parts.push(
+            '<div class="step-card step-text">' +
+              '<span class="step-card-icon">💭</span>' +
+              '<div class="step-card-body">' + renderAssistant(seg.text) + '</div>' +
+            '</div>'
+          );
+        }
+        }
+        parts.push('</div>');
+      }
     }
     if (ts.images && ts.images.length) {
       for (const img of ts.images) {
@@ -2218,6 +2481,11 @@
         case 'user': {
           const { bubble } = addMessage('user', msg.id);
           bubble.textContent = msg.text || '';
+          // 「修改并重发」：记录原始文本（编辑重发时回填），并挂 hover 操作条（✏️ 编辑 / ↻ 重发）。
+          // 对齐其他 agent 工作台（DSH/Claude Code）的用户消息 hover 交互：改完一键重发，
+          // 后端把该条之后的历史截掉、用新文本重新提问，对话不会残留旧回答。
+          bubble.dataset.raw = msg.text || '';
+          if (msg.id) addUserMsgActions(msg.id, bubble, msg);
           if (msg.attachments && msg.attachments.length) {
             const att = document.createElement('div');
             att.className = 'user-attachments';

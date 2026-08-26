@@ -343,6 +343,119 @@ body {
 /* ---------- 消息区 ---------- */
 .messages { flex: 1 1 auto; overflow-y: auto; padding: 16px 16px 6px; min-width: 0; }
 
+/* ---------- 用户消息「修改并重发」：hover 操作条（✏️ 编辑 / ↻ 重发）----------
+   对齐 DSH / Claude Code 的用户消息 hover 交互：编辑 = 气泡内改原文后一键重发，
+   重发 = 原文重发。操作条默认隐藏，hover 用户气泡时浮现，避免常驻按钮抢视觉。 */
+.msg.user { position: relative; }
+.user-actions {
+  position: absolute;
+  top: 14px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--fox-t);
+  z-index: 3;
+}
+.msg.user:hover .user-actions,
+.msg.user:focus-within .user-actions { opacity: 1; pointer-events: auto; }
+.user-actions .mini {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--vscode-editor-background, rgba(128,128,128,.14));
+  border: 1px solid var(--fox-line);
+  box-shadow: var(--fox-shadow-sm);
+}
+.user-actions .mini:hover { border-color: var(--fox-accent); color: var(--fox-accent); }
+/* 编辑态：气泡内的 textarea + 操作按钮 */
+.edit-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 54px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  border-radius: var(--fox-rad-sm);
+  border: 1px solid var(--fox-accent);
+  background: var(--vscode-input-background, rgba(128,128,128,.08));
+  color: var(--vscode-input-foreground, inherit);
+  resize: vertical;
+  outline: none;
+}
+.edit-actions { display: flex; gap: 6px; margin-top: 6px; justify-content: flex-end; }
+
+/* ---------- 步骤时间线（1.1.18c，对齐 DSH ToolRow 单行动作块）----------
+   工具步骤 = `[🛠️] 动作名` 单行；思考步骤 = `[💭] 思考正文` 直接段落。
+   2px 时间线竖线串联，不再一张卡 3 行（icon/title/badge 堆叠）糊成一片。 */
+.assistant-steps {
+  display: flex;
+  flex-direction: column;
+  margin: 2px 0 8px 4px;
+  position: relative;
+}
+.assistant-steps::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 8px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--fox-line, rgba(128,128,128,.22));
+}
+.assistant-steps .step-card {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  line-height: 24px;
+  overflow: hidden;
+}
+/* 时间线圆点节点 */
+.assistant-steps .step-card::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin: 10px 9px 0 3px;
+  border-radius: 50%;
+  background: var(--fox-accent, #f0883e);
+  z-index: 1;
+}
+.assistant-steps .step-card-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+  width: 16px;
+  margin-right: 6px;
+  text-align: center;
+}
+.assistant-steps .step-card-head { display: contents; }
+.assistant-steps .step-card-badge { display: none; }
+.assistant-steps .step-card-title {
+  color: var(--fox-fg, var(--vscode-foreground));
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.assistant-steps .step-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fox-fg, var(--vscode-foreground));
+  font-size: 12.5px;
+  line-height: 1.65;
+  padding: 2px 0 4px;
+}
+.assistant-steps .step-card-body p { margin: 0 0 3px; }
+.assistant-steps .step-card-body p:last-child { margin-bottom: 0; }
+.assistant-steps .step-card-body *:first-child { margin-top: 0; }
+/* 工具动作行：单行 24px，无边框无底色 */
+.assistant-steps .step-tool .step-card-title { font-weight: 650; }
+.assistant-steps .step-text .step-card-body { margin: 0; }
+/* 1.1.18c：工具行不挂圆点，思考行保留圆点节点 */
+.assistant-steps .step-tool::before { display: none; }
+
 /* ---------- 工作链侧边栏：把 thinking/tool/step 与正文物理隔离 ---------- */
 .workchain-panel {
   flex: 0 1 auto;

@@ -80,6 +80,38 @@ function summarizeArgs(name, args) {
   }
 }
 
+/* 1.1.18d：transcript 落盘兜底剥工具块——后端流式剥块正常时这里基本用不上，
+   但历史会话（旧版本剥块弱）或个别直答路径可能把 <foxtool>{json}</foxtool> 原文落进存档，
+   restore 重渲染时若前端兜底又漏，JSON 就会带进气泡。这里在落盘前统一剥成 STEP 标记，
+   保证存档永远干净。 */
+const TAPE_TOOL_BLOCK = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>([\s\S]*?)<\/(fox:?tool|fox-tool|tool)>/gi;
+const TAPE_STEP = '\u0002STEP:';
+function stripTapeToolBlocks(text) {
+  if (typeof text !== 'string') return text;
+  if (text.indexOf('<fox') === -1 && text.indexOf('[[tool') === -1 && text.indexOf('<tool') === -1) return text;
+  const s = text
+    .replace(/(?:\[\[tool:([A-Za-z0-9_]+)\]\]\s*\{[\s\S]*?\}\s*\[\[\/tool\]\])|(?:\[\[tool:([A-Za-z0-9_]+)\]\])/gi, (_m, a, b) => '\u0002STEP:' + (a || b) + '\u0002')
+    .replace(TAPE_TOOL_BLOCK, (_m, _a, name) => '\u0002STEP:' + name + '\u0002')
+    .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, ''); // 未闭合尾巴截断
+  // STEP 前裸 JSON 残影（模型把参数放块外/解析残留）——配平后紧接 STEP 才剥，不误伤正文
+  let out = '', i = 0;
+  while (i < s.length) {
+    if (s[i] === '{' && s.indexOf(TAPE_STEP, i) !== -1) {
+      let depth = 1, j = i + 1, inStr = false, esc = false;
+      for (; j < s.length; j++) {
+        const c = s[j];
+        if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+        if (c === '"') { inStr = true; continue; }
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) break; }
+      }
+      if (depth === 0 && s.slice(j + 1, j + 1 + TAPE_STEP.length) === TAPE_STEP) { i = j + 1; continue; }
+    }
+    out += s[i]; i++;
+  }
+  return out;
+}
+
 function isEmptyMessageContent(content) {
   if (!content) return true;
   if (typeof content === 'string') return !content.trim();
@@ -115,6 +147,8 @@ class ChatViewProvider {
     /** @type {AgentSession|null} */
     this.session = null;
     this.seq = 0;
+    /** 用户消息 id（'u' + seq）→ this.messages 中的索引，供「修改并重发」截断历史用 */
+    this._userMsgIndex = {};
     this.bubbleId = null;
     this.alwaysAllow = new Set();
     /** @type {Map<string, Function>} */
@@ -256,6 +290,7 @@ class ChatViewProvider {
 
   _applySession(session) {
     this.messages = session.messages || [];
+    this._userMsgIndex = {}; // 会话切换后旧索引失效，重建
     this.transcript = resolveTranscriptImages(session.transcript || []);
     // 存档时剥掉了 base64，切回会话时按原路径补读回来（文件还在就还能继续发）
     this.attachments = (session.attachments || [])
@@ -304,6 +339,52 @@ class ChatViewProvider {
       case 'send':
         await this.ask(msg.text, { attachments: msg.attachments });
         break;
+      case 'resend': {
+        // 「修改并重发」：把该条用户消息之后的所有对话历史截掉，用（可能修改过的）文本重新提问。
+        // 参考其他 agent 工作台（DSH/Claude Code）的用户消息 hover 编辑重发交互：
+        // 前端已把旧气泡之后的 DOM 删掉（truncateAfter 只做后端侧历史截断的补充通知），
+        // 这里同步截断 messages / transcript，保证模型不会再看到被删除的旧对话。
+        if (this.session) {
+          vscode.window.showWarningMessage(i18n.tw('狐狸 AI 还在忙上一件事，先暂停或停止它吧～'));
+          break;
+        }
+        const uid = String(msg.id || '');
+        let idx = this._userMsgIndex[uid];
+        if (typeof idx !== 'number' || idx < 0 || idx >= this.messages.length) {
+          // 会话重载后索引表为空：按 transcript 位置回退推算。
+          // transcript 里该 user 是倒数第几条 → messages 里对应「倒数第几条 user 消息」。
+          const userPositions = [];
+          for (const m of this.transcript) if (m && m.type === 'user') userPositions.push(String(m.id));
+          const posFromEnd = userPositions.indexOf(uid) >= 0
+            ? userPositions.length - 1 - userPositions.lastIndexOf(uid)
+            : -1;
+          if (posFromEnd >= 0) {
+            let seen = 0;
+            for (let i = this.messages.length - 1; i >= 0; i--) {
+              if (this.messages[i] && this.messages[i].role === 'user') {
+                if (seen === posFromEnd) { idx = i; break; }
+                seen++;
+              }
+            }
+          }
+        }
+        if (typeof idx === 'number' && idx >= 0 && idx < this.messages.length) {
+          // 保留 idx 之前的消息（不含该条 user），丢弃其后全部历史
+          this.messages = this.messages.slice(0, idx);
+        }
+        // transcript 同步截断：找到该 user 消息的位置，保留之前的条目
+        const tIdx = this.transcript.findIndex((m) => m && m.type === 'user' && String(m.id) === uid);
+        if (tIdx >= 0) {
+          this.transcript = this.transcript.slice(0, tIdx);
+          this._pendingReviewCard = null;
+          this._pendingArtifact = null;
+          this._pendingApplyReview = null;
+        }
+        const text = (msg.text === undefined || msg.text === null) ? '' : String(msg.text);
+        if (!text.trim()) break;
+        await this.ask(text, { resend: true });
+        break;
+      }
       case 'pause':
         if (this.session) this.session.pause();
         break;
@@ -701,6 +782,11 @@ class ChatViewProvider {
     // 轮末全量 reasoning（无 stream 标记）才落盘，供恢复「已思考」内容。
     const PERSIST = ['user', 'assistantStart', 'delta', 'assistantEnd', 'image', 'tool', 'toolUpdate', 'step', 'notice', 'error', 'assistant'];
     if (msg && (PERSIST.includes(msg.type) || (msg.type === 'reasoning' && !msg.stream))) {
+      // 1.1.18d：落盘兜底剥工具块——历史会话（旧版剥块弱）或个别直答路径可能把
+      // <foxtool>{json}</foxtool> 原文落进 transcript，restore 重渲染时 JSON 会漏进气泡。
+      // 在这里统一剥成 \u0002STEP:<name>\u0002 标记（与后端 stripToolBlocks 同款语义），保证存档永远干净。
+      if (msg && typeof msg.text === 'string') msg.text = stripTapeToolBlocks(msg.text);
+      if (msg && typeof msg.output === 'string') msg.output = stripTapeToolBlocks(msg.output);
       this.transcript.push(msg);
       // 按轮次压缩，保留每轮锚点（详见 compactTranscript），避免长会话丢锚点导致恢复后对话栏为空
       this.transcript = compactTranscript(this.transcript);
@@ -1164,6 +1250,8 @@ class ChatViewProvider {
 
     this.post({ type: 'user', id: 'u' + ++this.seq, text: extractTextFromContent(visibleText), attachments: effectiveAtts });
     this.messages.push({ role: 'user', content: userContent });
+    // 记录该用户消息在 messages 里的位置：重发/编辑重发时要把它之后的历史全部截掉
+    this._userMsgIndex['u' + this.seq] = this.messages.length - 1;
     // 仅在“本次不是切换指令”时才更新上一轮缓冲，避免把「换agent」写进缓冲造成死循环
     if (!SWITCH_AGENT_RE.test(sendText)) {
       this._lastUserTurn = { text: effectiveText, attachments: effectiveAtts };

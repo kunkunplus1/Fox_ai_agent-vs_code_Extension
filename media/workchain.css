@@ -85,3 +85,84 @@ body.workchain-only .workchain-list:empty::before {
   opacity: .55;
   font-size: 12px;
 }
+
+/* —— 1.1.18c 步骤时间线（对齐 DSH ToolRow）：单行紧凑，去掉边框/badge/卡片堆叠。
+   工具步骤 = `[🛠️] 动作名` 24px 单行；思考步骤 = `[💭] 正文` 直接是段落，
+   左边一条 2px 时间线竖线串联，不再一张卡 3 行糊成一片。 */
+.workchain-steps {
+  display: flex;
+  flex-direction: column;
+  margin: 2px 0 2px 4px;
+  position: relative;
+}
+.workchain-steps::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--fox-line-soft, rgba(128,128,128,.18));
+}
+.step-card {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  line-height: 24px;
+  overflow: hidden;
+}
+/* 时间线节点：8px 圆点挂在竖线上 */
+.step-card::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin: 9px 9px 0 3px;
+  border-radius: 50%;
+  background: var(--fox-accent, #f0883e);
+  z-index: 1;
+}
+.step-card-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+  width: 16px;
+  margin-right: 6px;
+  text-align: center;
+}
+.step-card-head {
+  display: contents; /* 让 head 内元素直接参与行内排版，不再产生独立块 */
+}
+.step-card-badge { display: none; }
+.step-card-title {
+  color: var(--fox-fg, #333);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.step-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fox-fg, #333);
+  font-size: 12.5px;
+  line-height: 1.65;
+  padding: 2px 0 4px;
+}
+.step-card-body p { margin: 0 0 3px; }
+.step-card-body p:last-child { margin-bottom: 0; }
+.step-card-body *:first-child { margin-top: 0; }
+/* 工具动作行：单行 24px，无边框无底色、无圆点前的「·」——现在 icon 就是圆点 */
+.step-tool .step-card-title {
+  font-weight: 650;
+}
+.step-text .step-card-body {
+  margin: 0; /* 已是 icon 的 flex 兄弟，不再需要 margin 魔法 */
+}
+/* 1.1.18d：工具行思考行都不挂圆点——竖线即节奏，icon（🛠️/💭）本身是节点，
+   与 chat.css 的 compact 规则对齐，双圆点不再叠挂。 */
+.step-tool::before,
+.step-text::before,
+.step-tool .step-card::before { display: none; }
