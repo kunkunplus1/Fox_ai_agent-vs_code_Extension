@@ -63,7 +63,7 @@ function normalizeError(err, urlString) {
   return err instanceof Error ? err : new Error(String(err));
 }
 
-function explainHttpError(status, text) {
+function explainHttpError(status, text, baseUrl) {
   let msg = text;
   try {
     const j = JSON.parse(text);
@@ -72,11 +72,59 @@ function explainHttpError(status, text) {
   const hints = {
     401: '401 鉴权失败：Anthropic API Key 不对或没设置',
     403: '403 无权限',
-    404: '404 找不到接口：检查 baseUrl 是否为 https://api.anthropic.com/v1',
+    404: build404Hint(baseUrl),
     429: '429 触发限流：请求过快或额度用尽'
   };
   const hint = hints[status];
   return (hint ? hint + '\n' : `HTTP ${status}\n`) + String(msg).slice(0, 800);
+}
+
+/**
+ * 各厂商官方 Anthropic 兼容端点映射（依据官方文档，勿猜）：
+ *   - DeepSeek：https://api.deepseek.com/anthropic（官方「Using the Anthropic API」）
+ *   - 智谱 GLM：https://open.bigmodel.cn/api/anthropic（官方「Claude API 兼容」）
+ *   - Kimi / 月之暗面：https://api.moonshot.cn/anthropic（官方 platform.moonshot.cn/docs/guide/claude-code-kimi）
+ *   - 硅基流动：https://api.siliconflow.cn（官方 docs.siliconflow.cn，注意不带 /v1）
+ *   - 腾讯混元：https://api.hunyuan.cloud.tencent.com/anthropic（官方 cloud.tencent.com/doc 1729/127293）
+ *   - 阿里百炼：https://dashscope.aliyuncs.com/apps/anthropic（官方 help.aliyun.com Claude Code 文档；旧 compatible-mode/v1 无 anthropic 端点）
+ *   - MiniMax：https://api.minimaxi.com/anthropic（官方开发者文档）
+ *   - 火山方舟 / 豆包：https://ark.cn-beijing.volces.com/api/coding（官方 volcengine.com 接入三方工具）
+ * 命中官方 OpenAI 端点但未映射到的 → 原样返回 baseUrl（可能用户走的是中转站，直接拼 /v1/messages）
+ */
+function anthropicEndpointFor(baseUrl) {
+  const u = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return u;
+  // DeepSeek 官方：api.deepseek.com 或 api.deepseek.com/v1
+  if (/^https?:\/\/(www\.)?api\.deepseek\.com(\/v1)?$/i.test(u)) return 'https://api.deepseek.com/anthropic';
+  // 智谱：open.bigmodel.cn/api/paas/v4
+  if (/^https?:\/\/open\.bigmodel\.cn(\/api\/paas\/v4)?$/i.test(u)) return 'https://open.bigmodel.cn/api/anthropic';
+  // Kimi / 月之暗面：api.moonshot.cn 或 /v1
+  if (/^https?:\/\/api\.moonshot\.cn(\/v1)?$/i.test(u)) return 'https://api.moonshot.cn/anthropic';
+  // 硅基流动：api.siliconflow.cn 或 /v1（官方 base 不带 /v1）
+  if (/^https?:\/\/api\.siliconflow\.cn(\/v1)?$/i.test(u)) return 'https://api.siliconflow.cn';
+  // 腾讯混元：api.hunyuan.cloud.tencent.com 或 /v1
+  if (/^https?:\/\/api\.hunyuan\.cloud\.tencent\.com(\/v1)?$/i.test(u)) return 'https://api.hunyuan.cloud.tencent.com/anthropic';
+  // 阿里百炼：旧 OpenAI 兼容端点（compatible-mode/v1）→ 新 anthropic 端点；若无映射则提示
+  if (/^https?:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1$/i.test(u)) return 'https://dashscope.aliyuncs.com/apps/anthropic';
+  // MiniMax：api.minimaxi.com 或 /v1
+  if (/^https?:\/\/api\.minimaxi\.com(\/v1)?$/i.test(u)) return 'https://api.minimaxi.com/anthropic';
+  // 火山方舟 / 豆包：ark.cn-beijing.volces.com/api/v3 → /api/coding
+  if (/^https?:\/\/ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(u)) return 'https://ark.cn-beijing.volces.com/api/coding';
+  // 其它（中转站 / 自定义）原样
+  return u;
+}
+
+function build404Hint(baseUrl) {
+  const ep = anthropicEndpointFor(baseUrl);
+  if (ep === 'NO_ANTHROPIC_ENDPOINT') {
+    return '404：该服务商官方不提供 Anthropic Messages 兼容端点（只有 OpenAI 兼容 compatible-mode/v1）。\n'
+      + '请把 API 协议切回 chat（OpenAI 兼容），或改用支持 Anthropic 格式的中转站。';
+  }
+  if (ep !== String(baseUrl || '').trim().replace(/\/+$/, '')) {
+    return `404：看起来 baseUrl 是 ${baseUrl}（OpenAI 兼容地址）。该厂商的 Anthropic 兼容端点是 ${ep}，`
+      + '狐狸 AI 已按官方文档自动映射，但仍 404 的话请检查 API Key、模型名，或确认该中转站是否真的支持 Anthropic 格式。';
+  }
+  return '404 找不到接口：检查 baseUrl 是否为 https://api.anthropic.com/v1（或厂商的 Anthropic 兼容端点，如 DeepSeek https://api.deepseek.com/anthropic、智谱 https://open.bigmodel.cn/api/anthropic、Kimi https://api.moonshot.cn/anthropic、混元 https://api.hunyuan.cloud.tencent.com/anthropic、火山 https://ark.cn-beijing.volces.com/api/coding 等）。';
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -281,10 +329,19 @@ function streamChat(options) {
   let req;
 
   let url;
+  // 厂商 Anthropic 兼容端点自动映射（DeepSeek / 智谱按官方文档；通义无端点给明确报错）
+  const anthUrl = anthropicEndpointFor(baseUrl);
+  if (anthUrl === 'NO_ANTHROPIC_ENDPOINT') {
+    setImmediate(() => onError && onError(new Error(
+      '该服务商（通义千问/百炼）官方不提供 Anthropic Messages 兼容端点（只有 OpenAI 兼容 compatible-mode/v1）。\n'
+      + '请把 API 协议切回 chat（OpenAI 兼容），或改用支持 Anthropic 格式的中转站。'
+    )));
+    return handle;
+  }
   try {
-    url = new URL(String(baseUrl).replace(/\/+$/, '') + '/messages');
+    url = new URL(anthUrl + '/v1/messages');
   } catch (e) {
-    setImmediate(() => onError && onError(new Error('接口地址不合法：' + baseUrl)));
+    setImmediate(() => onError && onError(new Error('接口地址不合法：' + baseUrl + '\n自定义 Anthropic 兼容服务需要在设置里填 baseUrl（如 https://api.deepseek.com/anthropic 或中转站地址）。')));
     return handle;
   }
 
@@ -324,6 +381,7 @@ function streamChat(options) {
   let finishReason = 'stop';
   const toolAcc = [];
   let curTool = null; // 正在累积 input_json 的工具
+  let lastUsage = null; // 整条流只取最后一次 usage（message_delta 每条都是累计值，逐条触发会重复累加）
 
   const finish = (err) => {
     if (finished) return;
@@ -337,6 +395,8 @@ function streamChat(options) {
       const txt = nativeSearch.sourcesToText(dedup);
       if (txt) onSearchResults(txt);
     }
+    // 统一收尾：整条流只触发一次 usage（最后一次累计值），避免多个 message_delta 重复累加
+    if (lastUsage && onUsage) { try { onUsage && onUsage(lastUsage); } catch (_) {} }
     onDone && onDone({
       content,
       reasoning,
@@ -354,7 +414,7 @@ function streamChat(options) {
       bs.on('data', (c) => chunks.push(c));
       bs.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
-        const err = new Error(explainHttpError(res.statusCode, text));
+        const err = new Error(explainHttpError(res.statusCode, text, baseUrl));
         err.status = res.statusCode;
         finish(err);
       });
@@ -399,6 +459,10 @@ function streamChat(options) {
       }
       if (event === 'message_start') {
         onStart && onStart();
+        // message_start 也携带初始 usage（message.usage：input_tokens / cache_creation 等）。
+        // 部分端点只在 start 报 usage，后续 message_delta 可能不带——把 start 的 usage 也作为
+        // lastUsage 起始值，确保这类请求也能统计到（1.1.15 修复：单请求只累计最后一次）。
+        if (data && data.message && data.message.usage) { try { lastUsage = data.message.usage; } catch (_) {} }
       } else if (event === 'content_block_start') {
         const d = data.delta || {};
         if (d.type === 'tool_use') {
@@ -428,7 +492,9 @@ function streamChat(options) {
         if (sr === 'tool_use') finishReason = 'tool_calls';
         else if (sr === 'max_tokens') finishReason = 'length';
         else if (sr === 'end_turn' || sr === 'stop_sequence') finishReason = 'stop';
-        if (data.usage) { try { onUsage && onUsage(data.usage); } catch (_) {} }
+        // 只记最后一条 usage：message_delta 每条 usage 都是「截至当前」的累计值（cached 全量、input 增量），
+        // 逐条触发 onUsage → 会话累计把同一批 cached 重复加 → 累计命中率 >100%（1.1.15 修复）。
+        if (data.usage) { try { lastUsage = data.usage; } catch (_) {} }
       } else if (event === 'error') {
         const err = new Error((data.error && (data.error.message || data.error.type)) || 'Anthropic stream error');
         err.status = data.error && data.error.status;
@@ -481,7 +547,7 @@ function postJson(urlString, { method = 'POST', apiKey, body, timeout = 120000, 
       bs.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode >= 400) {
-          reject(new Error(explainHttpError(res.statusCode, text)));
+          reject(new Error(explainHttpError(res.statusCode, text, urlString)));
           return;
         }
         try {
@@ -537,7 +603,11 @@ async function chatNonStream(options) {
     if (!(body.max_tokens > need)) body.max_tokens = need;
   }
 
-  const data = await postJson(String(baseUrl).replace(/\/+$/, '') + '/messages', {
+  const anthUrl = anthropicEndpointFor(baseUrl);
+  if (anthUrl === 'NO_ANTHROPIC_ENDPOINT') {
+    throw new Error('该服务商（通义千问/百炼）官方不提供 Anthropic Messages 兼容端点（只有 OpenAI 兼容 compatible-mode/v1）。\n请把 API 协议切回 chat（OpenAI 兼容），或改用支持 Anthropic 格式的中转站。');
+  }
+  const data = await postJson(anthUrl + '/v1/messages', {
     method: 'POST',
     apiKey,
     timeout: Math.max(timeout || 0, 90000),
@@ -575,4 +645,4 @@ function chatOnce(options) {
   return { promise, handle };
 }
 
-module.exports = { streamChat, chatNonStream, chatOnce, toAnthropic, fromAnthropic };
+module.exports = { streamChat, chatNonStream, chatOnce, toAnthropic, fromAnthropic, anthropicEndpointFor, explainHttpError };

@@ -120,10 +120,27 @@ const PROVIDERS = {
   },
   custom: {
     label: '自定义 OpenAI 兼容服务',
-    detail: '在设置里填 foxAi.baseUrl',
+    detail: '在设置里填 foxAi.baseUrl（任意 OpenAI 兼容 /chat/completions 或 /v1/responses 端点）',
     baseUrl: '',
     model: '',
     local: false
+  },
+  customResponses: {
+    label: '自定义 Responses 服务',
+    detail: '在设置里填 foxAi.baseUrl（OpenAI Responses API /v1/responses 端点，原生函数调用与推理增量；OpenAI 官方或 DeepSeek v4 等）',
+    baseUrl: '',
+    model: '',
+    local: false,
+    apiMode: 'responses'
+  },
+  customAnthropic: {
+    label: '自定义 Anthropic 兼容服务',
+    detail: '在设置里填 foxAi.baseUrl（任意 Anthropic Messages 兼容 /v1/messages 端点；官方服务商如 DeepSeek/智谱/Kimi 等会自动映射）',
+    baseUrl: '',
+    model: '',
+    local: false,
+    transport: 'anthropic',
+    notOpenAI: true
   }
 };
 

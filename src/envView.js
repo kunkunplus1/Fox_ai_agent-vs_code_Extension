@@ -251,7 +251,9 @@ function getHtml(context, webview) {
         <option value="moonshot">Kimi（云端）</option>
         <option value="siliconflow">硅基流动（云端）</option>
         <option value="openrouter">OpenRouter（云端）</option>
-        <option value="custom">自定义</option>
+        <option value="custom">自定义 OpenAI 兼容</option>
+        <option value="customResponses">自定义 Responses</option>
+        <option value="customAnthropic">自定义 Anthropic 兼容</option>
       </select>
     </div>
     <div class="row">
@@ -265,6 +267,14 @@ function getHtml(context, webview) {
     <div class="row">
       <label>API Key</label>
       <input id="kb-key" type="password" style="flex:1" placeholder="选云端模型时填写；本地模型留空。会写入该服务商独立的 SecretStorage"/>
+    </div>
+    <div class="row">
+      <label>传输层</label>
+      <select id="kb-transport" style="flex:1">
+        <option value="auto">auto（跟随服务商）</option>
+        <option value="openai">OpenAI 兼容 /chat/completions</option>
+        <option value="anthropic">Anthropic Messages API（自动映射 DeepSeek/智谱/Kimi 等端点）</option>
+      </select>
     </div>
     <div class="row">
       <button id="kb-organize">开始整理</button>
@@ -514,6 +524,7 @@ async function writeOrganize(cfg, patch) {
   if ('provider' in patch) await cfg.update('knowledgeBase.organize.provider', patch.provider || 'llamacpp', vscode.ConfigurationTarget.Global);
   if ('baseUrl' in patch) await cfg.update('knowledgeBase.organize.baseUrl', patch.baseUrl || '', vscode.ConfigurationTarget.Global);
   if ('model' in patch) await cfg.update('knowledgeBase.organize.model', patch.model || '', vscode.ConfigurationTarget.Global);
+  if ('transport' in patch) await cfg.update('knowledgeBase.organize.transport', patch.transport || 'auto', vscode.ConfigurationTarget.Global);
   if ('prompt' in patch) await cfg.update('knowledgeBase.organize.prompt', patch.prompt || '', vscode.ConfigurationTarget.Global);
   if ('autoEnabled' in patch) await cfg.update('knowledgeBase.autoSummarize.enabled', !!patch.autoEnabled, vscode.ConfigurationTarget.Global);
   if ('autoThreshold' in patch) await cfg.update('knowledgeBase.autoSummarize.threshold', Number(patch.autoThreshold) || 0.9, vscode.ConfigurationTarget.Global);
@@ -537,6 +548,7 @@ function kbPatchFromForm(c) {
     provider: c.provider || 'llamacpp',
     baseUrl: (c.baseurl || '').trim(),
     model: (c.model || '').trim(),
+    transport: (c.transport || 'auto').trim(),
     autoEnabled: !!c.autoEnabled,
     autoThreshold: c.autoThreshold,
     autoKeep: c.autoKeep,
@@ -848,6 +860,7 @@ function openEnvPanel(context, chatProvider, initialTab) {
           provider: org.provider || 'llamacpp',
           baseurl: org.baseUrl || '',
           model: org.model || '',
+          transport: org.transport || 'auto',
           defaultOutput: kbOrg.defaultOutputDir(org.outputDir),
           autoEnabled: !!as.enabled,
           autoThreshold: as.threshold != null ? as.threshold : 0.9,

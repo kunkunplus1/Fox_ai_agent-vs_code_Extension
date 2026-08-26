@@ -45,10 +45,14 @@ const REVIEW_MARK = '狐狸AI·审查意见';
 // AgentSession 每轮用户提问都会重建，导致 this._cacheSession* 每轮归零；若直接用它算
 // 「会话累计命中率」会把早前的冷启动轮（含预热请求）丢掉、显示值虚高，与 DeepSeek 官方口径对不上。
 // 这里用模块级 Map 跨轮次累计，让「会话累计命中率」与官方账单口径一致（含冷启动，真实偏低才真实）。
+// ⚠️ 分母必须累计 total（cached + miss/非缓存输入 + creation），不能累计 prompt：
+//   - Anthropic 系 promptTokens 即 input_tokens，只含「非缓存」部分（miss），分子 cached / 分母
+//     只有 miss → 冷启动轮后命中轮会把命中率顶到 >100%（如 111%），与单轮口径矛盾。
+//   - OpenAI 系 promptTokens 已含 cached（total=promptTokens），total 公式依然成立，全厂商兼容。
 const sessionCacheStats = new Map();
 function _accCache(key) {
   let a = sessionCacheStats.get(key);
-  if (!a) { a = { cached: 0, prompt: 0, completion: 0 }; sessionCacheStats.set(key, a); }
+  if (!a) { a = { cached: 0, prompt: 0, completion: 0, total: 0 }; sessionCacheStats.set(key, a); }
   return a;
 }
 
@@ -138,6 +142,16 @@ function extractFoxToolBlocks(text) {
     openRe.lastIndex = end + tag.length + 3; // 跳过闭合标签 '</' + tag + '>'
   }
   return blocks;
+}
+
+/** 流式诊断专用日志：~/.fox-ai/logs/agent-stream.log，失败静默忽略。 */
+function streamLog(line) {
+  try {
+    const dir = path.join(os.homedir(), '.fox-ai', 'logs');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'agent-stream.log');
+    fs.writeFileSync(file, new Date().toISOString() + ' [pid:' + process.pid + '] ' + line + '\n', { flag: 'a' });
+  } catch (_) { /* 日志写入失败不得影响主流程 */ }
 }
 
 /** 写一条调试日志到 ~/.fox-ai/logs/agent-<name>.log，失败静默忽略 */
@@ -920,25 +934,56 @@ class AgentSession {
       const id = req && req.id;
       if (!id) return '查询单个任务需要提供 id。';
       const job = h.store.get(id);
-      if (!job) return '找不到后台任务 ' + id + '。用 action=list 看看有哪些。';
-      return bg.renderJob(job);
+      if (job) return bg.renderJob(job);
+      // 子代理后台表里没有 → 回落到异步命令任务（run_command bg=true 提交）
+      try {
+        const term = require('./tools/terminal');
+        if (term.asyncJobLoad && term.asyncJobLoad(id)) {
+          return term.asyncCommandJobs({ action: 'get', id });
+        }
+      } catch (_) {}
+      return '找不到后台任务 ' + id + '。用 action=list 看看有哪些。';
     }
     if (action === 'cancel') {
       const id = req && req.id;
       if (!id) return '取消任务需要提供 id。';
-      const r = h.runner.cancel(id);
-      if (!r.ok) return '取消失败：' + r.error;
+      let r = h.runner.cancel(id);
+      if (!r.ok) {
+        try {
+          const term = require('./tools/terminal');
+          const cr = term.asyncJobCancel && term.asyncJobCancel(id);
+          if (cr && cr.ok) {
+            this.emit('notice', { text: `🚫 已取消后台命令任务 ${id}` });
+            return cr.queued ? `命令任务 ${id} 还在排队，已直接取消。` : `已取消命令任务 ${id}，进程树已终止。`;
+          }
+        } catch (_) {}
+        return '取消失败：' + r.error;
+      }
       this.emit('notice', { text: `🚫 已请求取消后台任务 ${id}` });
       return r.queued ? `任务 ${id} 还在排队，已直接取消。` : `已向任务 ${id} 发出取消请求，它会在当前这一步结束后停下。`;
     }
     if (action === 'clear') {
-      const n = h.store.clearFinished();
+      let n = h.store.clearFinished();
+      try {
+        const term = require('./tools/terminal');
+        if (term.asyncCommandJobs) n += (term.asyncCommandJobs({ action: 'clear' }).match(/已清理\s+(\d+)/) || [0, 0])[1] | 0;
+      } catch (_) {}
       return n ? `已清理 ${n} 条已结束的后台任务记录。` : '没有可清理的已结束任务。';
     }
     const jobs = h.store.list({ limit: Number(req && req.limit) > 0 ? Number(req.limit) : 12 });
     const active = jobs.filter((j) => j.status === 'running' || j.status === 'queued').length;
     const head = active ? `（${active} 个进行中）\n` : '';
-    return head + bg.renderJobList(jobs);
+    let body = head + bg.renderJobList(jobs);
+    // list 时也附上异步命令任务（若无子代理任务或仅有少量时避免刷屏，最多 8 条）
+    try {
+      const term = require('./tools/terminal');
+      const cmdText = term.asyncCommandJobs({ action: 'list' });
+      if (/后台命令任务|进行中|暂无后台命令任务/.test(cmdText)) {
+        const cmdLines = String(cmdText).split('\n').slice(0, 9);
+        body += (jobs.length ? '\n\n' : '') + cmdLines.join('\n');
+      }
+    } catch (_) {}
+    return body;
   }
 
   /** 后台任务事件 → UI 提示。后台任务的意义就是「别打扰你」，所以只在关键节点冒泡 */
@@ -2138,7 +2183,33 @@ class AgentSession {
           // 会被恒置真而强制补发，正是正文重复两遍的根因）。
           if (visibleText && String(visibleText).trim() && !this._finalStreamed) {
             this.emit('text', { text: visibleText, channel: 'final', msg_id: this.finalMsgId });
+            streamLog('endFlush FULL protocol=' + this.protocol + ' len=' + String(visibleText).length + ' (no live delta)');
+          } else if (visibleText && String(visibleText).trim() && this._finalStreamed) {
+            // 已实时推过：用「去空白前缀包含」判定是否真缺段（1.1.16 修正）。
+            // 旧实现对长度敏感（pushed 只累计非空正文 vs visible 含空白全量）→ 恒差空白 →
+            // TailFIX 每次误触发把后半段整体补发 → 用户看到「三分之一后一次性输出」。
+            // 判定基准统一为「去空白正文」：pushedNoWs 与 visibleNoWs 都是非空白字符。
+            //  - pushedNoWs 是 visibleNoWs 的前缀 → 流式已覆盖全部正文（只缺空白，无感知）→ 不补；
+            //  - 不是前缀 → 中间真缺段 → 从「visible 中首个不匹配位置」补发剩余非空正文。
+            const visibleNoWs = String(visibleText).replace(/\s+/g, '');
+            const pushedNoWs = this._estDeltaPushChars || 0; // 非空口径（onDelta 按非空白累计）
+            const streamedFull = this._finalStreamedText || '';
+            if (pushedNoWs > 0 && visibleNoWs.startsWith(String(streamedFull).replace(/\s+/g, ''))) {
+              // 前缀匹配：流式已覆盖正文全部（仅空白差异）→ 不补，绝不重复
+            } else if (pushedNoWs > 0 && !visibleNoWs.startsWith(String(streamedFull).replace(/\s+/g, ''))) {
+              // 真缺段：从头找「visibleNoWs 中 streamedNoWs 之后的部分」补发（去空白坐标，不重复）
+              const streamedNoWs = String(streamedFull).replace(/\s+/g, '');
+              const tail = visibleNoWs.slice(streamedNoWs.length);
+              if (tail && String(tail).trim()) {
+                this.emit('text', { text: tail, channel: 'final', msg_id: this.finalMsgId });
+                streamLog('endFlush TAIL-FIX real-miss streamedNoWs=' + streamedNoWs.length +
+                  ' visibleNoWs=' + visibleNoWs.length + ' tail=' + tail.length);
+              }
+            }
           }
+          streamLog('endFlush protocol=' + this.protocol + ' type=' + (this.protocol === 'text' ? 'text' : 'native') +
+            ' finalStreamed=' + !!this._finalStreamed + ' deltaCount=' + (this._streamDeltaCount || 0) +
+            ' pushed=' + (this._estDeltaPushChars || 0) + ' visible=' + (visibleText ? String(visibleText).length : 0));
           for (const img of resultImages) {
             this.emit('image', { src: img.src, alt: img.alt || '模型生成图片', channel: 'final', msg_id: this.finalMsgId });
           }
@@ -2165,7 +2236,7 @@ class AgentSession {
             // 任务完成：汇总本轮产物（创建/修改/删除的文件 + Token 用量）给用户一张成果卡片，可一键导出报告
             if (this._artifacts && this._artifacts.length) {
               const acc = _accCache(this.sessionId || this.conversationId);
-              const sessionHitRate = acc.prompt > 0 ? Math.round((acc.cached / acc.prompt) * 100) : 0;
+              const sessionHitRate = acc.total > 0 ? Math.round((acc.cached / acc.total) * 100) : 0;
               this.emit('artifact', {
                 files: this._artifacts.map((a) => ({ path: a.path, op: a.op, added: a.added || 0, removed: a.removed || 0 })),
                 title: (this.task && this.task.title) || '',
@@ -2900,6 +2971,13 @@ class AgentSession {
     }
     const b = selectBackend(targetCfg);
     const useResp = b.responses;
+    streamLog('requestEndpoint protocol=' + this.protocol +
+      ' transport=' + (targetCfg.transport || '') +
+      ' apiMode=' + (targetCfg.apiMode || '') +
+      ' forceNonStream=' + !!forceNonStream +
+      ' streamBroken=' + !!this.streamBroken +
+      ' useResp=' + !!useResp +
+      ' model=' + String(targetCfg.model || ''));
 
     // WebAI2API 文本协议（浏览器自动化）：
     //  1) 不发送 warmup 的 "ping" 探测——它会作为真实聊天消息打进 DeepSeek，污染上下文、浪费 token；
@@ -2920,6 +2998,7 @@ class AgentSession {
     }
 
     if (forceNonStream || this.streamBroken) {
+      streamLog('requestEndpoint → NON-STREAM (forceNonStream=' + !!forceNonStream + ' streamBroken=' + !!this.streamBroken + ')');
       try {
         return await this.fallbackIfLocalEmpty(await b.nonStream(opt), opt);
       } catch (err) {
@@ -2950,8 +3029,17 @@ class AgentSession {
       // 流式响应被截断/解析失败时，用非流式再试一次
       if (err && err.canRetryNonStream) {
         console.log('[fox-ai] fallback to non-stream because:', err.message);
-        this.streamBroken = true; // 本次会话后续都走非流式，避免反复撞墙
-        this.emit('notice', { text: '流式响应解析失败，已自动改用非流式请求…' });
+        // 1.1.15：用户主动取消/中止（abort）不算「流式解析失败」——强停只是打断本次流，
+        // 若因此置 streamBroken，整会话三种协议全部降级非流式、且永不恢复（用户实测「三协议都不流式」根因）。
+        // 权威判据用 this.cancelled：agent.cancel()（1303-1311）只由用户强停触发，会置 this.cancelled=true
+        // 并 abort _abortCtrl / stream.abort()——流式错误只要发生在 cancelled 状态下，一律不算解析失败，
+        // 不置全局降级；onDelta 复位逻辑（3159）还会在下一轮真实 delta 到达时自动恢复流式。
+        if (this.cancelled) {
+          console.log('[fox-ai] stream aborted by user, keep streaming enabled for next turn');
+        } else {
+          this.streamBroken = true; // 本次会话后续都走非流式，避免反复撞墙
+          this.emit('notice', { text: '流式响应解析失败，已自动改用非流式请求…' });
+        }
         // 部分厂商（通义）非流式禁止开思考，这里按非流式重新映射一次思考参数
         const rpNs = reasoning.buildReasoningParams(targetCfg, { stream: false });
         if (opt.extraBody) {
@@ -3006,7 +3094,10 @@ class AgentSession {
     acc.cached += stats.cachedTokens;
     acc.prompt += stats.promptTokens;
     acc.completion += stats.completionTokens;
-    const sessionHitRate = acc.prompt > 0 ? acc.cached / acc.prompt : 0;
+    // 分子分母同口径（与单轮 total 一致）：分母累计 cached + 非缓存输入 + 缓存写入，
+    // 否则 Anthropic 系 promptTokens 只含 miss，分子 cached 会顶出 >100% 的虚假累计命中率。
+    acc.total += (typeof stats.totalTokens === 'number' && stats.totalTokens > 0) ? stats.totalTokens : (stats.cachedTokens + stats.promptTokens);
+    const sessionHitRate = acc.total > 0 ? acc.cached / acc.total : 0;
     const report = {
       conversationId: this.conversationId,
       prefixHash,
@@ -3056,12 +3147,14 @@ class AgentSession {
       console.log('[fox-ai] cache warmup priming conversation ' + this.conversationId);
       await b.nonStream(warmOpt);
       console.log('[fox-ai] cache warmup done');
-      // 预热是冷启动（0 命中）：把它的输入 token 计入会话累计，避免「会话累计命中率」虚高、与官方口径对不上
+      // 预热是冷启动（0 命中）：把它的输入 token 计入会话累计的 total 分母（cache 写入量），
+      // 与累计口径一致（分母=total=cached+miss+creation）；原 acc.prompt 累加会漏掉分母、顶虚高命中率。
       const acc = _accCache(this.sessionId || this.conversationId);
       const warmPrompt = contextUsage.estimateTokens(typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg))
         + contextUsage.estimateTokens('ping')
         + contextUsage.estimateTokens(JSON.stringify(opt.tools || []));
       acc.prompt += warmPrompt;
+      acc.total += warmPrompt;
     } catch (e) {
       console.log('[fox-ai] cache warmup failed (ignored):', e && e.message);
     }
@@ -3145,22 +3238,63 @@ class AgentSession {
       onDelta: (t) => {
         if (!t) return;
         this.deltaSeen = true;
+        // 自愈：流式 delta 真实到达 = 本连接流式正常 → 解除历史降级（streamBroken 置位后若
+        // 某次流式实际成功，不应让本会话永久停留在非流式；否则「abort/偶发截断后整会话不流式」）。
+        if (this.streamBroken) {
+          this.streamBroken = false;
+          console.log('[fox-ai] stream recovered, restore streaming');
+          this.emit('notice', { text: '流式已恢复，重新启用实时输出…' });
+        }
         this._thinkingBuffer.text += t;
         this._estDeltaChars = (this._estDeltaChars || 0) + String(t).length;
         if (this._estDeltaChars % 100 < String(t).length || this._estDeltaChars < 100) {
           this._emitContextUsageDelta(this._estDeltaChars);
         }
-        // 实时流式：native/completions 协议且 provider 真正流式时，把最终正文逐字推到 final 通道，
-        // 让主对话栏逐字显示，而不是轮次末一次性蹦出。文本协议（含 <fox:tool> 标签）仍走轮末统一 flush，
-        // 避免把工具调用标签裸流到主对话栏；非流式 provider（forceNonStream/streamBroken）也不在此流式。
+        // 实时流式：native 与 text 协议都把最终正文增量逐字推到 final 通道（text 先剥掉
+        // <fox:tool> 工具块，只推可见正文，避免工具调用标签裸流到主对话栏）。
+        // 非流式 provider（forceNonStream/streamBroken）不在此流式——它们根本没走 onDelta。
+        // 1.1.16：text 协议此前被 protocol!=='text' 整体关掉实时推送（轮末一次性蹦出），
+        // 用户实测「三协议都不流式」的根因；现在 text 协议也实时推（剥块后正文）。
         const streaming = !(cfg.forceNonStream || this.streamBroken);
-        if (this.protocol !== 'text' && streaming) {
+        if (streaming) {
+          let pushText = t;
+          if (this.protocol === 'text') {
+            // text 协议增量剥离（1.1.16）：维护跨 chunk 的「未闭合块缓冲」。
+            // 工具块可能被 chunk 边界切成两半（<fox:tool ...> 在 A、内容在 B、</fox:tool> 在 C），
+            // 单 chunk 正则只能删完整闭合块 → 半截块会漏推成正文。算法：先把累积缓冲拼上增量，
+            // 再看「完整闭合块」之外是否有未闭合开标签——如果有，整体压缓冲不推；
+            // 否则推全部（剥掉完整闭合块与残留未闭合尾）。
+            const buf = (this._textStripBuf || '') + t;
+            const cleaned = buf.replace(TOOL_BLOCK, '').replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '').trim();
+            const rawNoClosed = buf.replace(TOOL_BLOCK, '');
+            const hasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rawNoClosed);
+            if (hasOpen) {
+              // 工具块还没闭合：把整段压入缓冲，等后续 chunk 闭合后再推正文
+              this._textStripBuf = buf;
+              streamLog('onDelta buffered (unclosed tool block) bufLen=' + buf.length + ' t=' + JSON.stringify(String(t).slice(0, 40)));
+              this._textBuffered = true;
+              return;
+            }
+            this._textStripBuf = '';
+            pushText = cleaned;
+          }
+          if (!pushText) { streamLog('onDelta skipped (empty after strip) protocol=' + this.protocol + ' t=' + JSON.stringify(String(t).slice(0, 60))); return; }
+          // _estDeltaPushChars 按「非空白字符」累计：与轮末 TailFIX 的 visibleNoWs 口径一致，
+          // 空格/换行在剥离 .trim() 时被去掉，不算入「已推正文量」，避免「已推 vs 全量」恒差空白。
+          this._estDeltaPushChars = (this._estDeltaPushChars || 0) + String(pushText).replace(/\s+/g, '').length;
           if (!this._finalStarted) {
             this._finalStarted = true;
             this.emit('assistantStart', { channel: 'final', msg_id: this.finalMsgId });
           }
           this._finalStreamed = true;
-          this.emit('text', { text: t, channel: 'final', msg_id: this.finalMsgId });
+          if (!this._streamDeltaCount) this._streamDeltaCount = 0;
+          this._streamDeltaCount++;
+          if (this._streamDeltaCount <= 3 || this._streamDeltaCount % 50 === 0) {
+            streamLog('onDelta push #' + this._streamDeltaCount + ' protocol=' + this.protocol +
+              ' len=' + String(pushText).length + ' total=' + this._estDeltaPushChars);
+          }
+          this._finalStreamedText = (this._finalStreamedText || '') + pushText;
+          this.emit('text', { text: pushText, channel: 'final', msg_id: this.finalMsgId });
         }
       },
       onReasoning: (t) => {
@@ -3168,8 +3302,21 @@ class AgentSession {
         this._thinkingBuffer.reasoning += t;
         // 实时流式：把思考过程逐字推到 thinking 通道（右侧工作链「调用模型」步骤卡片），
         // 让用户即时看到模型在思考什么，而不是等整轮结束才一次性蹦出（「看不到即时工作」的根因）。
-        // 文本协议（含 <fox:tool> 标签）与非流式 provider 不实时推，避免把工具标签/整段裸推。
-        if (this.protocol !== 'text' && !(cfg.forceNonStream || this.streamBroken)) {
+        // 1.1.16：text 协议此前被 protocol!=='text' 整体关掉实时推送（轮末一次性蹦出），
+        // 现在 text 协议剥掉 <fox:tool> 块后也实时推思考增量；非流式 provider 不在此流式。
+        // text 协议 reasoning 剥离（1.1.16）：同样维护跨 chunk 未闭合块缓冲，避免半截块漏推。
+        if (this.protocol === 'text') {
+          const rBuf = (this._reasonStripBuf || '') + String(t || '');
+          const rCleaned = rBuf.replace(TOOL_BLOCK, '').replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '').trim();
+          const rRaw = rBuf.replace(TOOL_BLOCK, '');
+          const rHasOpen = /<(fox:?tool|fox-tool|tool)[\s\S]*$/i.test(rRaw);
+          if (rHasOpen) { this._reasonStripBuf = rBuf; return; }
+          this._reasonStripBuf = '';
+          t = rCleaned;
+        }
+        const reasoningStreamable = !(cfg.forceNonStream || this.streamBroken) &&
+          (this.protocol !== 'text' || (String(t || '').trim().length > 0));
+        if (reasoningStreamable) {
           // stream:true 标记这是「实时增量」：只用于工作链即时滚动，不落盘 transcript（避免增量膨胀），
           // 轮末的全量 reasoning（无 stream 标记）才落盘，供重载/切换会话后恢复「已思考」内容。
           this.emit('reasoning', { text: t, channel: 'thinking', msg_id: this.thinkingMsgId, stream: true });
@@ -3957,8 +4104,9 @@ class AgentSession {
     }
     if (preHook.decision === 'allow' && preHook.ran > 0) skipApprove = true;
 
-    // use_skill 始终先询问用户（用前询问），不被 autoApprove 跳过
-    if (name === 'use_skill') skipApprove = false;
+    // use_skill 始终先询问用户（用前询问），不被 autoApprove 跳过；
+    // import_skill 从外部下载代码入库，同样强制先询问，不被 autoApprove 跳过
+    if (name === 'use_skill' || name === 'import_skill') skipApprove = false;
     if (preHook.decision === 'ask') skipApprove = false;
 
     const decision = skipApprove || name === 'save_memory' || name === 'get_memory'

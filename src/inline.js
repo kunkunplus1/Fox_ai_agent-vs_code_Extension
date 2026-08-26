@@ -3,6 +3,7 @@
 const vscode = require('vscode');
 const config = require('./config');
 const { chatOnce, fimCompleteOnce } = require('./client');
+const anthropic = require('./anthropic');
 const projectScan = require('./projectScan');
 
 const outputChannel = vscode.window.createOutputChannel('狐狸 AI·行内补全');
@@ -81,6 +82,42 @@ function pickCompletionModel(cfg, resolved) {
     return resolved.inlineCompletion.model;
   }
   return (resolved && resolved.model) || '';
+}
+
+/**
+ * 判断模型是否 DeepSeek 思考模型（deepseek-reasoner / deepseek-v4-pro 等带 reasoner/thinking 后缀）。
+ * DeepSeek 官方文档：deepseek-reasoner 不支持 FIM 补全（Beta），也不支持 temperature 等采样参数。
+ * https://api-docs.deepseek.com/zh-cn/guides/reasoning_model
+ */
+function isDeepSeekReasoner(model) {
+  const m = String(model || '').toLowerCase();
+  return /deepseek-(reasoner|r1|v4?-?pro)|deepseek.*(thinking|reasoning)/.test(m);
+}
+
+/**
+ * 按 transport + thinking 配置构造请求 body 额外字段。
+ * - openai  + thinking=on → { reasoning_effort: effort }（推理模型顶层参数）
+ * - anthropic + thinking=on → { thinking: { type:'enabled', budget_tokens: N } }
+ *   （budget 须 ≥1024 且 < maxTokens；按 effort 映射 low=2048 / medium=4096 / high=8192）
+ * - 其余返回空对象
+ */
+function buildInlineExtraBody(ic, model) {
+  const thinkingOn = ic && (ic.thinking === 'on' || ic.thinking === true);
+  if (!thinkingOn) return {};
+  const effort = (ic.thinkingEffort || 'medium').toLowerCase();
+  const transport = (ic.transport || 'openai').toLowerCase();
+  if (transport === 'anthropic') {
+    const budgetMap = { low: 2048, medium: 4096, high: 8192 };
+    const budget = budgetMap[effort] || 4096;
+    const maxTokens = Math.max(1024, (ic.maxTokens || 256) || 1024);
+    // budget 必须 < maxTokens，否则 Anthropic API 报错；给正文留至少 1024
+    const safeBudget = Math.min(budget, Math.max(1024, maxTokens - 1024));
+    return { thinking: { type: 'enabled', budget_tokens: safeBudget } };
+  }
+  // openai 系：DeepSeek 思考模型没有 reasoning_effort 参数（官方文档「即将可用」），
+  // 但传了也不报错（文档：不支持的参数会被忽略）——为兼容，reasoner 模型直接走自身思考模式，不传参数。
+  if (isDeepSeekReasoner(model)) return {};
+  return { reasoning_effort: effort };
 }
 
 /**
@@ -237,11 +274,19 @@ function createInlineProvider(context) {
       }
 
       const completionModel = pickCompletionModel(cfg, resolved);
-      log('请求', document.fileName, 'model=', completionModel, 'provider=', ic.provider || '(main)');
+      log('请求', document.fileName, 'model=', completionModel, 'provider=', ic.provider || '(main)', 'transport=', ic.transport, 'thinking=', ic.thinking);
 
       const isFimEndpoint = !!ic.fimEndpoint;
       const fimStrategy = detectFimStrategy(ic.fimStrategy, completionModel);
-      const useFim = fimStrategy !== 'none' && !isFimEndpoint;
+      // DeepSeek 思考模型（deepseek-reasoner）官方不支持 FIM 补全 → 自动降级为 chat 补全；
+      // Anthropic transport 无 FIM 端点 → 也用 chat 补全（Messages API + FIM 模板）
+      const isAnthropic = (ic.transport || 'openai') === 'anthropic';
+      const useFim = !isAnthropic && fimStrategy !== 'none' && !isFimEndpoint && !isDeepSeekReasoner(completionModel);
+      if (ic.thinking === 'on' && isDeepSeekReasoner(completionModel)) {
+        log('DeepSeek 思考模型不支持 FIM，已自动降级为 chat 补全（官方文档：deepseek-reasoner Not Supported: FIM）');
+      }
+      const extraBody = buildInlineExtraBody(ic, completionModel);
+      if (Object.keys(extraBody).length) log('注入思考参数:', JSON.stringify(extraBody));
 
       let prompt;
       let systemPrompt = SYSTEM;
@@ -297,7 +342,7 @@ function createInlineProvider(context) {
           if (inflight === handle) inflight = null;
         }
       } else {
-      const { promise, handle } = chatOnce({
+      const chatOpts = {
         baseUrl: ic.baseUrl,
         apiKey: ic.apiKey,
         model: completionModel,
@@ -308,8 +353,14 @@ function createInlineProvider(context) {
         temperature: 0.1,
         maxTokens: inlineMaxTokens,
         timeout: 20000,
-        stop: ['\n\n']
-      });
+        stop: ['\n\n'],
+        extraBody
+      };
+      // Anthropic transport：走原生 Messages API（支持 thinking.budget_tokens）；其余走 OpenAI 兼容
+      const useAnthropicClient = isAnthropic;
+      const { promise, handle } = useAnthropicClient
+        ? anthropic.chatOnce(chatOpts)
+        : chatOnce(chatOpts);
       inflight = handle;
       token.onCancellationRequested(() => {
         try { handle.abort(); } catch (_) {}
@@ -349,5 +400,7 @@ module.exports = {
   trimOverlap,
   pickCompletionModel,
   detectFimStrategy,
-  buildFimPrompt
+  buildFimPrompt,
+  isDeepSeekReasoner,
+  buildInlineExtraBody
 };

@@ -327,6 +327,7 @@ check('标题/列表/引用/加粗 基本结构', () => {
 });
 
 check('[^n^] 双尖角标也识别为可点击角标', () => {
+  for (const k of Object.keys(chat.citeUrlByNum)) delete chat.citeUrlByNum[k];
   chat.harvestSourceUrls('[1] Foo\nURL: https://foo.example/a\n[2] Bar\nURL: https://bar.example/b\n');
   const h = chat.renderAssistant('见 [^1^] 与 [^2^]。', 'fid7');
   assert.ok(h.includes('<sup class="cite link" data-source-id="fid7:0"'), '[^1^] link: ' + h);

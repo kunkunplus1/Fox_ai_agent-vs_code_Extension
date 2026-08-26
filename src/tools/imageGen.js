@@ -293,13 +293,17 @@ async function generateViaOpenAIImages({ baseUrl, apiKey, model, prompt, size, t
 }
 
 /** OpenAI 兼容 chat/completions 生图（Qwen 兼容端点、本地模型等）。沿用旧逻辑。 */
-async function generateViaChat({ baseUrl, apiKey, model, prompt, size, maxTokens, timeout, insecureHTTPParser }) {
+async function generateViaChat({ baseUrl, apiKey, model, prompt, size, maxTokens, timeout, insecureHTTPParser, transport }) {
   const text = size ? `${prompt}\n[尺寸要求：${size}]` : prompt;
   const messages = [{ role: 'user', content: [{ type: 'text', text: text }] }];
-  const result = await (require('../client').chatNonStream)({
+  const opts = {
     baseUrl, apiKey, model, messages,
     temperature: 0.9, maxTokens, timeout, insecureHTTPParser, includeRaw: true
-  });
+  };
+  // anthropic transport：走 Messages API（自动映射厂商端点）；注意 Anthropic 不输出图片，此处仅按协议正确调用
+  const result = transport === 'anthropic'
+    ? await (require('../anthropic').chatNonStream)(opts)
+    : await (require('../client').chatNonStream)(opts);
   debugImageGen('RESPONSE', { prompt, model, result: { content: result.content, images: result.images, raw: result.raw } });
   return extractImageUrls(result);
 }
@@ -341,7 +345,8 @@ async function run(a, ctx) {
     } else {
       images = await generateViaChat({
         baseUrl, apiKey, model, prompt, size,
-        maxTokens: ig.maxTokens || 1024, timeout: ig.timeout || 60000, insecureHTTPParser: cfg.insecureHttpParser
+        maxTokens: ig.maxTokens || 1024, timeout: ig.timeout || 60000, insecureHTTPParser: cfg.insecureHttpParser,
+        transport: ig.transport
       });
     }
   } catch (e) {

@@ -353,6 +353,7 @@
     onChange('kb-provider', saveKb);
     onChange('kb-baseurl', saveKb);
     onChange('kb-model', saveKb);
+    onChange('kb-transport', saveKb);
     onChange('kb-auto-enabled', saveKb);
     onChange('kb-auto-threshold', saveKb);
     onChange('kb-auto-keep', saveKb);
@@ -440,6 +441,7 @@
       provider: document.getElementById('kb-provider').value,
       baseurl: document.getElementById('kb-baseurl').value,
       model: document.getElementById('kb-model').value,
+      transport: val('kb-transport', 'value', 'auto'),
       apiKey: document.getElementById('kb-key').value,
       autoEnabled: document.getElementById('kb-auto-enabled').checked,
       autoThreshold: document.getElementById('kb-auto-threshold').value,
@@ -949,6 +951,7 @@
         document.getElementById('kb-provider').value = m.provider || 'llamacpp';
         document.getElementById('kb-baseurl').value = m.baseurl || '';
         document.getElementById('kb-model').value = m.model || '';
+        setVal('kb-transport', 'value', m.transport || 'auto');
         document.getElementById('kb-auto-enabled').checked = !!m.autoEnabled;
         document.getElementById('kb-auto-threshold').value = (m.autoThreshold != null) ? m.autoThreshold : '';
         document.getElementById('kb-auto-keep').value = (m.autoKeep != null) ? m.autoKeep : '';

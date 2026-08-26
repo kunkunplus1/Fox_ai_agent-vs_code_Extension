@@ -158,7 +158,9 @@
 
 ### 6.4 执行命令与读取终端
 
-智能体可在可见的集成终端中执行命令，并实时将输出回传至模型，适用于依赖安装、构建、测试运行等场景。您也可要求智能体读取您自有终端中的输出，满足“查看终端报错”类诉求（目标终端需为当前活动终端）。
+智能体可在可见的集成终端中执行命令，并实时将输出回传至模型，适用于依赖安装、构建、测试运行等场景。您也可要求智能体读取您自有终端中的输出，满足"查看终端报错"类诉求（目标终端需为当前活动终端）。
+
+**异步执行（1.1.17 新增）**：执行命令工具支持 `bg=true` 异步模式——耗时命令（依赖安装、大构建、长测试）提交后立即返回任务号，不占用当前对话；用后台任务查询工具（`action=get` + 任务号）随时查看状态与完整输出，`action=cancel` 可取消，`action=clear` 清理已结束记录。该异步机制独立于子代理，不依赖子代理调度器。
 
 过程控制命令：**“狐狸 AI：暂停”** / **“取消”** / **“继续”**。取消会立即中断模型输出，并向正在运行的命令发送中断信号（Ctrl+C）。
 
@@ -198,7 +200,7 @@
 
 ### 6.9 知识库整理与检索
 
-- **整理**：命令 **“狐狸 AI：整理知识库”**，将散落的资料归纳为结构化节点，便于后续检索与注入。
+- **整理**：命令 **“狐狸 AI：整理知识库”**，将散落的资料归纳为结构化节点，便于后续检索与注入。整理 AI 的传输层可用 `foxAi.knowledgeBase.organize.transport` 选择 `auto` / `openai` / `anthropic`（选 anthropic 走 Messages API，自动映射 DeepSeek/智谱/Kimi 等厂商端点；环境面板「知识库 → 传输层」下拉可直接切换）。
 - **检索**：默认启用 BM25 相关度检索（中文按二元组切分），按 Top-K 取回相关内容；可设置 `foxAi.knowledgeBase.topK`（默认 10）调整召回量。
 - **向量语义检索（独立开关）**：在「环境面板 → 知识库 → 向量模型（语义检索）」分区可开启向量召回。它与「AI 整理」完全独立——只配整理模型时检索与旧版一致（纯 BM25）；同时配了向量模型时，向量先做语义召回（前置）、AI 整理继续产出笔记（在后），并可勾选「与 BM25 混合排序（RRF）」融合两种召回。支持的向量服务：Ollama、阿里百炼 `text-embedding-v4`、智谱 GLM、硅基流动、OpenAI、Gemini/Mistral/OpenRouter 兼容端点、LM Studio、llama.cpp server；DeepSeek / Kimi / Claude 暂无官方 embedding 接口，可在 `custom` 下自配兼容端点。向量密钥存于独立的 SecretStorage 键，不与整理 AI、主对话互相覆盖。任意失败都会自动回退到 BM25，不影响知识库可用性。
 - **存储位置**：知识库目录与整理结果可在设置 `foxAi.knowledgeBase.*` 中配置；向量缓存位于工作区 `.fox-ai/kb-vec.json`。
@@ -213,6 +215,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - **Playwright 快捷开关**：`foxAi.mcp.playwright.enabled`，用于后台读取网页与可访问性树。
 - **优先级**：`foxAi.mcp.priority` 可设为 `local-first` 或 `remote-first`，决定同名工具优先使用本地还是远程实现。
 - **VS Code 原生 MCP**：扩展面板会只读展示 VS Code 自身 `mcp.json` 配置的服务器（标记为“VS Code 管理”），不会误改其配置。
+- **MCP 工具可见化（1.1.17）**：工具清单检索工具 `get_tools` 现在会同时返回**已加载的 MCP 工具**（附在清单尾部）；传 `query=mcp`（或 query 含 mcp）可单独检索已加载的 MCP 工具及其参数，便于智能体在网页文本接入（WebAI2API）下也能感知到可用的 MCP 工具。
 
 ### 6.11 上下文用量面板与自动压缩
 
@@ -238,6 +241,15 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 - `foxAi.inlineCompletion.fimEndpoint`：**专用 FIM 端点开关（默认 false）**。开启后改走 DeepSeek Beta 的 `/completions` 端点。
 - `foxAi.inlineCompletion.useProjectContext` / `.projectContextChars`：是否结合项目上下文（默认 true）/ 上下文最大字符数（默认 1000）。
 - `foxAi.inlineCompletion.maxContextChars`：补全前后文（不含项目上下文）的最大字符数（**默认 6000**），超出时前文优先保留、后文裁剪。
+- `foxAi.inlineCompletion.transport`：**补全传输层（默认 auto）**。`auto` 跟随 provider（claude 走 Anthropic Messages API，其余走 OpenAI 兼容）；可强制 `openai` 或 `anthropic`（部分中转站只提供 Anthropic 格式端点）。
+- `foxAi.inlineCompletion.thinking`：**补全是否开启思考模式（默认 off）**。`on` 后按厂商注入思考参数：OpenAI 系传 `reasoning_effort`、Anthropic 传 `thinking.budget_tokens`；补全更准但更慢、更耗 token。
+- `foxAi.inlineCompletion.thinkingEffort`：**思考强度（默认 medium）**，`low` / `medium` / `high`。OpenAI 映射为 `reasoning_effort`；Anthropic 映射为 budget（2048 / 4096 / 8192，自动保证小于 maxTokens）。
+
+> 各厂商行内补全适配矩阵（依据官方文档）：
+> - **DeepSeek**：`deepseek-chat` / `deepseek-coder` 支持 FIM 补全（Beta，需 baseUrl 用 `https://api.deepseek.com/beta` 并开启 `fimEndpoint`）；**`deepseek-reasoner`（深度思考模式）官方不支持 FIM 补全**（见官方「推理模型」文档 Not Supported: FIM），开启思考时自动降级为 chat 补全，且不传 `temperature` 等无效采样参数。
+> - **OpenAI**：推理模型（o 系列 / gpt-5 系列）支持顶层 `reasoning_effort`（low/medium/high，gpt-5 另支持 minimal/xhigh/none）；行内补全无原生 FIM 端点，走 FIM token 模板（diffusion）。
+> - **Anthropic**：`thinking: {type:"enabled", budget_tokens:N}`（budget 最小 1024 且必须小于 max_tokens）；新版 Opus 4.6 推荐 `type:"adaptive"`。无 FIM 端点，走 Messages API + FIM 模板。
+> - **Gemini**：无官方 FIM 端点，走 OpenAI 兼容端点 + FIM 模板。
 
 > 提示：每次按键都会向模型发一次请求，若主模型较慢或按量计费，强烈建议把 `provider` + `model` 指向一个快模型（如 `qwen2.5-coder`、`deepseek-chat` 等）；不需要时可关闭 `enabled`。
 
@@ -254,7 +266,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 ### 6.15 多模态识图中转
 
-当主模型不支持图片理解、而对话中包含图片时，可开启多模态识图中转：由独立的视觉模型先将图片转述为文字描述，再交给主模型处理。相关设置位于 `foxAi.vision.*`（enabled / provider / baseUrl / apiKey / model / apiMode）。
+当主模型不支持图片理解、而对话中包含图片时，可开启多模态识图中转：由独立的视觉模型先将图片转述为文字描述，再交给主模型处理。相关设置位于 `foxAi.vision.*`（enabled / provider / baseUrl / apiKey / model / apiMode / **transport**）。`transport` 支持 `auto` / `openai` / `anthropic`——选 `anthropic` 后识图走 Anthropic Messages API（支持图片输入 image 块，自动映射 DeepSeek/智谱/Kimi 等厂商端点）。
 
 > 带图片的输入会跳过知识库直答、直接走智能体，确保识图中转生效；如需让 AI 生成图片，见 6.17。
 
@@ -274,7 +286,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 智能体可调用独立的生图模型生成图片（插画、海报、图标、概念图等）。生图是独立于主控模型的**第二个模型通道**，需单独配置后才生效：
 
-- **开启与配置**：设置 `foxAi.imageGen.enabled` 为 `true`，并填写 `provider` / `baseUrl` / `apiKey` / `model`（如通义万相兼容端点）。未配置时，AI 会提示“生图通道未开启”而非静默失败。
+- **开启与配置**：设置 `foxAi.imageGen.enabled` 为 `true`，并填写 `provider` / `baseUrl` / `apiKey` / `model`（如通义万相兼容端点）。未配置时，AI 会提示“生图通道未开启”而非静默失败。`transport` 支持 `auto` / `openai` / `anthropic`（默认 auto；注意 Anthropic Messages API 不输出图片，生图首选 OpenAI 兼容端点，选 anthropic 仅走文本描述）。
 - **如何触发**：用自然语言描述即可，例如“画一棵大树”“生成一张活动海报”。生图工具已设为常驻，AI 会主动调用而非用 SVG/代码替代（除非您明确要矢量图）。
 - **保存与持久化**：生成的图片在对话中展示，每张图右下角有「保存」按钮，可一键另存到本地磁盘；会话中的图片会以轻量引用存档，关闭窗口再打开也能原样恢复。
 - **结果可信**：生图结果只从约定的图片字段提取，若模型返回错误页/无关内容会明确提示“未返回可识别图片”。
@@ -304,11 +316,31 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 配套细节：
 
 - **思考过程实时可见**：开启思考后，推理过程逐字流式推送到工作链「调用模型」步骤，你随时看得到它在想什么，不用等整轮结束才一次性蹦出来。
+- **回答逐字实时输出（native 与文本协议均支持）**：正文增量到达即实时推送到主对话气泡，而非轮末一次性蹦出。文本协议下自动剥掉 `<fox:tool>` 工具调用块只推可见正文（跨块工具内容缓存至闭合后再推，不漏不重）。
 - **关闭时显式下发关闭参数**：对默认就思考的模型（尤其 DeepSeek 非 reasoner 的 `v4-flash`/`v4-pro`，走 Responses API 时默认开启思考）会主动下发 `reasoning.effort=none` 关闭思考，否则思考意识流会超长、反复规划、吃光输出预算，表现为「问一句只干一件事」「模型没有返回任何内容」。
 - **非流式自动规避思考参数**；参数不被接受时自动去掉重试；思考过程仍以可折叠卡片展示。
 - **思考链回传省 token**：多轮回放时只在「带工具调用的回合」回传思考链，纯文本回合的思考链不再回传（服务端会忽略纯文本回合的思考链，回传纯属浪费）。
 
 > 深度思考会显著增加响应时长与 token 消耗，日常问答建议保持关闭，遇到疑难 bug、架构设计、复杂推理时再临时开启。
+
+**Anthropic Messages API 全模型接入（foxAi.apiMode / foxAi.transport）**：默认各 provider 按预置协议接入（deepseek/自定义等走 OpenAI 兼容、claude 走 Anthropic Messages）。若你的中转站 / 网关只提供 **Anthropic 格式端点**（`/v1/messages`），有三种等效做法：① 在 **API 协议（`foxAi.apiMode`）里直接选 `anthropic`**——任意模型（含 deepseek/gemini/自定义等）都会改用 Anthropic Messages API 格式调用，`thinking` / 工具调用 / 流式均按 Anthropic 协议处理；② 或将 `foxAi.transport` 设为 `anthropic`；③ 在对话栏 **「选择模型服务」** 里选 **「自定义 Anthropic 兼容服务」**（`foxAi.provider = customAnthropic`）。同理，需要 OpenAI Responses API（`/v1/responses`）时可选 **「自定义 Responses 服务」**（`customResponses`）——对话栏「选择模型服务」现提供三种自定义：**自定义 OpenAI 兼容服务**（`custom`，/chat/completions）、**自定义 Responses 服务**（`customResponses`，/v1/responses）、**自定义 Anthropic 兼容服务**（`customAnthropic`，/v1/messages），选完在设置里填 baseUrl + API Key 即可，协议自动联动。行内补全同样支持 `foxAi.inlineCompletion.transport` 独立控制，知识整理可用 `foxAi.knowledgeBase.organize.transport`。
+
+**厂商 Anthropic 端点自动映射（依据官方文档）**：切到 Anthropic 协议时，扩展会按官方文档自动把下列厂商的 OpenAI 端点映射为其 Anthropic 兼容端点，**无需手动改 baseUrl**：
+
+| 服务商 | OpenAI 端点（原 baseUrl） | Anthropic 兼容端点（自动映射） |
+| --- | --- | --- |
+| DeepSeek | `https://api.deepseek.com/v1` | `https://api.deepseek.com/anthropic`（官方「Using the Anthropic API」） |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `https://open.bigmodel.cn/api/anthropic`（官方「Claude API 兼容」） |
+| Kimi / 月之暗面 | `https://api.moonshot.cn/v1` | `https://api.moonshot.cn/anthropic`（官方 Claude Code 接入文档） |
+| 硅基流动 | `https://api.siliconflow.cn/v1` | `https://api.siliconflow.cn`（官方 Claude Code 文档，base 不带 /v1） |
+| 腾讯混元 | `https://api.hunyuan.cloud.tencent.com/v1` | `https://api.hunyuan.cloud.tencent.com/anthropic`（官方 Anthropic 兼容示例） |
+| 阿里百炼 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `https://dashscope.aliyuncs.com/apps/anthropic`（官方 Claude Code 文档） |
+| MiniMax | `https://api.minimaxi.com/v1` | `https://api.minimaxi.com/anthropic`（官方开发者文档） |
+| 火山方舟 / 豆包 | `https://ark.cn-beijing.volces.com/api/v3` | `https://ark.cn-beijing.volces.com/api/coding`（官方接入三方工具文档） |
+| Anthropic 官方 | `https://api.anthropic.com/v1` | 原样（本就走 Messages） |
+| 其它中转站 / 自定义 | 自定义 | 原样 baseUrl + `/v1/messages`（需你自己确认端点支持 Anthropic 格式） |
+
+若 404 依旧，报错信息会给出对应厂商的 Anthropic 端点提示，方便排查。
 
 ### 6.19 执行步骤时间线
 

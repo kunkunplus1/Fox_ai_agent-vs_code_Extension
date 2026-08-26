@@ -153,10 +153,23 @@ async function resolve(context) {
     forceNonStream: c.get('forceNonStream', false),
     streamFormat: c.get('streamFormat', 'auto'),
     insecureHttpParser: c.get('insecureHttpParser', false),
-    transport: (PROVIDERS[id] && PROVIDERS[id].transport) || 'openai',
-    apiMode: (PROVIDERS[id] && PROVIDERS[id].transport) === 'anthropic'
-      ? 'chat'
-      : c.get('apiMode', (PROVIDERS[id] && PROVIDERS[id].apiMode) || 'chat'),
+    // 传输层协议：foxAi.transport 用户显式覆盖（openai/anthropic）> apiMode='anthropic' 联动 > provider 预置。
+    // 这样 deepseek/gemini/自定义 等任意模型都能通过 Anthropic Messages API 格式接入
+    // （适用于只提供 Anthropic 格式端点或走 Anthropic 格式网关的中转站）。
+    transport: (() => {
+      const t = c.get('transport', '');
+      if (t === 'anthropic' || t === 'openai') return t;
+      if (c.get('apiMode', '') === 'anthropic') return 'anthropic';
+      return (PROVIDERS[id] && PROVIDERS[id].transport) || 'openai';
+    })(),
+    apiMode: (() => {
+      // apiMode='anthropic' 是「API 协议下拉里的 Anthropic API 接入方式」——直接作为 anthropic 传输标记
+      const explicitMode = c.get('apiMode', '');
+      if (explicitMode === 'anthropic') return 'anthropic';
+      const t = c.get('transport', '');
+      const isAnth = t === 'anthropic' || (PROVIDERS[id] && PROVIDERS[id].transport) === 'anthropic';
+      return isAnth ? 'chat' : explicitMode || (PROVIDERS[id] && PROVIDERS[id].apiMode) || 'chat';
+    })(),
     deepThinking: {
       enabled: c.get('deepThinking.enabled', false),
       effort: c.get('deepThinking.effort', 'medium'),
@@ -170,8 +183,18 @@ async function resolve(context) {
       apiKey: inlineApiKey,
       model: inlineModel,
       meta: inlineMeta,
-      transport: 'openai',
+      // 行内补全传输层：openai（OpenAI 兼容 /chat/completions）或 anthropic（Messages API）。
+      // 默认取主 provider 的 transport；deepseek 等预置 provider 是 openai，claude 是 anthropic。
+      transport: c.get('inlineCompletion.transport', 'auto') === 'anthropic'
+        ? 'anthropic'
+        : c.get('inlineCompletion.transport', 'auto') === 'openai'
+          ? 'openai'
+          : ((PROVIDERS[inlineProvider] || {}).transport === 'anthropic' ? 'anthropic' : 'openai'),
       apiMode: 'chat',
+      // 行内补全思考模式：off（默认，最快）/ on（开启思考，更准但更慢）。
+      // DeepSeek 思考模型（deepseek-reasoner）官方不支持 FIM 补全 → 开启思考时自动降级为 chat 补全。
+      thinking: c.get('inlineCompletion.thinking', 'off'),
+      thinkingEffort: c.get('inlineCompletion.thinkingEffort', 'medium'),
       maxTokens: c.get('inlineCompletion.maxTokens', 256),
       contextLines: c.get('inlineCompletion.contextLines', 60),
       suffixLines: c.get('inlineCompletion.suffixLines', 30),
@@ -194,7 +217,12 @@ async function resolve(context) {
       apiKey: c.get('vision.apiKey', ''),
       model: c.get('vision.model', '').trim(),
       apiMode: c.get('vision.apiMode', 'chat'),
-      transport: (PROVIDERS[c.get('vision.provider', 'custom')] || {}).transport || 'openai',
+      // 传输层：用户显式配置（auto/openai/anthropic）> provider 预置。anthropic 支持图片输入（image 块）。
+      transport: (() => {
+        const t = c.get('vision.transport', 'auto');
+        if (t === 'anthropic' || t === 'openai') return t;
+        return (PROVIDERS[c.get('vision.provider', 'custom')] || {}).transport || 'openai';
+      })(),
       maxTokens: c.get('vision.maxTokens', 1024),
       timeout: c.get('vision.timeout', 30000)
     },
@@ -205,7 +233,14 @@ async function resolve(context) {
       apiKey: c.get('imageGen.apiKey', ''),
       model: c.get('imageGen.model', '').trim(),
       apiMode: c.get('imageGen.apiMode', 'chat'),
-      transport: (PROVIDERS[c.get('imageGen.provider', 'custom')] || {}).transport || 'openai',
+      // 传输层：用户显式配置（auto/openai/anthropic）> provider 预置。
+      // 注意：Anthropic Messages API 不输出图片，生图选 anthropic 会走文本描述（意义有限），
+      // 生图首选 OpenAI 兼容端点（Qwen 兼容 / 本地等）。
+      transport: (() => {
+        const t = c.get('imageGen.transport', 'auto');
+        if (t === 'anthropic' || t === 'openai') return t;
+        return (PROVIDERS[c.get('imageGen.provider', 'custom')] || {}).transport || 'openai';
+      })(),
       maxTokens: c.get('imageGen.maxTokens', 1024),
       timeout: c.get('imageGen.timeout', 60000)
     },

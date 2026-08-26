@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { UserSkillStore } = require('../src/skills');
+const { UserSkillStore, parseGitHubUrl, candidateSkillUrls, inferSkillName, normalizeSkillFile } = require('../src/skills');
 
 let pass = 0;
 let fail = 0;
@@ -149,6 +149,70 @@ check('显式 overwrite:true 允许覆盖更新', () => {
   const upd = s.create({ name: 'dup-ov', body: 'v2 更新版指导', overwrite: true });
   assert.ok(upd.ok, 'overwrite:true 应允许更新：' + upd.errors.join('; '));
   assert.ok(s.get('dup-ov').includes('v2'), '文件应被覆盖为新内容');
+});
+
+console.log('[10] GitHub 导入：URL 解析');
+check('仓库根 URL 解析', () => {
+  const r = parseGitHubUrl('https://github.com/anthropics/skills');
+  assert.strictEqual(r.type, 'repo');
+  assert.strictEqual(r.owner, 'anthropics');
+  assert.strictEqual(r.repo, 'skills');
+  assert.strictEqual(r.branch, '');
+  assert.strictEqual(r.path, '');
+});
+check('tree 子路径 URL 解析', () => {
+  const r = parseGitHubUrl('https://github.com/anthropics/skills/tree/main/skills/pdf');
+  assert.strictEqual(r.type, 'repo');
+  assert.strictEqual(r.branch, 'main');
+  assert.strictEqual(r.path, 'skills/pdf');
+});
+check('raw 文件 URL 解析', () => {
+  const r = parseGitHubUrl('https://raw.githubusercontent.com/anthropics/skills/main/skills/pdf/SKILL.md');
+  assert.strictEqual(r.type, 'raw');
+  assert.strictEqual(r.owner, 'anthropics');
+  assert.strictEqual(r.repo, 'skills');
+  assert.strictEqual(r.branch, 'main');
+  assert.strictEqual(r.path, 'skills/pdf/SKILL.md');
+});
+check('非 GitHub URL 拒绝', () => {
+  assert.strictEqual(parseGitHubUrl('https://example.com/foo'), null);
+  assert.strictEqual(parseGitHubUrl(''), null);
+});
+check('.git 后缀被去除', () => {
+  const r = parseGitHubUrl('https://github.com/foo/bar.git');
+  assert.strictEqual(r.repo, 'bar');
+});
+
+console.log('[11] GitHub 导入：候选路径与名称推断');
+check('候选路径含根/嵌套', () => {
+  const r = parseGitHubUrl('https://github.com/foo/my-skill');
+  const c = candidateSkillUrls(r);
+  assert.ok(c.includes('https://raw.githubusercontent.com/foo/my-skill/main/SKILL.md'));
+  assert.ok(c.some((u) => u.includes('/skills/my-skill/SKILL.md')));
+  assert.ok(c.some((u) => u.includes('/skill/my-skill/SKILL.md')));
+});
+check('tree 子路径优先', () => {
+  const r = parseGitHubUrl('https://github.com/foo/bar/tree/main/skills/pdf');
+  const c = candidateSkillUrls(r);
+  assert.strictEqual(c[0], 'https://raw.githubusercontent.com/foo/bar/main/skills/pdf/SKILL.md');
+});
+check('名称推断：frontmatter 优先', () => {
+  assert.strictEqual(inferSkillName('---\nname: pdf-tool\ndescription: x\n---\nbody', 'repo-fallback'), 'pdf-tool');
+});
+check('名称推断：无 frontmatter 用仓库名', () => {
+  assert.strictEqual(inferSkillName('plain markdown', 'my-repo'), 'my-repo');
+});
+
+console.log('[12] GitHub 导入：frontmatter 规范化');
+check('缺 when_to_use 自动补默认', () => {
+  const n = normalizeSkillFile('---\nname: pdf-tool\ndescription: 处理PDF\n---\n# 指导', 'pdf-tool');
+  assert.ok(n.includes('when_to_use: 用户需求与该技能描述匹配'));
+  assert.ok(n.includes('name: pdf-tool'));
+  assert.ok(n.includes('# 指导'));
+});
+check('已有 when_to_use 保留', () => {
+  const n = normalizeSkillFile('---\nname: t\ndescription: d\nwhen_to_use: 仅PDF任务\n---\nbody', 't');
+  assert.ok(n.includes('when_to_use: 仅PDF任务'));
 });
 
 console.log('\n结果：通过 ' + pass + ' / 失败 ' + fail);

@@ -84,7 +84,7 @@ async function run() {
   });
   ok('非流式 content 正确', r3.content === '已读完');
   ok('非流式 finishReason=stop', r3.finishReason === 'stop');
-  ok('请求体含 system 字段（走 Anthropic 格式）', gotBody.system === '你是助手');
+  ok('请求体含 system 字段（走 Anthropic 格式，带 cache_control 块）', Array.isArray(gotBody.system) && gotBody.system[0].type === 'text' && gotBody.system[0].text === '你是助手' && gotBody.system[0].cache_control);
   ok('请求体 messages 为 Anthropic 数组', Array.isArray(gotBody.messages) && gotBody.messages.length === 4);
   ok('非流式请求带 anthropic-version 头（bug#2 修复：此前复用 OpenAI 的 Bearer 头，Claude 非流式会 401）', gotHeaders['anthropic-version'] === '2023-06-01');
   srv.close();

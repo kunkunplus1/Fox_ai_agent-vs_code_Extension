@@ -2,6 +2,7 @@
 
 // inline.js 顶部强依赖 vscode，这里用 Module._load 拦截，注入 mock，避免加载真实扩展宿主。
 const Module = require('module');
+const assert = require('assert');
 const noop = () => {};
 
 const baseVscode = {
@@ -77,6 +78,45 @@ check('trimOverlap 去除结尾回显的光标后文本', () => eq(
   inline.trimOverlap('hello world', 'foo(', 'world'),
   'hello '
 ));
+
+// —— 深度适配：DeepSeek 思考模型判定 + thinking 参数构造（官方文档：deepseek-reasoner 不支持 FIM）——
+check('isDeepSeekReasoner 识别 deepseek-reasoner', () => {
+  assert.ok(inline.isDeepSeekReasoner('deepseek-reasoner'));
+  assert.ok(inline.isDeepSeekReasoner('deepseek-v4-pro'));
+  assert.ok(inline.isDeepSeekReasoner('DeepSeek-R1'));
+});
+check('isDeepSeekReasoner 不误判 deepseek-chat', () => {
+  assert.ok(!inline.isDeepSeekReasoner('deepseek-chat'));
+  assert.ok(!inline.isDeepSeekReasoner('deepseek-coder'));
+  assert.ok(!inline.isDeepSeekReasoner('gpt-4o'));
+});
+
+check('buildInlineExtraBody off 不注入', () => eq(
+  JSON.stringify(inline.buildInlineExtraBody({ thinking: 'off', transport: 'openai' }, 'gpt-4o')),
+  '{}'
+));
+check('buildInlineExtraBody openai+on → reasoning_effort', () => {
+  const b = inline.buildInlineExtraBody({ thinking: 'on', thinkingEffort: 'high', transport: 'openai' }, 'gpt-5');
+  assert.strictEqual(b.reasoning_effort, 'high');
+});
+check('buildInlineExtraBody openai+deepseek-reasoner 不传参数（官方无 reasoning_effort）', () => {
+  const b = inline.buildInlineExtraBody({ thinking: 'on', thinkingEffort: 'low', transport: 'openai' }, 'deepseek-reasoner');
+  assert.strictEqual(JSON.stringify(b), '{}');
+});
+check('buildInlineExtraBody anthropic+on → thinking.budget_tokens', () => {
+  const b = inline.buildInlineExtraBody({ thinking: 'on', thinkingEffort: 'medium', transport: 'anthropic', maxTokens: 8192 }, 'claude-sonnet-4');
+  assert.strictEqual(b.thinking.type, 'enabled');
+  assert.strictEqual(b.thinking.budget_tokens, 4096);
+});
+check('buildInlineExtraBody anthropic budget 恒 < maxTokens', () => {
+  // maxTokens=2048 时 high(8192) 被压到 maxTokens-1024=1024 以下，保证 Anthropic API 不报错
+  const b = inline.buildInlineExtraBody({ thinking: 'on', thinkingEffort: 'high', transport: 'anthropic', maxTokens: 2048 }, 'claude-sonnet-4');
+  assert.ok(b.thinking.budget_tokens < 2048, 'budget 必须 < maxTokens，实际=' + b.thinking.budget_tokens);
+});
+check('buildInlineExtraBody anthropic 默认 openai transport 时按 openai 处理', () => {
+  const b = inline.buildInlineExtraBody({ thinking: 'on', thinkingEffort: 'low', transport: 'openai' }, 'gpt-5');
+  assert.strictEqual(b.reasoning_effort, 'low');
+});
 
 // —— 异步单测：fimCompleteOnce 专用 FIM 端点（DeepSeek Beta /completions）——
 const asyncChecks = [];

@@ -68,7 +68,7 @@ const TOOLS = [
         pattern: { type: 'string', description: 'glob 模式' },
         scope: { type: 'string', enum: ['workspace', 'global'], description: '搜索范围：workspace=当前工作区（默认），global=全电脑' },
         root: { type: 'string', description: '全局搜索时起始于哪个目录，默认用户主目录' },
-        max_results: { type: 'integer', description: '最多返回多少条，默认 60' }
+        max_results: { type: 'integer', description: '最多返回多少条。1.1.17 起默认 200、上限 2000（电脑内搜索一次能拿更多，不再「搜不到几个」）。' }
       },
       required: ['pattern']
     },
@@ -87,7 +87,7 @@ const TOOLS = [
         scope: { type: 'string', enum: ['workspace', 'global'], description: '搜索范围：workspace=当前工作区（默认），global=全电脑' },
         root: { type: 'string', description: '全局搜索时起始于哪个目录，默认用户主目录' },
         is_regex: { type: 'boolean', description: 'query 是否为正则，默认 false' },
-        max_results: { type: 'integer', description: '最多返回多少条，默认 40' }
+        max_results: { type: 'integer', description: '最多返回多少条。1.1.17 起默认 80、上限 500。' }
       },
       required: ['query']
     },
@@ -98,7 +98,7 @@ const TOOLS = [
     kind: 'read',
     title: (a) => `查询工具清单（${a.query || '全部'}）`,
     description:
-      '查询当前可用的工具列表、参数与调用格式。**开始任何任务前，第一步必须调用本工具**获取工具清单；之后也可随时用 query 按关键词检索（如"文件""搜索""记忆""执行命令"）。detail="full" 返回完整参数说明，默认 brief（名称+描述+必填参数+调用示例）。本工具返回的内容里会附每个工具的 <foxtool> 调用示例，请严格照抄格式。',
+      '查询当前可用的工具列表、参数与调用格式。**开始任何任务前，第一步必须调用本工具**获取工具清单；之后也可随时用 query 按关键词检索（如"文件""搜索""记忆""执行命令"）。detail="full" 返回完整参数说明，默认 brief（名称+描述+必填参数+调用示例）。本工具返回的内容里会附每个工具的 <foxtool> 调用示例，请严格照抄格式。**已加载的 MCP 工具也会附在清单尾部**：传 query=mcp（或 query 里含 mcp）单独检索。',
     parameters: {
       type: 'object',
       properties: {
@@ -109,20 +109,49 @@ const TOOLS = [
     run: (a) => {
       const q = String((a && a.query) || '').trim();
       const detail = (a && a.detail) === 'full' ? 'full' : 'brief';
+      const lq = q.toLowerCase();
       let list = TOOLS;
-      if (q) {
-        const lq = q.toLowerCase();
-        list = TOOLS.filter((t) => {
-          const props = (t.parameters && t.parameters.properties) || {};
-          const hay = (t.name + ' ' + (t.description || '') + ' ' + Object.keys(props).join(' ')).toLowerCase();
-          return hay.includes(lq);
-        });
-      }
-      if (!list.length) {
-        return `没有匹配「${q}」的工具。全部可用工具：${TOOLS.map((t) => t.name).join('、')}`;
+      if (q) list = TOOLS.filter((t) => {
+        const props = (t.parameters && t.parameters.properties) || {};
+        const hay = (t.name + ' ' + (t.description || '') + ' ' + Object.keys(props).join(' ')).toLowerCase();
+        return hay.includes(lq);
+      });
+
+      // 已加载的 MCP 工具：query=mcp 或 query 为空时并入结果尾部（不占本地条数）
+      let mcpLines = [];
+      try {
+        const cached = mcp.getCachedTools && mcp.getCachedTools();
+        if (Array.isArray(cached) && cached.length) {
+          const mcpList = !q || lq === 'mcp' || lq === 'mcp工具' || lq.includes('mcp')
+            ? cached
+            : cached.filter((t) => {
+                const hay = (t.name + ' ' + (t.description || '')).toLowerCase();
+                return hay.includes(lq);
+              });
+          if (mcpList.length) {
+            mcpLines = mcpList.map((t) => {
+              const name = t.name || (t.remoteName ? 'mcp__' + t.remoteName : '?');
+              const desc = (t.description || '').slice(0, 160);
+              const params = (t.inputSchema && t.inputSchema.properties) ? Object.keys(t.inputSchema.properties) : [];
+              const brief = `【MCP 工具】${name}\n描述：${desc || '（无描述）'}` +
+                (params.length ? `\n参数：${params.join('、')}` : '');
+              return detail === 'full' ? brief + `\n调用示例：<foxtool name="${name}">\n{"参数名": "参数值"}\n</foxtool>` : brief;
+            });
+          }
+        }
+      } catch (_) {}
+
+      if (!list.length && !mcpLines.length) {
+        const allNames = TOOLS.map((t) => t.name).join('、') +
+          (mcpLines.length ? '' : '');
+        return `没有匹配「${q}」的工具。全部可用工具：${allNames}。也试试 query=mcp 看已加载的 MCP 工具。`;
       }
       const lines = list.map((t) => renderToolGuideLine(t, detail));
-      return `共 ${list.length} 个工具（每条附 <foxtool> 调用示例，严格照抄格式）：\n\n` + lines.join('\n\n') +
+      let body = `共 ${list.length} 个工具（每条附 <foxtool> 调用示例，严格照抄格式）：\n\n` + lines.join('\n\n');
+      if (mcpLines.length) {
+        body += `\n\n【已加载 MCP 工具 ${mcpLines.length} 个】\n` + mcpLines.join('\n\n');
+      }
+      return body +
         '\n\n【调用格式】\n<foxtool name="工具名">\n{"参数名": "参数值"}\n</foxtool>\n写完 </foxtool> 后立即停止输出，等待工具结果。';
     }
   },
@@ -186,13 +215,14 @@ const TOOLS = [
     kind: 'exec',
     title: (a) => `执行 ${a.command || ''}`,
     description:
-      '在 VS Code 集成终端里执行 shell 命令并返回输出与退出码，用于安装依赖、构建、跑测试等。命令必须非交互（自带 -y 等参数），不要用会一直挂起的命令（如 npm run dev 长期驻留服务）。',
+      '在 VS Code 集成终端里执行 shell 命令并返回输出与退出码，用于安装依赖、构建、跑测试等。命令必须非交互（自带 -y 等参数），不要用会一直挂起的命令（如 npm run dev 长期驻留服务）。\n\n**异步模式**：传 bg=true 会立即提交后台任务并返回任务号（不阻塞当前对话），用 background_jobs action=get + id 随时查状态与完整输出，action=cancel 可取消。适合安装依赖、大构建、长测试这类耗时命令；同步等结果最多等到该模型配置的 commandTimeout。',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的完整命令' },
         cwd: { type: 'string', description: '工作目录，默认工作区根目录' },
-        explanation: { type: 'string', description: '一句话说明为什么要跑这条命令' }
+        explanation: { type: 'string', description: '一句话说明为什么要跑这条命令' },
+        bg: { type: 'boolean', description: 'true=异步后台执行，立刻返回任务号不阻塞；默认 false（同步等结果）' }
       },
       required: ['command']
     },
@@ -395,6 +425,31 @@ const TOOLS = [
         return a.query ? `没找到与「${a.query}」相关的记忆` : '还没有任何长期记忆';
       }
       return out.join('\n');
+    }
+  },
+  {
+    name: 'import_skill',
+    kind: 'edit',
+    title: (a) => `导入技能 ${a.url ? a.url.slice(0, 40) : ''}`,
+    description:
+      '从 GitHub 下载并导入一个 Agent Skill 到用户技能目录（user-skills/），导入后可用 use_skill 激活。支持两种链接：① 仓库页 https://github.com/{owner}/{repo}（自动在仓库根 / skills/<repo>/ / skill/<repo>/ 等常见位置找 SKILL.md）；② raw 文件 https://raw.githubusercontent.com/{owner}/{repo}/{branch}/…/SKILL.md（直接下载该文件）。SKILL.md 需是标准格式（--- YAML frontmatter：name/description--- + Markdown 指导正文）；缺 when_to_use 会自动补默认值。若仓库同目录有 run.js 会一并导入（含 node --check 校验）。导入前请先向用户确认要导入的仓库来源可信。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'GitHub 仓库页 URL 或 raw SKILL.md URL（仅支持 github.com / raw.githubusercontent.com）' },
+        name: { type: 'string', description: '可选，自定义技能名（默认取 SKILL.md frontmatter 的 name，缺失则取仓库名）' }
+      },
+      required: ['url']
+    },
+    run: async (a, c) => {
+      const store = c && c.skills;
+      if (!store) return '技能存储不可用';
+      const res = await store.importFromUrl(a.url, { name: a.name });
+      if (!res.ok) return '技能导入失败：\n' + res.errors.join('\n') + '\n（可改用 raw 文件链接，或先用 list_skills 确认是否已导入）';
+      let msg = `技能「${res.name}」已从 GitHub 导入并验证通过，路径：${res.path}`;
+      if (res.scriptNote) msg += '\n' + res.scriptNote;
+      msg += '\n后续可用 use_skill 激活它。';
+      return msg;
     }
   },
   {

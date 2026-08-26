@@ -47,7 +47,6 @@
   "没有匹配的 MCP 工具": "No matching MCP tools",
   "↑↓ 选择，Enter 让狐狸 AI 调用，Esc 关闭": "↑↓ to select, Enter to let Fox AI call, Esc to close",
   "正在加载 MCP 工具…": "Loading MCP tools…",
-  "⚙️ 存储": "⚙️ Storage",
   "确认": "Confirm",
   "📋 项目任务清单": "📋 Project Tasks",
   "📊 上下文用量": "📊 Context Usage",
@@ -167,7 +166,6 @@
   "选择目录失败：{0}": "Failed to select directory: {0}",
   "续跑失败：{0}": "Resume failed: {0}",
   "确定删除任务「{0}」吗？此操作不可恢复。": "Delete task \"{0}\"? This cannot be undone.",
-  "已删除任务：{0}": "Deleted task: {0}",
   "没有已完成的任务可清理": "No completed tasks to clear",
   "确定清理 {0} 条已完成的任务吗？此操作不可恢复。": "Clear {0} completed tasks? This cannot be undone.",
   "已清理 {0} 条完成任务": "Cleared {0} completed tasks",
@@ -216,5 +214,6 @@
   "🧠 思考: 关": "🧠 Think: off",
   "深度思考：左键开关，右键选强度（low / medium / high）": "Deep thinking: left-click to toggle, right-click to pick effort (low / medium / high)",
   "深度思考已开启（强度 {0}）：模型先推理再作答。左键关闭，右键改强度": "Deep thinking is ON (effort {0}): the model reasons before answering. Left-click to turn off, right-click to change effort.",
-  "深度思考已关闭：模型直接作答。左键开启，右键选强度": "Deep thinking is OFF: the model answers directly. Left-click to turn on, right-click to pick effort."
+  "深度思考已关闭：模型直接作答。左键开启，右键选强度": "Deep thinking is OFF: the model answers directly. Left-click to turn on, right-click to pick effort.",
+  "⚙️ 存储": "⚙️ Storage"
 }

@@ -302,7 +302,9 @@
     let changed = false;
     // 后端 buildSourcesText 生成「[n] 标题\nURL: url\n摘要」；这里把摘要（snippet）也一并收割，
     // 让引用浮窗能展示来源内容摘要（参考 DSH WebSource.snippet），而不只是标题 + 链接。
-    const re = /^[ \t]*(?:\[\^?(\d+)\^?\][ \t]*)?(.+?)[ \t]*\r?\n[ \t]*(?:URL|url|链接|网址)[:：][ \t]*(https?:\/\/\S+)(?:[ \t]*\r?\n[ \t]*([^\r\n]+))?/gm;
+    // 摘要组负向前瞻：禁止以 [n] / [^n] 编号开头（否则会把下一条的标题行贪吃成摘要，
+    // 导致无正文的多条目列表只收割到第一条）。正文本身以纯数字/文字开头不受影响。
+    const re = /^[ \t]*(?:\[\^?(\d+)\^?\][ \t]*)?(.+?)[ \t]*\r?\n[ \t]*(?:URL|url|链接|网址)[:：][ \t]*(https?:\/\/\S+)(?:[ \t]*\r?\n[ \t]*((?!\[\^?\d+\^?\])[^\r\n]+))?/gm;
     let m;
     while ((m = re.exec(s))) {
       const num = m[1] ? Number(m[1]) : 0;
@@ -2152,7 +2154,7 @@
   function applyStatus(msg) {
     if (msg.provider) $('providerName').textContent = msg.provider;
     if (msg.model) $('modelName').textContent = msg.model;
-    if (msg.apiMode) apiModeChip.textContent = t(msg.apiMode === 'responses' ? '协议: Responses' : '协议: Chat');
+    if (msg.apiMode) apiModeChip.textContent = t(msg.apiMode === 'responses' ? '协议: Responses' : msg.apiMode === 'anthropic' ? '协议: Anthropic' : '协议: Chat');
 
     if (thinkChip && msg.deepThinking !== undefined) {
       const on = !!msg.deepThinking;
@@ -2165,9 +2167,18 @@
         : t('深度思考已关闭：模型直接作答。左键开启，右键选强度');
     }
 
-    agentChip.textContent = msg.agent ? t('智能体') : t('纯问答');
+    // Agent 模式芯片：显示当前模式名（编码/架构/排错/问答），或纯问答
+    const MODE_LABELS = { code: '🦊 编码', architect: '📐 架构', debug: '🔍 排错', ask: '💬 问答' };
+    if (msg.agent) {
+      agentChip.textContent = t(MODE_LABELS[msg.mode] || (msg.mode ? '模式: ' + msg.mode : '智能体'));
+    } else {
+      agentChip.textContent = t('纯问答');
+    }
     agentChip.classList.toggle('on', !!msg.agent);
     agentChip.classList.toggle('off', !msg.agent);
+    agentChip.title = msg.agent
+      ? t('当前模式：{0}。点此切换模式（编码 / 架构 / 排错 / 问答 / 纯问答）', MODE_LABELS[msg.mode] || msg.mode || '编码')
+      : t('当前为纯问答（未启用智能体）。点此切换模式');
 
     if (msg.approve) {
       approveLevel = msg.approve;

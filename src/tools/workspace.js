@@ -563,12 +563,12 @@ const GLOBAL_SKIP_DIRS = new Set([
   'coverage', '.nuxt', '.output', '.cache', 'vendor'
 ]);
 
-/** 使用 Node.js fs 在指定根目录下按 glob 查找文件 */
+/** 使用 Node.js fs 在指定根目录下按 glob 查找文件（全电脑模式：深度加深到 14） */
 async function findFilesGlobal(root, pattern, max) {
   const results = [];
   const re = globToRegex(pattern);
   const rootAbs = path.resolve(root);
-  const maxDepth = 8;
+  const maxDepth = 14;
 
   async function walk(dir, depth) {
     if (depth > maxDepth || results.length >= max) return;
@@ -607,28 +607,44 @@ function globalSearchRoot(args) {
 
 async function findFiles(args) {
   const pattern = String(args.pattern || '**/*').trim();
-  const max = Math.min(200, parseInt(args.max_results, 10) || 60);
+  // 1.1.17：一次搜索量加大——电脑内默认 200、上限 2000（原来默认 60/上限 200，经常「搜不到几个」）
+  const max = Math.min(2000, parseInt(args.max_results, 10) || 200);
   const scope = args.scope || 'workspace';
   const isGlobal = scope === 'global' || path.isAbsolute(pattern);
 
+  let list;
   if (isGlobal) {
     const root = globalSearchRoot(args);
-    const files = await findFilesGlobal(root, pattern, max);
-    if (!files.length) return `在 ${root} 下没有匹配 ${pattern} 的文件`;
-    return `在 ${root} 匹配 ${pattern} 的文件（${files.length} 个）：\n` + files.join('\n');
+    list = await findFilesGlobal(root, pattern, max);
+    if (!list.length) return `在 ${root} 下没有匹配 ${pattern} 的文件。可试试更宽的模式（如 **/*.txt）或换 root 起始目录。`;
+    const loc = locHint(list.length, pattern);
+    return `在 ${root} 匹配 ${pattern} 的文件（${list.length} 个）：\n` + list.join('\n') + loc;
   }
 
   const exclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.venv/**,**/__pycache__/**}';
   const uris = await vscode.workspace.findFiles(pattern, exclude, max);
-  if (!uris.length) return `没有匹配 ${pattern} 的文件`;
-  return `匹配 ${pattern} 的文件（${uris.length} 个）：\n` + uris.map((u) => relative(u)).join('\n');
+  if (!uris.length) return `没有匹配 ${pattern} 的文件。可试试更宽的模式或去掉排除目录。`;
+  list = uris.map((u) => relative(u));
+  return `匹配 ${pattern} 的文件（${list.length} 个）：\n` + list.join('\n') + locHint(list.length, pattern);
+}
+
+/** 搜索完成后的定位提示：告诉模型怎么把结果落成「具体文件定位」 */
+function locHint(count, pattern) {
+  const lines = [];
+  if (count >= 200) {
+    lines.push(`\n\n【定位提示】结果较多（≥200），建议先用 open_file / read_file 定位前几个确认路径正确，再用更窄的 pattern（如 src/**/*.js、**/package.json）缩小范围。`);
+  } else {
+    lines.push(`\n\n【定位提示】以上路径均为绝对/工作区相对路径，可直接 open_file / read_file 打开定位；若需进一步缩小，可用 search_text 在指定目录或用更精确的 glob 再搜。`);
+  }
+  return lines.join('\n');
 }
 
 async function searchText(args) {
   const query = String(args.query || '');
   if (!query) throw new Error('query 不能为空');
   const glob = String(args.glob || '**/*');
-  const max = Math.min(120, parseInt(args.max_results, 10) || 40);
+  // 1.1.17：搜索量加大——默认 80、上限 500（原来 40/120，电脑内搜文本经常不够）
+  const max = Math.min(500, parseInt(args.max_results, 10) || 80);
   const isRegex = !!args.is_regex;
   const scope = args.scope || 'workspace';
   const isGlobal = scope === 'global' || path.isAbsolute(glob);
@@ -671,7 +687,8 @@ async function searchText(args) {
       }
     }
     if (!hits.length) return `在 ${root} 下没找到「${query}」`;
-    return `在 ${root} 搜索「${query}」共 ${hits.length} 条：\n` + hits.join('\n');
+    return `在 ${root} 搜索「${query}」共 ${hits.length} 条：\n` + hits.join('\n') +
+      `\n\n【定位提示】每条是「文件路径:行号: 命中行」，用 read_file 直接定位到对应文件+行（参数 path 填冒号前的路径，start_line 填行号）；若想继续缩小范围，可加 glob 限定文件类型再搜。`;
   }
 
   const exclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.venv/**,**/__pycache__/**,**/*.min.*}';
@@ -710,7 +727,8 @@ async function searchText(args) {
     }
   }
   if (!hits.length) return `没找到「${query}」`;
-  return `搜索「${query}」共 ${hits.length} 条：\n` + hits.join('\n');
+  return `搜索「${query}」共 ${hits.length} 条：\n` + hits.join('\n') +
+    `\n\n【定位提示】每条是「相对路径:行号: 命中行」，用 read_file 直接定位（path 填冒号前的路径、start_line 填行号）；也可加 glob 限定文件类型（如 *.js）再搜缩小范围。`;
 }
 
 async function deleteFile(args, ctx) {

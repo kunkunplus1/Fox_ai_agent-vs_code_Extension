@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.15",
+  "version": "1.1.17",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -415,7 +415,8 @@
       },
       {
         "id": "foxAi.storageSubmenu",
-        "label": "存储"
+        "label": "存储",
+        "icon": "$(database)"
       }
     ],
     "menus": {
@@ -595,7 +596,9 @@
               "siliconflow",
               "openrouter",
               "webai2api",
-              "custom"
+              "custom",
+              "customResponses",
+              "customAnthropic"
             ],
             "enumDescriptions": [
               "本地 llama.cpp server（默认 http://127.0.0.1:8080/v1）",
@@ -608,7 +611,9 @@
               "硅基流动 SiliconFlow",
               "OpenRouter",
               "WebAI2API（网页版安全接入）",
-              "自定义 OpenAI 兼容服务"
+              "自定义 OpenAI 兼容服务",
+              "自定义 OpenAI Responses 服务（/v1/responses，原生函数调用与推理增量；OpenAI 官方或 DeepSeek v4 等）",
+              "自定义 Anthropic Messages 兼容服务（/v1/messages，自动映射 DeepSeek/智谱/Kimi 等厂商端点）"
             ],
             "description": "%foxai.n117%"
           },
@@ -768,10 +773,31 @@
             "type": "string",
             "enum": [
               "chat",
-              "responses"
+              "responses",
+              "anthropic"
             ],
             "default": "chat",
-            "markdownDescription": "API protocol. chat = OpenAI-compatible /chat/completions (default, works with all providers). responses = OpenAI Responses API (/v1/responses, native function calling and reasoning deltas), supported by OpenAI official and DeepSeek (deepseek-v4-flash; see api-docs.deepseek.com). Selecting the openai provider defaults to responses. Other third-party services (Zhipu, Ollama, LM Studio, etc.) may not implement /responses; forcing it on an unsupported endpoint will error."
+            "enumDescriptions": [
+              "OpenAI 兼容 /chat/completions（默认，所有服务商通用）",
+              "OpenAI Responses API（/v1/responses，原生 function calling 与推理流，OpenAI 官方与 DeepSeek v4-flash 支持）",
+              "Anthropic Messages API（/v1/messages，任意模型均可经 Anthropic 格式接入；适用于走 Anthropic 格式端点/网关的中转站，自动开启 thinking 与工具调用）"
+            ],
+            "markdownDescription": "API 协议。chat = OpenAI 兼容 /chat/completions（默认，所有服务商通用）；responses = OpenAI Responses API（/v1/responses，原生 function calling 与推理 deltas，OpenAI 官方与 DeepSeek deepseek-v4-flash 支持）；anthropic = Anthropic Messages API（/v1/messages，任意模型可经 Anthropic 格式接入，适用于只提供 Anthropic 格式端点/网关的中转站；等价于将 foxAi.transport 设为 anthropic）。"
+          },
+          "foxAi.transport": {
+            "type": "string",
+            "enum": [
+              "",
+              "openai",
+              "anthropic"
+            ],
+            "default": "",
+            "enumDescriptions": [
+              "自动（跟随 provider 预置：deepseek/自定义等走 OpenAI 兼容，claude 走 Anthropic Messages API）",
+              "强制 OpenAI 兼容 /chat/completions",
+              "强制 Anthropic Messages API（任意模型均可通过 Anthropic 格式接入，适用于只提供 Anthropic 格式端点或网关的中转站）"
+            ],
+            "markdownDescription": "传输层协议覆盖：留空自动跟随 provider；选 anthropic 后，当前 provider（含 deepseek/gemini/自定义等）都会改用 Anthropic Messages API 格式（/v1/messages），需要对应端点为 Anthropic 兼容格式。"
           },
           "foxAi.deepThinking.enabled": {
             "type": "boolean",
@@ -851,9 +877,19 @@
                 "type": "array",
                 "items": {
                   "type": "string",
-                  "enum": ["timeout", "connection", "serverError", "rateLimit", "emptyResponse"]
+                  "enum": [
+                    "timeout",
+                    "connection",
+                    "serverError",
+                    "rateLimit",
+                    "emptyResponse"
+                  ]
                 },
-                "default": ["timeout", "connection", "serverError"],
+                "default": [
+                  "timeout",
+                  "connection",
+                  "serverError"
+                ],
                 "markdownDescription": "触发切换的错误类型：timeout=超时；connection=连接失败/拒绝/DNS；serverError=服务端 5xx；rateLimit=限流 429；emptyResponse=主模型返回空。"
               },
               "maxRetries": {
@@ -867,11 +903,31 @@
                 "items": {
                   "type": "object",
                   "properties": {
-                    "name": { "type": "string", "default": "", "markdownDescription": "备用模型别名（仅用于日志/提示，可留空）。" },
-                    "baseUrl": { "type": "string", "default": "", "markdownDescription": "备用端点，如 http://127.0.0.1:8080/v1（本地）或 https://api.xxx/v1（云端）。" },
-                    "apiKey": { "type": "string", "default": "", "markdownDescription": "云端备用模型 API Key；本地模型留空。" },
-                    "model": { "type": "string", "default": "", "markdownDescription": "备用模型名（如 qwen2.5:7b / gpt-4o）。" },
-                    "local": { "type": "boolean", "default": false, "markdownDescription": "true=本地模型（不发送 apiKey）；false=云端（需 apiKey）。" }
+                    "name": {
+                      "type": "string",
+                      "default": "",
+                      "markdownDescription": "备用模型别名（仅用于日志/提示，可留空）。"
+                    },
+                    "baseUrl": {
+                      "type": "string",
+                      "default": "",
+                      "markdownDescription": "备用端点，如 http://127.0.0.1:8080/v1（本地）或 https://api.xxx/v1（云端）。"
+                    },
+                    "apiKey": {
+                      "type": "string",
+                      "default": "",
+                      "markdownDescription": "云端备用模型 API Key；本地模型留空。"
+                    },
+                    "model": {
+                      "type": "string",
+                      "default": "",
+                      "markdownDescription": "备用模型名（如 qwen2.5:7b / gpt-4o）。"
+                    },
+                    "local": {
+                      "type": "boolean",
+                      "default": false,
+                      "markdownDescription": "true=本地模型（不发送 apiKey）；false=云端（需 apiKey）。"
+                    }
                   }
                 }
               }
@@ -925,7 +981,12 @@
           "foxAi.modes.current": {
             "type": "string",
             "default": "code",
-            "enum": ["code", "architect", "ask", "debug"],
+            "enum": [
+              "code",
+              "architect",
+              "ask",
+              "debug"
+            ],
             "enumDescriptions": [
               "编码：读写代码、跑命令、改 bug，全权限（默认）",
               "架构：只做方案与设计，只能写文档类文件，不改代码、不跑命令",
@@ -966,13 +1027,17 @@
           },
           "foxAi.autoMode.allow": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "default": [],
             "markdownDescription": "工具名白名单，命中即自动放行（零 LLM 开销）。例如 [\"read_file\",\"get_diagnostics\"]。"
           },
           "foxAi.autoMode.deny": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "default": [],
             "markdownDescription": "工具名黑名单，命中即拒绝。例如 [\"delete_file\",\"run_command\"]。"
           }
@@ -989,7 +1054,11 @@
           "foxAi.bestOfN.judge": {
             "type": "string",
             "default": "length",
-            "enum": ["length", "llm", "first"],
+            "enum": [
+              "length",
+              "llm",
+              "first"
+            ],
             "enumDescriptions": [
               "按有效内容长度挑最长且非空者（默认，零额外调用）",
               "用主模型当评委挑最优（更准，但多一次 LLM 调用）",
@@ -1080,13 +1149,21 @@
           "foxAi.headless.apiMode": {
             "type": "string",
             "default": "",
-            "enum": ["", "chat", "responses"],
+            "enum": [
+              "",
+              "chat",
+              "responses"
+            ],
             "markdownDescription": "Headless 协议：chat=OpenAI /chat/completions，responses=OpenAI Responses API（留空继承）。"
           },
           "foxAi.headless.transport": {
             "type": "string",
             "default": "",
-            "enum": ["", "openai", "anthropic"],
+            "enum": [
+              "",
+              "openai",
+              "anthropic"
+            ],
             "markdownDescription": "Headless 传输：openai=OpenAI 兼容，anthropic=原生 Messages 协议（留空继承）。"
           },
           "foxAi.headless.temperature": {
@@ -1142,6 +1219,21 @@
             ],
             "default": "chat",
             "description": "%foxai.n143%"
+          },
+          "foxAi.vision.transport": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "openai",
+              "anthropic"
+            ],
+            "default": "auto",
+            "enumDescriptions": [
+              "跟随 provider 默认传输层",
+              "OpenAI 兼容 /chat/completions",
+              "Anthropic Messages API（支持图片输入 image 块，自动映射厂商端点）"
+            ],
+            "markdownDescription": "多模态识图中转模型的传输层协议：默认 auto 跟随 provider；可选强制 anthropic（任意模型可经 Anthropic 格式识图，自动映射 DeepSeek/智谱/Kimi 等厂商端点）。"
           }
         }
       },
@@ -1181,6 +1273,21 @@
             ],
             "default": "chat",
             "description": "%foxai.n150%"
+          },
+          "foxAi.imageGen.transport": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "openai",
+              "anthropic"
+            ],
+            "default": "auto",
+            "enumDescriptions": [
+              "跟随 provider 默认传输层",
+              "OpenAI 兼容 /chat/completions（生图首选，Qwen 兼容/本地等）",
+              "Anthropic Messages API（注意：Anthropic 不输出图片，选此项只走文本描述，意义有限）"
+            ],
+            "markdownDescription": "生图模型传输层协议：默认 auto 跟随 provider；生图首选 OpenAI 兼容端点（Anthropic Messages 不输出图片，选 anthropic 仅走文本描述）。"
           },
           "foxAi.imageGen.maxTokens": {
             "type": "number",
@@ -1358,7 +1465,9 @@
               "moonshot",
               "siliconflow",
               "openrouter",
-              "custom"
+              "custom",
+              "customResponses",
+              "customAnthropic"
             ],
             "order": 13,
             "description": "%foxai.n178%"
@@ -1374,6 +1483,21 @@
             "default": "",
             "order": 15,
             "description": "%foxai.n180%"
+          },
+          "foxAi.knowledgeBase.organize.transport": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "openai",
+              "anthropic"
+            ],
+            "default": "auto",
+            "enumDescriptions": [
+              "跟随 provider 默认传输层",
+              "OpenAI 兼容 /chat/completions",
+              "Anthropic Messages API（自动映射 DeepSeek/智谱/Kimi 等厂商端点）"
+            ],
+            "markdownDescription": "知识整理/压缩模型传输层协议：默认 auto 跟随 provider；可选强制 anthropic（任意模型可经 Anthropic 格式整理知识，自动映射厂商 Anthropic 兼容端点）。"
           },
           "foxAi.knowledgeBase.organize.prompt": {
             "type": "string",
@@ -1425,7 +1549,19 @@
           "foxAi.knowledgeBase.embedding.provider": {
             "type": "string",
             "default": "ollama",
-            "enum": ["ollama", "llamacpp", "lmstudio", "dashscope", "zhipu", "siliconflow", "openai", "gemini", "mistral", "openrouter", "custom"],
+            "enum": [
+              "ollama",
+              "llamacpp",
+              "lmstudio",
+              "dashscope",
+              "zhipu",
+              "siliconflow",
+              "openai",
+              "gemini",
+              "mistral",
+              "openrouter",
+              "custom"
+            ],
             "description": "向量模型服务类型：Ollama 走原生 /api/embed，其余（含阿里百炼 text-embedding-v4）走 OpenAI 兼容 /v1/embeddings。DeepSeek、Kimi(claude)、Claude 暂无官方 embedding 接口，可在 custom 下自配兼容端点。"
           },
           "foxAi.knowledgeBase.embedding.baseUrl": {
@@ -1494,7 +1630,9 @@
               "moonshot",
               "siliconflow",
               "openrouter",
-              "custom"
+              "custom",
+              "customResponses",
+              "customAnthropic"
             ],
             "enumDescriptions": [
               "使用当前对话模型",
@@ -1507,7 +1645,9 @@
               "Kimi",
               "硅基流动",
               "OpenRouter",
-              "自定义 OpenAI 兼容服务"
+              "自定义 OpenAI 兼容服务",
+              "自定义 OpenAI Responses 服务（/v1/responses，原生函数调用与推理增量；OpenAI 官方或 DeepSeek v4 等）",
+              "自定义 Anthropic Messages 兼容服务（/v1/messages，自动映射 DeepSeek/智谱/Kimi 等厂商端点）"
             ],
             "description": "%foxai.n192%"
           },
@@ -1968,6 +2108,52 @@
             "order": 0,
             "description": "%foxai.n249%"
           },
+          "foxAi.inlineCompletion.transport": {
+            "type": "string",
+            "default": "auto",
+            "order": 0,
+            "enum": [
+              "auto",
+              "openai",
+              "anthropic"
+            ],
+            "enumDescriptions": [
+              "跟随 provider 默认传输层（deepseek/自定义等走 OpenAI 兼容，claude 走 Anthropic Messages API）",
+              "强制走 OpenAI 兼容 /chat/completions",
+              "强制走 Anthropic Messages API（适用于走 Anthropic 格式的中转站/网关）"
+            ],
+            "markdownDescription": "行内补全使用的传输层协议。默认 `auto` 跟随所选 provider；可选强制 `openai` 或 `anthropic`（部分中转站只提供 Anthropic 格式端点）。"
+          },
+          "foxAi.inlineCompletion.thinking": {
+            "type": "string",
+            "default": "off",
+            "order": 0,
+            "enum": [
+              "off",
+              "on"
+            ],
+            "enumDescriptions": [
+              "关闭思考模式（默认，最快）",
+              "开启思考模式（补全更准但更慢；DeepSeek 思考模型不支持 FIM，会自动降级为 chat 补全）"
+            ],
+            "markdownDescription": "行内补全是否开启思考/推理模式。`off` 最快；`on` 对 OpenAI 传 `reasoning_effort`、对 Anthropic 传 `thinking.budget_tokens`。注意：DeepSeek 深度思考模型（deepseek-reasoner）官方不支持 FIM 补全，开启后自动改用 chat 补全。"
+          },
+          "foxAi.inlineCompletion.thinkingEffort": {
+            "type": "string",
+            "default": "medium",
+            "order": 0,
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "enumDescriptions": [
+              "低强度（OpenAI reasoning_effort=low / Anthropic budget 2048）",
+              "中强度（OpenAI reasoning_effort=medium / Anthropic budget 4096）",
+              "高强度（OpenAI reasoning_effort=high / Anthropic budget 8192）"
+            ],
+            "markdownDescription": "行内补全思考强度（仅 thinking=on 时生效）：OpenAI 映射为 `reasoning_effort`，Anthropic 映射为 `thinking.budget_tokens`（low=2048 / medium=4096 / high=8192，均需小于 maxTokens）。"
+          },
           "foxAi.inlineCompletion.provider": {
             "type": "string",
             "default": "",
@@ -1983,7 +2169,9 @@
               "moonshot",
               "siliconflow",
               "openrouter",
-              "custom"
+              "custom",
+              "customResponses",
+              "customAnthropic"
             ],
             "enumDescriptions": [
               "跟随主对话模型（默认）",
@@ -1996,7 +2184,9 @@
               "月之暗面 Kimi",
               "硅基流动 SiliconFlow",
               "OpenRouter",
-              "自定义 OpenAI 兼容服务"
+              "自定义 OpenAI 兼容服务",
+              "自定义 OpenAI Responses 服务（/v1/responses，原生函数调用与推理增量；OpenAI 官方或 DeepSeek v4 等）",
+              "自定义 Anthropic Messages 兼容服务（/v1/messages，自动映射 DeepSeek/智谱/Kimi 等厂商端点）"
             ],
             "description": "%foxai.n265%"
           },

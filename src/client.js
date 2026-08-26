@@ -216,21 +216,27 @@ function buildInlineSourcesText(text, queries) {
  *  - DeepSeek Chat：usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
  *  - Anthropic：usage.cache_read_input_tokens
  *  - OpenAI/DeepSeek Responses：usage.input_tokens_details.cached_tokens / usage.cached_tokens
- * 返回 { cachedTokens, promptTokens, completionTokens, hitRate } 或 null。
+ * 返回 { cachedTokens, promptTokens, completionTokens, hitRate, totalTokens } 或 null。
+ * totalTokens 是命中率分母（cached + miss + creation），与单轮 hitRate 同口径。
+ * ⚠️ 会话累计命中率必须用 totalTokens 累加（Anthropic 系 promptTokens 只含 miss 非缓存部分），
+ * 否则累计分母漏掉 cached → 累计命中率 >100%（1.1.15 已修：单轮 100% 但累计 111%）。
  */
 function extractCacheStats(usage) {
   if (!usage || typeof usage !== 'object') return null;
   const ptd = usage.prompt_tokens_details;
   const itd = usage.input_tokens_details;
+  // Gemini 的缓存字段在 usageMetadata 子对象里（usageMetadata.cachedContentTokenCount）
+  const umd = usage.usageMetadata || usage.usage_metadata;
   // 按优先级取「第一个出现的缓存命中字段」——多字段并存时不再累加，避免命中率虚高
   // （例如部分厂商同时返回 prompt_cache_hit_tokens 与 total_cached_tokens 会被旧逻辑重复累加）。
   const candidates = [
     usage.prompt_cache_hit_tokens,      // DeepSeek
-    ptd && ptd.cached_tokens,           // OpenAI Chat
-    usage.cache_read_input_tokens,      // Anthropic
+    ptd && ptd.cached_tokens,           // OpenAI Chat / Kimi / GLM / Moonshot / z.ai / DashScope
+    usage.cache_read_input_tokens,      // Anthropic / 各厂商 anthropic 兼容端点
     itd && itd.cached_tokens,           // OpenAI/DeepSeek Responses
     usage.cached_tokens,                // 通用
-    usage.total_cached_tokens           // Gemini
+    usage.total_cached_tokens,          // Gemini 旧字段
+    umd && umd.cachedContentTokenCount  // Gemini usageMetadata
   ];
   let cached = null;
   for (const c of candidates) {
@@ -240,15 +246,41 @@ function extractCacheStats(usage) {
   let promptTokens = 0;
   if (typeof usage.prompt_tokens === 'number') promptTokens = usage.prompt_tokens;
   else if (typeof usage.input_tokens === 'number') promptTokens = usage.input_tokens;
+  else if (typeof usage.promptTokenCount === 'number') promptTokens = usage.promptTokenCount; // Gemini
   let miss = 0;
   if (typeof usage.prompt_cache_miss_tokens === 'number') miss = usage.prompt_cache_miss_tokens;
+  // 命中率分母（total）= 命中 + 未命中 的输入 token。
+  // ⚠️ Anthropic 的 input_tokens 只含「非缓存」部分，不含 cache_read_input_tokens——
+  // 若直接 total=promptTokens，命中率会被算成 17700/725=2440%（虚高 24 倍）。
+  // 正确：total = cached + miss（miss 含本轮未命中输入 + 缓存写入 cache_creation）。
   if (!promptTokens) promptTokens = cached + miss;
-  const total = promptTokens || cached;
+  let total;
+  if (typeof usage.prompt_cache_hit_tokens === 'number' || usage.cache_read_input_tokens != null) {
+    // DeepSeek / Anthropic 语义：cached 与 miss 各自独立，total 取两者之和。
+    // Anthropic 没有 prompt_cache_miss_tokens，其 input_tokens 本身就是 miss（非缓存输入）。
+    if (!miss && typeof usage.input_tokens === 'number' && usage.prompt_tokens == null) {
+      miss = usage.input_tokens;
+    }
+    let creation = 0;
+    if (typeof usage.cache_creation_input_tokens === 'number') creation = usage.cache_creation_input_tokens;
+    total = cached + miss + creation;
+    if (total <= 0) total = promptTokens;
+  } else if (cached > promptTokens && promptTokens > 0) {
+    // 异常兜底：prompt_tokens 不含 cached（某些厂商语义不同）→ 用 cached + 写入 估算全量
+    let write = 0;
+    if (typeof (ptd && ptd.cache_write_tokens) === 'number') write += ptd.cache_write_tokens;
+    if (typeof (itd && itd.cache_write_tokens) === 'number') write += itd.cache_write_tokens;
+    if (typeof usage.cache_creation_input_tokens === 'number') write += usage.cache_creation_input_tokens;
+    total = cached + write;
+  } else {
+    // OpenAI Chat / Kimi / GLM / z.ai / Moonshot / Responses / Gemini：prompt_tokens 已含 cached（全量输入）
+    total = promptTokens || cached;
+  }
   const hitRate = total > 0 ? cached / total : 0;
   const completionTokens =
     typeof usage.completion_tokens === 'number' ? usage.completion_tokens :
     (typeof usage.output_tokens === 'number' ? usage.output_tokens : 0);
-  return { cachedTokens: cached, promptTokens, completionTokens, hitRate };
+  return { cachedTokens: cached, promptTokens, completionTokens, hitRate, totalTokens: total };
 }
 
 /**
@@ -668,6 +700,9 @@ function streamChat(options) {
         onError && onError(err);
         return;
       }
+      // 流式统一收尾：整条流只消费最后一次 usage（过程内多个 usage chunk 不再逐个触发，
+      // 避免同一请求的累计口径 usage 被重复累加进会话统计，造成累计命中率 >100%）。
+      if (lastUsage && onUsage) { try { onUsage(lastUsage); } catch (_) {} }
       onDone &&
         onDone({
           content,
@@ -827,7 +862,10 @@ function streamChat(options) {
           finish(new Error(json.error.message || JSON.stringify(json.error)));
           return true;
         }
-        if (json.usage) { lastUsage = json.usage; if (onUsage) { try { onUsage(json.usage); } catch (_) {} } }
+        // 只记最后一条 usage，不在每个 chunk 触发 onUsage：同一请求内多个 chunk 带 usage
+        //（首 chunk + 尾 chunk / 工具循环多个 completed），若逐 chunk 触发 onUsage，
+        // 会话累计会把同一批（累计口径的）cached 重复累加 → 累计命中率 >100%（1.1.15 修复）。
+        if (json.usage) { lastUsage = json.usage; }
         // 多厂商原生联网收割：通义 search_info（chunk 顶层）/ 智谱·Kimi 工具消息 search_results（嵌套），
         // 仅收 http(s)，push 进 collectedSources，复用 finish 的去重 + onSearchResults 透传。
         if (nativeSearch && collectedSources) {
@@ -1389,6 +1427,8 @@ function streamResponses(options) {
         const t = fcAcc[k];
         return { id: t.id || 'call_' + k, name: t.name, arguments: t.args || '{}' };
       });
+      // 统一收尾：整条流只触发一次 usage（最后一次累计），避免工具循环的多个 completed 重复累加
+      if (lastUsage && onUsage) { try { onUsage(lastUsage); } catch (_) {} }
       onDone &&
         onDone({
           content,
@@ -1544,7 +1584,9 @@ function streamResponses(options) {
         } else if (type === 'response.completed') {
           finishReason = 'stop';
           const ru = (json.response && json.response.usage) || json.usage;
-          if (ru) { lastUsage = ru; if (onUsage) { try { onUsage(ru); } catch (_) {} } }
+          // 只记最后一条，不在过程中触发 onUsage：工具循环会发多个 response.completed，
+          // 每个都带同一累计口径的 usage（cached 全量、input 只含新增量）——逐并发会重复累加→累计>100%
+          if (ru) { lastUsage = ru; }
           // 关键兜底：最终 output 数组里通常包含 web_search_call 项及其 results（DeepSeek 不在 streaming 事件里给 results）
           const outArr = (json.response && json.response.output) || json.output;
           if (Array.isArray(outArr)) {

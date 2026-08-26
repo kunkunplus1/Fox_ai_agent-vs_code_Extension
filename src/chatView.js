@@ -442,21 +442,45 @@ class ChatViewProvider {
         const pick = await vscode.window.showQuickPick(
           [
             { label: 'Chat（默认）', description: 'OpenAI 兼容 /chat/completions，所有服务商通用', value: 'chat' },
-            { label: 'Responses', description: 'OpenAI Responses API /v1/responses，原生函数调用与推理增量（需服务商支持）', value: 'responses' }
+            { label: 'Responses', description: 'OpenAI Responses API /v1/responses，原生函数调用与推理增量（需服务商支持）', value: 'responses' },
+            { label: 'Anthropic Messages API', description: '/v1/messages，任意模型可经 Anthropic 格式接入（适用于只提供 Anthropic 格式端点/网关的中转站）', value: 'anthropic' }
           ],
-          { title: '选择 API 协议', placeHolder: '当前：' + (cur === 'responses' ? 'Responses' : 'Chat') }
+          { title: '选择 API 协议', placeHolder: '当前：' + (cur === 'responses' ? 'Responses' : cur === 'anthropic' ? 'Anthropic' : 'Chat') }
         );
         if (pick && pick.value !== cur) {
           await config.conf().update('apiMode', pick.value, vscode.ConfigurationTarget.Global);
-          vscode.window.showInformationMessage(i18n.tw('狐狸 AI 已切换为 {0}（下一轮对话生效）', pick.value === 'responses' ? 'Responses API' : 'Chat 协议'));
+          const label = pick.value === 'responses' ? 'Responses API' : pick.value === 'anthropic' ? 'Anthropic Messages API' : 'Chat 协议';
+          vscode.window.showInformationMessage(i18n.tw('狐狸 AI 已切换为 {0}（下一轮对话生效）', label));
         }
         this.pushStatus();
         break;
       }
       case 'toggleAgent': {
+        // 模式切换器：纯问答（agent.enabled=false）/ 4 种 Agent 模式（modes.current）
         const cfg = config.conf();
-        const now = cfg.get('agent.enabled', true);
-        await cfg.update('agent.enabled', !now, vscode.ConfigurationTarget.Global);
+        const modes = require('./modes');
+        const curMode = cfg.get('modes.current', modes.DEFAULT_MODE);
+        const agentEnabled = cfg.get('agent.enabled', true);
+        const pick = await vscode.window.showQuickPick(
+          [
+            { label: '💬 纯问答', description: '关闭智能体：只对话，不读写文件、不执行命令', value: 'plain' },
+            { label: '🦊 编码（默认）', description: '读写代码、跑命令、改 bug，全权限', value: 'code' },
+            { label: '📐 架构', description: '只做方案设计：可读全部代码、写文档，不改代码不跑命令', value: 'architect' },
+            { label: '🔍 排错', description: '定位并修复问题：先取证再动手，可读可改可跑命令', value: 'debug' },
+            { label: '💬 问答模式', description: '纯只读答疑：解释代码与概念，绝不改动任何东西', value: 'ask' }
+          ],
+          {
+            title: '切换 Agent 模式',
+            placeHolder: '当前：' + (agentEnabled ? modes.BUILTIN_MODES[curMode] ? (modes.BUILTIN_MODES[curMode].emoji + ' ' + modes.BUILTIN_MODES[curMode].label) : curMode : '纯问答')
+          }
+        );
+        if (!pick) { this.pushStatus(); break; }
+        if (pick.value === 'plain') {
+          if (agentEnabled) await cfg.update('agent.enabled', false, vscode.ConfigurationTarget.Global);
+        } else {
+          if (!agentEnabled) await cfg.update('agent.enabled', true, vscode.ConfigurationTarget.Global);
+          if (curMode !== pick.value) await cfg.update('modes.current', pick.value, vscode.ConfigurationTarget.Global);
+        }
         this.pushStatus();
         break;
       }
@@ -701,6 +725,10 @@ class ChatViewProvider {
       thinkEffort: cfg.get('deepThinking.effort', 'medium'),
       vision: caps.supportsVision(model, cfg.get('visionMode', 'auto'), config.visionLists()),
       agent: cfg.get('agent.enabled', true),
+      mode: (() => {
+        const modes = require('./modes');
+        return cfg.get('modes.current', modes.DEFAULT_MODE);
+      })(),
       approve: cfg.get('agent.autoApprove', 'read'),
       state: state || (this.session ? 'running' : 'idle'),
       undoCount: undo.size(),

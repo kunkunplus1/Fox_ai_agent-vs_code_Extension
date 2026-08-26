@@ -20,6 +20,7 @@ const path = require('path');
 const os = require('os');
 
 const { chatNonStream } = require('./client');
+const anthropic = require('./anthropic');
 const config = require('./config');
 const { PROVIDERS } = config;
 const harness = require('./harness');
@@ -65,7 +66,12 @@ async function resolveOrganizer(context) {
   const baseUrl = (cfg.baseUrl || '').trim() || config.baseUrlFor(pid);
   const model = (cfg.model || '').trim() || meta.model || 'local-model';
   const apiKey = await config.getOrganizeApiKey(context, pid);
-  return { pid, label: meta.label, baseUrl, model, apiKey, local: !!meta.local };
+  // 传输层：用户显式配置（auto/openai/anthropic）> provider 预置（与主 agent 一致）
+  const t = String(cfg.transport || 'auto').trim();
+  const transport = (t === 'anthropic' || t === 'openai')
+    ? t
+    : (meta.transport || 'openai');
+  return { pid, label: meta.label, baseUrl, model, apiKey, local: !!meta.local, transport };
 }
 
 // 整理提示词
@@ -231,7 +237,7 @@ async function organizeFile(context, file, root, outputDir, organizer, { onLog, 
   for (let i = 0; i < chunks.length; i++) {
     if (signal && signal.aborted) throw new Error('已取消');
     const prompt = buildPrompt(chunks.length > 1 ? `（第 ${i + 1}/${chunks.length} 段）\n` + chunks[i] : chunks[i], source);
-    const res = await chatNonStream({
+    const callOpts = {
       baseUrl: organizer.baseUrl,
       apiKey: organizer.apiKey,
       model: organizer.model,
@@ -239,7 +245,11 @@ async function organizeFile(context, file, root, outputDir, organizer, { onLog, 
       temperature: 0.2,
       maxTokens: 0,
       timeout: 180000
-    });
+    };
+    // anthropic transport：走 Messages API（自动映射厂商端点）；否则 OpenAI 兼容
+    const res = organizer.transport === 'anthropic'
+      ? await anthropic.chatNonStream(callOpts)
+      : await chatNonStream(callOpts);
     if (res && res.content) parts.push(res.content.trim());
     else parts.push('（整理未返回内容）');
   }
@@ -331,15 +341,25 @@ async function summarizeConversation(context, messages, { onLog, signal, session
 
   if (signal && signal.aborted) throw new Error('已取消');
 
-  const res = await chatNonStream({
-    baseUrl: organizer.baseUrl,
-    apiKey: organizer.apiKey,
-    model: organizer.model,
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0.2,
-    maxTokens: 0,
-    timeout: 180000
-  });
+  const res = organizer.transport === 'anthropic'
+    ? await anthropic.chatNonStream({
+        baseUrl: organizer.baseUrl,
+        apiKey: organizer.apiKey,
+        model: organizer.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2,
+        maxTokens: 0,
+        timeout: 180000
+      })
+    : await chatNonStream({
+        baseUrl: organizer.baseUrl,
+        apiKey: organizer.apiKey,
+        model: organizer.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2,
+        maxTokens: 0,
+        timeout: 180000
+      });
 
   const content = (res && res.content ? res.content : '').trim();
   if (!content) {
