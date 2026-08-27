@@ -764,6 +764,7 @@ class AgentSession {
     this._cachePrevRequested = false;
     this._cacheWarmed = false;          // 预热是否已做过
     this._webResetSent = false;         // WebAI2API 文本协议：新建会话的重置信号是否已发过
+    this._reviewResetSent = false;      // 审查子代理独立新会话信号是否已发过（每次审查首轮只发一次）
     // 易变块指纹缓存（对齐 DSH「变了才更新」）：会话级缓存 RAG/主题记忆等 query 驱动块的
     // 结果，query 无实质变化时复用旧字节，避免每轮重检 → 每轮 miss 数千 token（命中率 71% 的主因）。
     this._dynCache = { kb: null, topicMem: null, env: null, diag: null };
@@ -2045,8 +2046,18 @@ class AgentSession {
           }
         }
 
-        const visibleText =
-          this.protocol === 'text' ? this.stripToolBlocks(textSource) : result.content;
+        // 可见正文与思考分离（1.1.18m）：textSource 是 content+reasoning 拼接，仅用于
+        // parseTextCalls 解析工具块（部分模型把 <fox:tool> 藏在 reasoning 里）；但**显示正文**
+        // 必须只取 content，否则 reasoning 的思考尾巴（如「第13行有…用户要求…已完成」）
+        // 会拼进最终回答气泡（网页原文 vs 插件显示差异的根源）。
+        // 兜底：模型把完整答案放在 thinking 而 content 为空时，才用 reasoning 剥块后作正文
+        //（此时 reasoning 就是答案本体而不是思考过程）。
+        const rawContent = String(result.content || '');
+        let visibleText = this.protocol === 'text' ? this.stripToolBlocks(rawContent) : rawContent;
+        // 兜底：content 为空而 reasoning 非空（模型把完整答案写在思考里）→ 用 reasoning 作正文
+        if (this.protocol === 'text' && !String(visibleText).trim() && String(result.reasoning || '').trim()) {
+          visibleText = this.stripToolBlocks(String(result.reasoning));
+        }
 
         // 模型生成图片：暂存到本轮缓冲区，最终随 channel（thinking/final）统一发出
         const resultImages = Array.isArray(result.images) ? result.images : [];
@@ -2426,6 +2437,18 @@ class AgentSession {
     const cfg = this.cfg;
     const b = selectBackend(cfg);
     const isReview = !!opts.review;
+    // 点1（审查独立会话）：审查走 WebAI2API 网页端时，首轮捎带 fox_new_session 信号，
+    // 让远端「新对话」开一个独立干净会话专门跑审查——主对话上下文不再被审查请求污染。
+    // 该信号与 fox-ai「新建会话」复用同一机制（webai2api 的 deepseek_text 及通用适配器
+    // 都读 meta.foxNewSession 点「新对话」），所以 fox-ai 支持的所有模型网址都生效；
+    // 且幂等：只给每次审查的第一轮带（审查只一轮，天然只发一次），主代理完全不受影响。
+    const isWebText = !!(cfg.meta && cfg.meta.textOnly);
+    const extraBody = {};
+    // 幂等：同一次审查只发一次重置信号（后续轮/复用不再点新对话，避免重复开空会话）
+    if (isReview && isWebText && !this._reviewResetSent) {
+      extraBody.fox_new_session = true;
+      this._reviewResetSent = true;
+    }
     return llmLimiter.run(() => b.nonStream({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
@@ -2437,6 +2460,7 @@ class AgentSession {
       timeout: isReview ? Math.min(cfg.timeout || 60000, 60000) : cfg.timeout,
       insecureHttpParser: cfg.insecureHttpParser,
       streamFormat: cfg.streamFormat,
+      extraBody,
       signal: this._abortCtrl ? this._abortCtrl.signal : undefined
     }));
   }
