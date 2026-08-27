@@ -554,7 +554,7 @@ function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
 
   const common = `${base}
 
-你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
+你现在是 VS Code 里的编程智能体「狐狸 AI」，` + (cfg.model ? `由 ${cfg.model} 驱动，` : '') + `可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
 【当前环境】
 ${structured}${nativeSearchHint}${citationGuard}
@@ -586,7 +586,7 @@ ${structured}${nativeSearchHint}${citationGuard}
   // 只保留编码铁律 + 8 条最关乎工具正确调用的核心准则，降低指令跟随负担。
   const commonLocal = `${base}
 
-你现在是 VS Code 里的编程智能体「狐狸 AI」，可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
+你现在是 VS Code 里的编程智能体「狐狸 AI」，` + (cfg.model ? `由 ${cfg.model} 驱动，` : '') + `可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
 
 ${structured}
 
@@ -1739,16 +1739,29 @@ class AgentSession {
   const isShortQuery = String(queryText || '').trim().length < 10;
   const topicSwitched = (fp, c) => !c || (!isShortQuery && _qOverlap(fp, c.fp) < 0.2);
 
-  // 知识库检索（RAG）：首轮 / 话题切换才注入，同话题后续轮次不注入
+  // 知识库检索（RAG）：首轮 / 话题切换才注入，同话题后续轮次不注入。
+  // 1.1.18f（对齐 DSH agent-instructions 增量语义）：首轮全量基线注入后记录文件清单指纹；
+  // 同话题续轮若知识库文件清单变化（新增/移除/整理产物刷新）→ 只发一条「知识库已更新」增量块，
+  // 提醒模型先前的基线已过期、按新清单使用；没变则完全不发（RAG 已在历史里，模型可回看）。
   let knowledgeText = '';
   {
     const c = this._dynCache.kb;
     if (topicSwitched(qFp, c)) {
       const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
       knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
-      this._dynCache.kb = { fp: qFp, text: knowledgeText };
+      let filesFp = '';
+      try { filesFp = kb.filesFingerprint(kb.listKnowledgeFiles(this.sessionId)); } catch (_) {}
+      this._dynCache.kb = { fp: qFp, text: knowledgeText, filesFp };
+    } else if (c && c.filesFp) {
+      // 同话题续轮：只对「文件清单变化」发增量（不重发全文，保住前缀缓存；也让模型知道基线已刷新）
+      let curFp = '';
+      try { curFp = kb.filesFingerprint(kb.listKnowledgeFiles(this.sessionId)); } catch (_) {}
+      if (curFp && curFp !== c.filesFp) {
+        this._dynCache.kb = { ...c, filesFp: curFp };
+        knowledgeText = `【知识库已更新】\n先前注入的知识库基线（文件清单 ${c.filesFp}）已过期；相关知识库文件有新增、移除或整理产物刷新。如需最新内容请按需检索或参考最新基线，不要引用先前基线中已不存在的文件。`;
+      }
+      // 未变化：knowledgeText 保持空，不注入
     }
-    // else：同话题后续轮次，knowledgeText 保持空，不注入（RAG 已在历史里，模型可回看）
   }
 
   // 扁平长期记忆（稳定，仅随记忆文件变化）→ 进稳定块；主题记忆（查询相关，易变）→ 进易变块
@@ -1807,8 +1820,17 @@ class AgentSession {
       if (anchor) dynParts.push(`【⚓ 核心任务·始终牢记】${anchor}\n\n【⚓ 再次提醒·核心任务】你刚才要完成的是：${anchor}。请围绕它作答，不要跑题。`);
     } catch (_) {}
   }
-  // 环境信息：随用户操作变化，作为动态附录注入到最后一条 user 消息尾部，不影响前缀缓存命中率
-  if (dynOk && envBrief) dynParts.push('【当前环境】\n' + envBrief);
+  // 环境信息：随用户操作变化，作为动态附录注入到最后一条 user 消息尾部，不影响前缀缓存命中率。
+  // 1.1.18e（对齐 DSH runtime-context snapshot）：环境块是「快照」而非「追加的历史」——
+  // 头部明确「本快照取代先前所有快照」，防止模型把几轮前打开的旧文件/旧工作区当最新状态；
+  // envBrief 从有到无时（旧模型可能不再产生环境信息）发一条「环境已清空」，
+  // 让模型知道先前的环境快照已失效（DSH 的 CLEARED 语义：none supersedes earlier）。
+  if (dynOk) {
+    const envHead = '【当前环境·最新快照】\n这份环境快照取代先前所有环境快照；以下列出的才是当前真实状态：';
+    if (envBrief) dynParts.push(envHead + '\n' + envBrief);
+    else if (this._prevEnvInjected) dynParts.push('【当前环境】已清空：先前注入的环境快照不再生效，不要引用旧的工作区/打开的文件的描述。');
+  }
+  this._prevEnvInjected = !!envBrief;
   // L1 极速层（易变部分）：当前激活文件的 Diagnostics 摘要（前 3 个 Error），每轮随 query 刷新。
   // 极小（≤ 几百 token），放进动态附录尾部，不破坏可缓存的稳定前缀；让用户切文件后模型立刻知道新文件的报错。
   try {
@@ -2153,7 +2175,12 @@ class AgentSession {
               // 正文空但思考被截断时，改为明确要求「直接输出最终答案」，避免模型接着思考又截断。
               const _contMsg = _reasoningOnly
                 ? '你上一轮的思考过程因达到长度上限被截断，但还没输出最终答案。现在请直接输出完整的最终答案正文，不要再输出思考过程、不要调用任何工具。'
-                : buildContinuePrompt(visibleText || String(result.reasoning || ''));
+                : buildContinuePrompt(visibleText || String(result.reasoning || ''), {
+                    // 1.1.18g：续轮锚定整体目标（DSH goal_round 中文本土化）——
+                    // 取 planTaskText（当前任务清单）作目标上下文，让截断续写不脱离任务主线
+                    goalText: planTaskText ? this.planTasks.renderForPrompt() : '',
+                    round: this._continuesUsed + 1
+                  });
               this.messages.push({ role: 'user', content: _contMsg });
               // 标记下一轮请求强制文本协议（不给工具），让模型只续写正文
               this._lenContinue = true;

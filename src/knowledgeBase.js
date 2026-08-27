@@ -1101,14 +1101,44 @@ function augmentSystemPrompt(basePrompt, query, sessionId, opts) {
   return renderInjected(basePrompt, context, files);
 }
 
+/**
+ * 注入内容防注入转义（1.1.18g，对齐 DSH agent-instructions 的 `<system-reminder>` 转义）。
+ * 知识库文件是外部注入文本，可能藏伪装「系统指令」标签（如 `<system-reminder>`、
+ * `<fox:system>`、`<tool>` 等闭合标签），把它们注入 system 会让模型把文件内容当成
+ * 真正的控制指令。这里把常见闭合标签的 `/` 转义为 `\\/`（如 `</system-reminder>` →
+ * `<\\/system-reminder>`），让模型看到的是普通文本而非可闭合的标签结构。
+ * @param {string} text 外部注入文本
+ * @returns {string} 转义后的文本
+ */
+function escapeInjectedTags(text) {
+  return String(text).replace(/<\/(system-reminder|fox:system|system|tool|foxtool|fox:tool)>/gi, '<\\/$1>');
+}
+
 /** 拼装注入文本（同步 / 异步两条路径共用，保证格式完全一致） */
 function renderInjected(basePrompt, context, files) {
   const fileList = files.map((f) => (f.kb2 ? `${f.source}(知识库-2)` : f.source)).join('、');
-  let injected = `${basePrompt}\n\n【本地知识库参考】\n`;
-  injected += `当前可用的知识库文件：${fileList}\n\n`;
-  if (context.trim()) injected += `${context}\n\n`;
+  /** 1.1.18f（对齐 DSH agent-instructions 基线语义）：知识库是「基线快照」而非追加历史——
+   * 头部明确「本基线取代先前所有知识库基线」，防止模型把旧轮的知识库（可能已过期）当最新。 */
+  let injected = `${basePrompt}\n\n【本地知识库参考·当前基线】\n`;
+  injected += `本知识库基线取代先前所有知识库基线；当前可用的知识库文件：${fileList}\n\n`;
+  if (context.trim()) injected += `${escapeInjectedTags(context)}\n\n`;
   injected += '（以上来自本地知识库，回答用户问题时请优先参考其中内容；不要调用 find_files / search_text 等工作区工具去“确认知识库是否存在”。）';
   return injected;
+}
+
+/**
+ * 知识库文件清单指纹（1.1.18f）：用文件集合（含来源名）生成稳定指纹，
+ * 供主控判断「知识库是否新增/移除/变更了文件」——同话题续轮时只对变更发增量块。
+ * @param {Array<{file:string,source:string,kb2?:boolean}>} files
+ * @returns {string} sha1 指纹（空集合返回空串）
+ */
+function filesFingerprint(files) {
+  if (!Array.isArray(files) || files.length === 0) return '';
+  const joined = files
+    .map((f) => (f.kb2 ? `${f.source}#kb2` : f.source))
+    .sort()
+    .join('\u0000');
+  return textHash(joined);
 }
 
 module.exports = {
@@ -1117,5 +1147,5 @@ module.exports = {
   // 向量检索（1.1.33）
   retrieveAsync, augmentSystemPromptAsync, buildVectors, vectorStats, invalidateVectors, clearVectorCache,
   // 纯函数导出，供单测
-  embedSignature, textHash, dedupTop
+  embedSignature, textHash, dedupTop, filesFingerprint, escapeInjectedTags
 };

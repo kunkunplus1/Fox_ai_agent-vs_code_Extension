@@ -24,20 +24,31 @@ function shouldAutoContinue(result, cfg, continuesUsed) {
 /**
  * 构造「续写」提示：把上一轮被截断内容的末尾若干字回传给模型，
  * 让它明确从哪之后继续，避免从头重复（长度截断续跑失败的常见根因）。
+ *
+ * 1.1.18g（对齐 DSH goal_round 的中文本土化）：续轮不是纯「接着写」——
+ * 模型被截断后容易脱离整体目标、只补眼前一段。传入可选 goalText 时，
+ * 构造「【目标续轮】」结构化块（当前目标/已推进轮次/验证再完成），
+ * 让续写始终锚定任务目标而不是原地续字。
  * @param {string} lastText 上一轮（被截断的）可见文本
+ * @param {{goalText?:string, round?:number}} opts 可选：整体目标描述与已推进轮次
  * @returns {string}
  */
-function buildContinuePrompt(lastText) {
+function buildContinuePrompt(lastText, opts) {
   const tail = String(lastText || '').trim();
+  const goal = (opts && opts.goalText) ? String(opts.goalText).trim().slice(0, 400) : '';
+  const round = opts && opts.round ? Number(opts.round) : 0;
+  const head = goal
+    ? `【目标续轮】\n当前整体目标：${goal}\n本次是同一任务的第 ${round} 次续写。请始终围绕上述目标继续推进，不要偏离到无关内容；续写完成后检查是否达到目标，若已达到就明确收尾，不要空转。\n\n`
+    : '';
   if (tail.length > 400) {
     const slice = tail.slice(tail.length - 400);
     return (
-      '你刚才的输出因达到单次长度上限被截断。你最后写到的内容是下面这段（请务必从它之后继续，' +
+      head + '你刚才的输出因达到单次长度上限被截断。你最后写到的内容是下面这段（请务必从它之后继续，' +
       '绝对不要重复这段，直接续写后续内容；本次只输出续写文本，不要调用任何工具、不要输出工具标签）：\n' +
       '「' + slice + '」'
     );
   }
-  return '继续输出剩余内容，保持与上文连贯，不要重复已经输出的部分；本次只输出续写文本，不要调用任何工具。';
+  return head + '继续输出剩余内容，保持与上文连贯，不要重复已经输出的部分；本次只输出续写文本，不要调用任何工具。';
 }
 
 /**
