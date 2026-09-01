@@ -4360,6 +4360,7 @@ const emptyGuide = this.protocol === 'text'
       // Best-of-N 多模型对比：把“调用任意候选模型”与“评委 LLM（复用 _silentCall）”能力暴露给工具层
       callModel: (c, req) => this.callCandidate(c, req),
       llm: (m, o) => this._silentCall(m, o),
+      askUser: (req) => this.askUser(req),
       sessionId: this.sessionId
     };
 
@@ -4816,6 +4817,17 @@ const emptyGuide = this.protocol === 'text'
       return 'approve';
     }
     return decision;
+  }
+
+  /** 向用户澄清（clarify 工具）：弹窗让用户点选建议或自行输入补充要求，返回用户答复文本。 */
+  async askUser(req) {
+    if (typeof this.ui.requestClarify !== 'function') return null;
+    const id = 'cl-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    return await new Promise((resolve) => {
+      this.ui.requestClarify({ id, question: req.question, options: req.options || [] }, (answer) => {
+        resolve(answer == null ? '' : String(answer));
+      });
+    });
   }
 
   pushToolResult(callId, name, output, isError, meta) {

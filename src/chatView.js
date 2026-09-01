@@ -206,6 +206,8 @@ class ChatViewProvider {
     this.alwaysAllow = new Set();
     /** @type {Map<string, Function>} */
     this.approvalResolvers = new Map();
+    /** @type {Map<string, Function>} */
+    this.clarifyResolvers = new Map();
     /** @type {Map<string, {path:string, before:string, after:string}>} */
     this.previews = new Map();
     this.transcript = []; // 供面板重新可见时恢复
@@ -458,6 +460,14 @@ class ChatViewProvider {
         if (cb) {
           this.approvalResolvers.delete(msg.id);
           cb(msg.decision);
+        }
+        break;
+      }
+      case 'clarify': {
+        const cb = this.clarifyResolvers.get(msg.id);
+        if (cb) {
+          this.clarifyResolvers.delete(msg.id);
+          cb(msg.answer);
         }
         break;
       }
@@ -2189,6 +2199,10 @@ class ChatViewProvider {
           cb(decision);
         };
         this.approvalResolvers.set(req.id, wrappedCb);
+      },
+      requestClarify: (req, cb) => {
+        this.post({ type: 'clarify', id: req.id, question: req.question, options: req.options || [] });
+        this.clarifyResolvers.set(req.id, cb);
       },
       step: ({ id, kind, title, detail, status }) => {
         self._stepSeq = self._stepSeq || 0;

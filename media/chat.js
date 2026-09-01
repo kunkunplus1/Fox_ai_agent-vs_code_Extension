@@ -1665,6 +1665,44 @@ if (seg.kind === 'tool') {
     scrollDown(true);
   }
 
+  function addClarify(msg) {
+    hideWelcome();
+    const box = document.createElement('div');
+    box.className = 'clarify';
+    box.dataset.id = msg.id;
+    const opts = Array.isArray(msg.options) ? msg.options.filter((o) => o && String(o).trim()) : [];
+    const optHtml = opts.map((o, i) =>
+      '<button class="mini" data-opt="' + i + '">' + escapeHtml(o) + '</button>'
+    ).join('');
+    box.innerHTML =
+      '<div class="clarify-q">' + t('❓ {0}', escapeHtml(msg.question || '')) + '</div>' +
+      (optHtml ? '<div class="clarify-opts">' + optHtml + '</div>' : '') +
+      '<div class="clarify-input">' +
+        '<input type="text" class="clarify-input-box" placeholder="' + t('或自行输入补充要求…') + '" />' +
+        '<button class="mini primary" data-act="send">' + t('提交') + '</button>' +
+      '</div>';
+    messagesEl.appendChild(box);
+    scrollDown(true);
+    const send = (answer) => {
+      const v = String(answer == null ? '' : answer).trim();
+      if (!v) return;
+      box.classList.add('answered');
+      box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      const inp = box.querySelector('.clarify-input-box');
+      if (inp) inp.disabled = true;
+      vscode.postMessage({ type: 'clarify', id: msg.id, answer: v });
+    };
+    box.querySelectorAll('[data-opt]').forEach((b) => {
+      b.addEventListener('click', () => send(b.textContent));
+    });
+    const input = box.querySelector('.clarify-input-box');
+    const sendBtn = box.querySelector('[data-act="send"]');
+    if (sendBtn) sendBtn.addEventListener('click', () => send(input && input.value));
+    if (input) {
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(input.value); });
+    }
+  }
+
   function addPlanPending(msg) {
     hideWelcome();
     const plan = msg.plan || [];
@@ -2757,6 +2795,9 @@ if (seg.kind === 'tool') {
         }
         case 'approval':
           addApproval(msg);
+          break;
+        case 'clarify':
+          addClarify(msg);
           break;
         case 'notice':
           if (msg.internal) {

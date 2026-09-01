@@ -157,6 +157,27 @@ const TOOLS = [
     }
   },
   {
+    name: 'clarify',
+    kind: 'read',
+    title: (a) => `向用户澄清：${String((a && a.question) || '').slice(0, 30)}`,
+    description:
+      '当用户的需求存在相互矛盾、歧义，或你对要求不清楚、无法可靠继续时，调用本工具向用户澄清。给出你的疑问（question）与 2-4 个建议选项（options）；用户在弹窗中点选一个建议，或自行输入补充要求。收到用户答复后，严格依据答复继续，不要猜测。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '向用户提出的澄清问题，一句话说清哪里矛盾/不清楚' },
+        options: { type: 'array', items: { type: 'string' }, description: '给用户的建议选项（2-4 个，可选），用户可点选其一，也可自行输入' }
+      },
+      required: ['question']
+    },
+    run: async (a, ctx) => {
+      if (ctx && typeof ctx.askUser === 'function') {
+        return await ctx.askUser({ question: a.question, options: a.options || [] });
+      }
+      return '（当前环境不支持澄清交互，无法向用户提问。）请基于现有信息给出你的最佳判断；若确实无法继续，直接说明你的困惑与推测即可。';
+    }
+  },
+  {
     name: 'write_file',
     kind: 'edit',
     title: (a) => `写入 ${a.path || ''}`,

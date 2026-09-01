@@ -872,6 +872,27 @@ body[data-vscode-theme-kind="vscode-dark"] .msg.assistant .bubble {
 }
 .approval .q { flex: 1; min-width: 120px; }
 
+.clarify {
+  padding: 10px 12px; margin: -4px 0 12px;
+  border: 1px dashed var(--fox-accent);
+  border-radius: var(--fox-rad);
+  background: var(--fox-accent-soft);
+  font-size: 12px;
+}
+.clarify-q { margin-bottom: 8px; font-weight: 600; line-height: 1.5; }
+.clarify-opts { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 8px; }
+.clarify-input { display: flex; gap: 7px; }
+.clarify-input-box {
+  flex: 1; min-width: 0; padding: 5px 9px;
+  border: 1px solid var(--fox-line);
+  border-radius: var(--fox-rad);
+  background: var(--vscode-input-background, #fff);
+  color: var(--vscode-input-foreground, inherit);
+  font-size: 12px; outline: none;
+}
+.clarify-input-box:focus { border-color: var(--fox-accent); }
+.clarify.answered { opacity: .62; }
+
 .review-card {
   border: 1px solid var(--vscode-charts-orange, #d9822b);
   border-left: 3px solid var(--vscode-charts-orange, #d9822b);

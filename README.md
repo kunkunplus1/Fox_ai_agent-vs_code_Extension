@@ -73,6 +73,7 @@
 - **工作流**：智能体并非简单问答工具，而是自主循环调用工具完成任务。复杂任务自动拆分为清单，逐项标记待办 / 进行中 / 已完成。
 - **会话栏分步骤时间线**：思考（💭 思考卡）、工具调用（🖥️ 动作卡，标题带目标如「读取 xxx」「执行 xxx」）、最终正文按真实顺序直接铺在会话栏主消息流里，不再糊成一团；点击卡片可展开参数 / 结果详情，重开窗口自动恢复。工作链页另保留一份完整时间线（含等待审批、诊断提示等内部步骤）。
 - **纯对话直答**：极短且无任务意图的消息（问候 / 闲聊 / 简短回应，≤10 字且不含任务、时效关键词）自动追加「直接文字回复、不要调工具」提示，避免“你好”也触发 get_tools / 联网烧 token；`current_time`、天气、新闻等时效性查询不受影响。
+- **需求澄清**：当用户的需求存在相互矛盾、歧义，或模型对要求不清楚时，模型会调用 `clarify` 工具弹窗向你提问——你点选它给的建议，或自行输入补充要求，它据此继续，不瞎猜。
 - **过程控制**：命令「狐狸 AI：暂停 / 取消 / 继续」。取消会立即中断模型输出，并向正在运行的命令发送中断信号（Ctrl+C）。
 - **输出截断自动继续**：模型回复因达到 `max_tokens` 被截断时自动插入“继续输出剩余内容”并重调，默认最多 3 次（`foxAi.agent.maxContinues`）。续跑时关闭深度思考、思考被截断但正文未产出时自动补正文、可见正文为空时不空转。
 - **长任务自动续跑**：达到 `foxAi.agent.maxSteps` 步数上限时自动追加一轮预算并把断点信息写回历史继续执行（`foxAi.agent.autoResume`，默认开；累计轮数达 `autoResumeRounds` 默认 5 才挂起等用户）。手动暂停永远优先于自动续跑。
@@ -433,7 +434,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 
 ## 工具清单
 
-智能体可调用的部分工具：`read_file` `list_file` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` `search_codebase` `index_codebase` `spawn_subagent` `run_background_agent` `background_jobs` `get_tools` 等。
+智能体可调用的部分工具：`read_file` `list_file` `glob` `grep` `write_file` `edit_file` `delete_file` `run_command` `read_terminal` `get_diagnostics` `get_ports` `get_debug_console` `save_memory` `get_memory` `create_skill` `list_skills` `use_skill` `create_plan_task` `update_plan_task` `list_plan_tasks` `call_extension_command` `organize_knowledge` `query_code_graph` `review_changes` `security_audit` `generate_image` `search_codebase` `index_codebase` `spawn_subagent` `run_background_agent` `background_jobs` `clarify` `get_tools` 等。
 
 > 智能体工作准则：用户要求“读 / 看 / 打开 / 检查某文件”时，必须立即调用 `read_file` 读取真实内容，不凭记忆猜测或编造。
 
