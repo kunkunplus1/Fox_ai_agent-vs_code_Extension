@@ -393,19 +393,11 @@ body {
 .assistant-steps {
   display: flex;
   flex-direction: column;
-  margin: 2px 0 8px 4px;
+  margin: 2px 0 8px;
   position: relative;
 }
-.assistant-steps::before {
-  content: '';
-  position: absolute;
-  left: 7px;
-  top: 8px;
-  bottom: 6px;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--fox-line, rgba(128,128,128,.22));
-}
+/* 1.1.27：卡片流去掉左侧时间线（灰竖线 + 大红点），纯卡片堆叠（对齐 WorkBuddy 卡片流） */
+.assistant-steps::before { display: none; }
 .assistant-steps .step-card {
   position: relative;
   display: flex;
@@ -413,17 +405,7 @@ body {
   line-height: 24px;
   overflow: hidden;
 }
-/* 时间线圆点节点 */
-.assistant-steps .step-card::before {
-  content: '';
-  flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
-  margin: 10px 9px 0 3px;
-  border-radius: 50%;
-  background: var(--fox-accent, #f0883e);
-  z-index: 1;
-}
+.assistant-steps .step-card::before { display: none; }
 .assistant-steps .step-card-icon {
   flex: 0 0 auto;
   font-size: 13px;
@@ -453,7 +435,24 @@ body {
 /* 工具动作行：单行 24px，无边框无底色 */
 .assistant-steps .step-tool .step-card-title { font-weight: 650; }
 .assistant-steps .step-text .step-card-body { margin: 0; }
-/* 1.1.18c：工具行不挂圆点，思考行保留圆点节点 */
+/* 1.1.27：正文段也走卡片流（WorkBuddy 式「正文随时间推进」）——正文卡是独立输出卡片，
+   带底色+描边+微阴影，与思考行/工具行区分；整条卡片流不再挂左侧时间线装饰。 */
+.assistant-steps .step-card.step-answer {
+  align-items: flex-start;
+  line-height: 1.65;
+  padding: 8px 12px 9px;
+  background: var(--fox-card, rgba(128,128,128,.06));
+  border: 1px solid var(--fox-line, rgba(128,128,128,.18));
+  border-radius: 10px;
+  margin: 2px 0 8px 0;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+.assistant-steps .step-card.step-answer::before { display: none; }
+.assistant-steps .step-card.step-answer .step-card-icon { margin-top: 2px; }
+.assistant-steps .step-card.step-answer .step-card-body { margin: 0; }
+.assistant-steps .step-card.step-answer .step-card-body p { margin: 0 0 6px; }
+.assistant-steps .step-card.step-answer .step-card-body p:last-child { margin-bottom: 0; }
+/* 1.1.27：工具行/思考行均不挂圆点（卡片流已无时间线装饰） */
 .assistant-steps .step-tool::before { display: none; }
 
 /* ---------- 工作链侧边栏：把 thinking/tool/step 与正文物理隔离 ---------- */

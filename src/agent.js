@@ -1727,6 +1727,13 @@ async run() {
         this._estDeltaChars = 0;
         this.thinkingMsgId = 'thinking-' + this.runId + '-' + this.stepCount;
         this._thinkingBuffer = { text: '', reasoning: '', images: [] };
+        // 1.1.26：正文气泡也随轮推进（对齐 WorkBuddy「正文随时间变」）——
+        // 之前 finalMsgId 整个 run 固定一个，多轮工具循环的每段正文都叠进最早的同一个气泡，
+        // 用户看正文必须滑回最上面。现在与 thinkingMsgId 同款：每轮换新 id，
+        // 前端按 id 聚合自然就是「每轮一段新正文卡」，思考 → 工具 → 正文 → 再思考 → 再正文逐轮铺开。
+        // _finalStarted 同步每轮重置，让每轮都发 assistantStart 建新正文锚点（否则新 id 无锚点，正文会丢）。
+        this.finalMsgId = 'final-' + this.runId + '-' + this.stepCount;
+        this._finalStarted = false;
         this.state = 'thinking';
         this.emit('state', { state: 'thinking', step: this.stepCount, thinkingMsgId: this.thinkingMsgId });
 
@@ -3929,7 +3936,10 @@ const emptyGuide = this.protocol === 'text'
     };
     let s;
     try { s = stable(args, 0); } catch (_) { s = String(args); }
-    return name + '|' + String(s).slice(0, 300);
+    // 1.1.26b：签名长度从 300 提到 600——write_file/edit_file 的 content 差异常出现在
+    // 参数尾段（如「你好」 vs 「\n\n\n\n\n你好」），截到 300 会把差异截掉，导致
+    // 「参数已变化」的合法重写也被 loop-guard 误判为同名同参（日志实证 blocks 1→5）。
+    return name + '|' + String(s).slice(0, 600);
   }
 
   /**
@@ -3953,6 +3963,46 @@ const emptyGuide = this.protocol === 'text'
     const sig = this._toolSignature(name, args);
     const hist = this._toolSigHistory;
     let hit = '';
+
+    // 写文件类工具：签名不同 = 模型在尝试不同内容/不同参数（如 「你好」 vs 「\n\n\n\n\n你好」），
+    // 这是合法推进，不是空转。只有签名完全相同才算 repeat。1.1.26b 修复误拦。
+    const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'insert_text', 'replace_text', 'append_file', 'patch_file']);
+    if (WRITE_TOOLS.has(name)) {
+      // 形态一（写文件版）：只认「签名完全相同」的重复
+      const sameExact = hist.slice(-8).filter((s) => s === sig).length;
+      if (sameExact >= 2) hit = 'repeat';  // 即使写文件，连续 3 次一模一样也是空转
+      // 形态二：环状调用（周期 2 / 3）也按原逻辑，但写文件不会走环状
+      if (!hit) {
+        const seq = hist.concat(sig);
+        for (const p of [2, 3]) {
+          const need = p * 3;
+          if (seq.length < need) continue;
+          const tail = seq.slice(-need);
+          let cyclic = true;
+          for (let i = 0; i + p < need; i++) {
+            if (tail[i] !== tail[i + p]) { cyclic = false; break; }
+          }
+          if (cyclic && new Set(tail).size > 1) { hit = 'cycle-' + p; break; }
+        }
+      }
+      hist.push(sig);
+      if (hist.length > 16) hist.shift();
+      if (!hit) return null;
+      this._loopBlocks = (this._loopBlocks || 0) + 1;
+      if (this._loopBlocks >= 2) this._loopNudge = true;
+      this.emit('notice', {
+        text: `检测到工具「${name}」重复调用（${hit === 'repeat' ? '同名同参' : '环状'}），已拦截以免空转。`
+      });
+      const text = hit === 'repeat'
+        ? `已拦截：工具 ${name} 在最近几步里用完全相同的参数重复调用过 ${sameExact + 1} 次（参数和内容一模一样），结果不会变。请直接用已经拿到的结果继续，或换一个不同的思路/参数。`
+        : `已拦截：检测到 ${name} 与其他工具在来回循环调用（周期 ${hit.slice(-1)}），没有产生新信息。请停止这条链路，基于现有信息给出结论或换方案。`;
+      return {
+        text,
+        reason: '重复/环状工具调用',
+        suggest: '不要再用相同参数重试。若信息已足够就直接作答；确实缺信息就换工具或换参数，并说明你改变了什么。'
+      };
+    }
+    hist.push(sig);
 
     // 形态一：原地打转（同名同参）
     const sameInWindow = hist.slice(-8).filter((s) => s === sig).length;

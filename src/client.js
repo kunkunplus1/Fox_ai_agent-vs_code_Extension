@@ -800,7 +800,7 @@ function streamChat(options) {
     return handle;
   }
 
-  const body = { model, messages, stream: true, temperature };
+  const body = { model, messages, stream: true, temperature, stream_options: { include_usage: true } };
   if (maxTokens && maxTokens > 0) body.max_tokens = maxTokens;
   if (stop && stop.length) body.stop = stop;
   if (tools && tools.length) {
@@ -1529,7 +1529,7 @@ function streamResponses(options) {
   const instructions = sysMsgs.map((m) => textOfContent(m.content)).filter(Boolean).join('\n\n');
   const input = toResponsesInput((messages || []).filter((m) => m && m.role !== 'system'));
 
-  const body = { model, instructions, input, stream: true, temperature, store: false };
+  const body = { model, instructions, input, stream: true, temperature, store: false, include: ['usage'] };
   if (maxTokens && maxTokens > 0) body.max_output_tokens = maxTokens;
   if (tools && tools.length) {
     body.tools = toResponsesTools(tools);

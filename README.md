@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.26
+> **版本**：1.1.27
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -18,9 +18,9 @@
 
 ## 安装
 
-1. 获取扩展包 `fox-ai-1.1.26.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.27.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`），点击右上角 `…` 选择「从 VSIX 安装」。
-3. 选中 `fox-ai-1.1.26.vsix`，安装完成后按提示重新加载（Reload）窗口。
+3. 选中 `fox-ai-1.1.27.vsix`，安装完成后按提示重新加载（Reload）窗口。
 
 扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。
 

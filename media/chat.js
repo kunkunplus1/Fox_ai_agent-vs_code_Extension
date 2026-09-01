@@ -669,13 +669,22 @@
     // 补全链接：标签自带 > 搜索结果索引反查；并把来源存档到该消息，供点击角标取用（URL 晚到也会在重绘时回填）
     const resolved = cites.map((c) => ({ label: c.label, url: c.url || lookupCiteUrl(c.label), type: c.type, localPath: c.localPath }));
     recordSources(fid, resolved);
-    // DSH 式切段：文本段 → 💭 思考卡；工具段 → 🖥️ 动作卡；最后一段文本作为最终回答正文。
+    // WorkBuddy 式卡片流（1.1.26）：不再区分「中间思考段→卡、最后一段→固定气泡」，
+    // 全部文本段统一渲染成随时间推进的卡片（思考段=💭 思考卡，正文段=正文卡，工具段=动作卡）。
+    // 这样模型「思考→调工具→输出正文→再思考→再调工具→再输出正文」时，正文也是一段一张卡，
+    // 不会永远堆在最开始那一片气泡里。
     const segs = splitThinkingSteps(text);
+    const cards = [];
     let html;
     if (segs.length <= 1) {
-      html = renderMarkdown(text);
+      // 单段纯文本（无工具标记）：不套时间线，但仍是「正文卡」而不是固定最早气泡——
+      // WorkBuddy 同理：直接问答时正文就是一张卡，随时间推进出现在消息流中。
+      html =
+        '<div class="assistant-steps"><div class="step-card step-answer">' +
+          '<span class="step-card-icon">💬</span>' +
+          '<div class="step-card-body">' + renderMarkdown(text) + '</div>' +
+        '</div></div>';
     } else {
-      const cards = [];
       for (let i = 0; i < segs.length; i++) {
         const seg = segs[i];
         if (seg.kind === 'tool') {
@@ -688,11 +697,8 @@
               '<span class="step-card-title">' + escapeHtml(label) + '</span>' +
             '</div>'
           );
-        } else if (i === segs.length - 1 && String(seg.text).trim()) {
-          // 最后一段文本 = 最终回答正文（不包卡片，正常 markdown）
-          html = renderMarkdown(seg.text);
         } else if (String(seg.text).trim()) {
-          // 1.1.18c：思考段 = [💭] 图标 + 正文同行，去掉「思考」标题行
+          // 正文/思考段统一卡片：💭 思考卡（推理过程）与正文卡（最终回答段落）同行
           cards.push(
             '<div class="step-card step-text">' +
               '<span class="step-card-icon">💭</span>' +
@@ -701,8 +707,7 @@
           );
         }
       }
-      if (html === undefined) html = '';
-      html = '<div class="assistant-steps">' + cards.join('') + '</div>' + html;
+      html = '<div class="assistant-steps">' + cards.join('') + '</div>';
     }
     html = html.replace(/\u0003CIT(\d+)\u0003/g, (m, i) => {
       const c = resolved[Number(i)] || { label: '', url: '' };
@@ -1453,8 +1458,8 @@
             '<span class="step-caret">▾</span>' +
           '</div>' +
           '<div class="step-detail">' +
-            '<div class="step-params"><span class="step-label" data-k="params">参数</span></div>' +
-            '<div class="step-result"><span class="step-label" data-k="result">结果</span></div>' +
+            '<div class="step-params"></div>' +
+            '<div class="step-result"></div>' +
             '<div class="step-thinking"></div>' +
           '</div>' +
         '</div>';
@@ -1596,8 +1601,10 @@
     if (ts.raw && String(ts.raw).trim()) {
       const segs = splitThinkingSteps(ts.raw);
       if (segs.length <= 1) {
-        // 无工具标记：保持原样单节「输出」，避免空转（单节时不做额外包装）
-        parts.push('<div class="thinking-section">' + renderAssistant(ts.raw) + '</div>');
+        // 无工具标记：保持原样单节「输出」，避免空转（单节时不做额外包装）。
+        // 1.1.26b 修复：这里在思考卡内用 renderAssistant 会在单段时再包一层 step-answer 正文卡，
+        // 造成「思考卡里嵌套正文卡」。思考卡的正文内容直接用纯 markdown 渲染，不再套卡。
+        parts.push('<div class="thinking-section">' + renderMarkdown(ts.raw) + '</div>');
       } else {
         parts.push('<div class="workchain-steps">');
         for (const seg of segs) {
@@ -1613,10 +1620,11 @@ if (seg.kind === 'tool') {
           );
         } else {
           // 1.1.18c：思考段 [💭] icon 与正文同行，去「思考」标题行
+          // 1.1.26b 修复：思考段也用纯 markdown，避免在思考卡内再嵌出正文卡
           parts.push(
             '<div class="step-card step-text">' +
               '<span class="step-card-icon">💭</span>' +
-              '<div class="step-card-body">' + renderAssistant(seg.text) + '</div>' +
+              '<div class="step-card-body">' + renderMarkdown(seg.text) + '</div>' +
             '</div>'
           );
         }
