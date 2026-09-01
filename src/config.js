@@ -248,7 +248,11 @@ async function resolve(context) {
     showContextUsage: c.get('showContextUsage', true),
     agentEnabled: c.get('agent.enabled', true),
     planAndExecute: {
-      enabled: c.get('planAndExecute.enabled', true)
+      enabled: c.get('planAndExecute.enabled', true),
+      // 计划确认门（对齐 DSH goal-round-driver「计划即执行」）：默认关闭——
+      // present_plan/revise_plan 只把计划展示给用户看，不设确认门，模型提交后立即继续执行。
+      // 仅当用户显式开启此开关时才真正暂停等待用户确认。
+      confirmGate: c.get('planAndExecute.confirmGate', false)
     },
     review: {
       enabled: c.get('review.enabled', true)
@@ -308,6 +312,12 @@ async function resolve(context) {
     localConstrainedDecoding: c.get('agent.localConstrainedDecoding', 'auto'),
     weakHistoryRounds: c.get('agent.weakHistoryRounds', 2),
     autoApprove: c.get('agent.autoApprove', 'read'),
+    // 1.1.20 自动续跑（对齐 DSH goal-round-driver）：达到 maxSteps 硬性上限时不再干等用户手点「继续」，
+    // 自动追加一轮预算并把「续跑提示」写回历史，模型带上断点信息直接继续。
+    // autoResume=false 关闭（回到旧行为：挂起等手动确认）；autoResumeRounds 是自动续跑累计轮数上限，
+    // 超过后真正挂起等用户。两键都由 agent.js 的 _hardStopPause 读取。
+    autoResume: c.get('agent.autoResume', true),
+    autoResumeRounds: c.get('agent.autoResumeRounds', 5),
     blockedCommands: c.get('agent.blockedCommands', []),
     policy: c.get('policy', {}),
     // —— 失败降级 / 自动 failover（1.1.20）——
@@ -349,6 +359,20 @@ async function resolve(context) {
       return 60000;
     })(),
     structuredOutput: c.get('agent.structuredOutput', false),
+    // 视觉与功能协调系统（四层）：默认开启；可设 foxAi.designSystem.enabled=false 关闭，
+    // foxAi.designSystem.tokens 覆盖默认设计令牌（主色/圆角/间距等）。
+    designSystem: {
+      enabled: c.get('designSystem.enabled', true),
+      tokens: c.get('designSystem.tokens', {})
+    },
+    // 前缀/上下文缓存「强制保留本会话缓存副本」：默认开启。
+    // 仅对官方支持的厂商注入缓存指令（OpenRouter 走请求头、OpenAI gpt-5.6+ 走请求体），
+    // 其余厂商依赖稳定前缀自动命中，绝不臆造参数。
+    // 可通过 foxAi.cacheControl.enabled=false 关闭；foxAi.cacheControl.retention 改 OpenAI TTL（默认 '24h'）。
+    cacheControl: {
+      enabled: c.get('cacheControl.enabled', true),
+      retention: c.get('cacheControl.retention', '24h')
+    },
     projectSkeleton: c.get('agent.projectSkeleton', true),
     includeFileContext: c.get('includeFileContext', true),
     workspace: {

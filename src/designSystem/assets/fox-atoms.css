@@ -1,0 +1,130 @@
+/* fox-atoms —— 原子组件库样式（锁定设计令牌，禁止改这里调色） */
+:root {
+  --fox-color-primary: #1890ff;
+  --fox-color-primaryHover: #40a9ff;
+  --fox-color-primaryActive: #096dd9;
+  --fox-color-success: #52c41a;
+  --fox-color-warning: #faad14;
+  --fox-color-error: #ff4d4f;
+  --fox-color-text: #1f2329;
+  --fox-color-textSecondary: #646a73;
+  --fox-color-border: #e5e6eb;
+  --fox-color-bg: #ffffff;
+  --fox-color-bgMuted: #f5f6f7;
+  --fox-color-overlay: rgba(0, 0, 0, 0.45);
+  --fox-radius-sm: 4px;
+  --fox-radius-md: 8px;
+  --fox-radius-lg: 12px;
+  --fox-radius-pill: 999px;
+  --fox-space-xs: 4px;
+  --fox-space-sm: 8px;
+  --fox-space-md: 12px;
+  --fox-space-lg: 20px;
+  --fox-space-xl: 32px;
+  --fox-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --fox-font-size-sm: 12px;
+  --fox-font-size-md: 14px;
+  --fox-font-size-lg: 16px;
+  --fox-font-size-xl: 20px;
+  --fox-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --fox-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.10);
+  --fox-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.14);
+  --fox-z-pop: 1000;
+  --fox-z-modal: 1100;
+  --fox-z-toast: 1200;
+}
+
+fox-button {
+  display: inline-block;
+  font-family: var(--fox-font-family);
+  font-size: var(--fox-font-size-md);
+  padding: var(--fox-space-sm) var(--fox-space-lg);
+  border-radius: var(--fox-radius-md);
+  border: 1px solid var(--fox-color-border);
+  background: var(--fox-color-bg);
+  color: var(--fox-color-text);
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+  user-select: none;
+}
+fox-button[variant="primary"] {
+  background: var(--fox-color-primary);
+  border-color: var(--fox-color-primary);
+  color: #fff;
+}
+fox-button[variant="primary"]:hover { background: var(--fox-color-primaryHover); border-color: var(--fox-color-primaryHover); }
+fox-button[variant="primary"]:active { background: var(--fox-color-primaryActive); border-color: var(--fox-color-primaryActive); }
+fox-button[variant="text"] { background: transparent; border-color: transparent; color: var(--fox-color-primary); }
+fox-button[variant="text"]:hover { background: var(--fox-color-bgMuted); }
+fox-button[disabled] { opacity: .5; cursor: not-allowed; }
+
+fox-modal {
+  position: fixed; inset: 0; z-index: var(--fox-z-modal);
+  display: none; align-items: center; justify-content: center;
+  background: var(--fox-color-overlay);
+  font-family: var(--fox-font-family);
+}
+fox-modal[visible] { display: flex; }
+fox-modal .fox-modal-panel {
+  background: var(--fox-color-bg);
+  border-radius: var(--fox-radius-lg);
+  box-shadow: var(--fox-shadow-lg);
+  min-width: 320px; max-width: 90vw; max-height: 86vh; overflow: auto;
+  padding: var(--fox-space-lg);
+}
+fox-modal .fox-modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--fox-space-md); }
+fox-modal .fox-modal-title { font-size: var(--fox-font-size-xl); font-weight: 600; color: var(--fox-color-text); }
+fox-modal .fox-modal-close { cursor: pointer; border: none; background: transparent; font-size: 20px; color: var(--fox-color-textSecondary); }
+fox-modal .fox-modal-close:hover { color: var(--fox-color-text); }
+
+fox-tooltip {
+  position: relative; display: inline-block; font-family: var(--fox-font-family);
+}
+fox-tooltip .fox-tip {
+  position: absolute; z-index: var(--fox-z-pop);
+  background: var(--fox-color-text); color: #fff;
+  font-size: var(--fox-font-size-sm); padding: var(--fox-space-xs) var(--fox-space-sm);
+  border-radius: var(--fox-radius-sm); white-space: nowrap;
+  opacity: 0; pointer-events: none; transition: opacity .12s;
+}
+fox-tooltip[position="top"] .fox-tip { bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: var(--fox-space-xs); }
+fox-tooltip[position="bottom"] .fox-tip { top: 100%; left: 50%; transform: translateX(-50%); margin-top: var(--fox-space-xs); }
+fox-tooltip[position="left"] .fox-tip { right: 100%; top: 50%; transform: translateY(-50%); margin-right: var(--fox-space-xs); }
+fox-tooltip[position="right"] .fox-tip { left: 100%; top: 50%; transform: translateY(-50%); margin-left: var(--fox-space-xs); }
+fox-tooltip:hover .fox-tip { opacity: 1; }
+
+fox-toast {
+  position: fixed; top: var(--fox-space-lg); left: 50%; transform: translate(-50%, -20px);
+  z-index: var(--fox-z-toast);
+  font-family: var(--fox-font-family); font-size: var(--fox-font-size-md);
+  padding: var(--fox-space-sm) var(--fox-space-lg);
+  border-radius: var(--fox-radius-md); color: #fff;
+  background: var(--fox-color-text); box-shadow: var(--fox-shadow-md);
+  opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
+}
+fox-toast[type="success"] { background: var(--fox-color-success); }
+fox-toast[type="error"] { background: var(--fox-color-error); }
+fox-toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+fox-tabs { display: block; font-family: var(--fox-font-family); }
+fox-tabs > .fox-tabs-bar { display: flex; gap: var(--fox-space-md); border-bottom: 1px solid var(--fox-color-border); margin-bottom: var(--fox-space-md); }
+fox-tabs > .fox-tabs-bar > button {
+  border: none; background: transparent; cursor: pointer; padding: var(--fox-space-sm) 0;
+  color: var(--fox-color-textSecondary); font-size: var(--fox-font-size-md);
+}
+fox-tabs > .fox-tabs-bar > button.active { color: var(--fox-color-primary); border-bottom: 2px solid var(--fox-color-primary); }
+fox-tab { display: none; }
+fox-tab.active { display: block; }
+
+fox-sidebar {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 280px; z-index: var(--fox-z-modal);
+  background: var(--fox-color-bg); box-shadow: var(--fox-shadow-lg);
+  font-family: var(--fox-font-family); color: var(--fox-color-text);
+  transform: translateX(-100%); transition: transform .22s ease; padding: var(--fox-space-lg);
+}
+fox-sidebar[open] { transform: translateX(0); }
+fox-sidebar + .fox-sidebar-mask {
+  position: fixed; inset: 0; z-index: calc(var(--fox-z-modal) - 1);
+  background: var(--fox-color-overlay); display: none;
+}
+fox-sidebar[open] + .fox-sidebar-mask { display: block; }

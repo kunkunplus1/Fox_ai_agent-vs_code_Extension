@@ -87,7 +87,10 @@ function checkAsync(name, fn) {
   await tm.deleteTask(t.id);
 
   console.log('\n[2] AgentSession 热恢复续跑');
-  let failCount = 1; // 第一次请求返回 500，制造运行失败
+  // 1.1.25 网络退避重试：单次 500 会被自动重试吞掉 → 必须「持续 500」直到本轮耗尽重试（3 次）
+  // 才真正 FAILED。failCount 设为 100（远超所有请求消耗：每次请求 1 原始 + 3 重试，且第一轮可能多次请求），
+  // 确保第一次 run 的所有请求全 500 耗尽 → FAILED；第二次 run 时 failCount 已归 0 → 收到 'done'。
+  let failCount = 100;
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
@@ -159,6 +162,8 @@ function checkAsync(name, fn) {
   } catch (_) {
     /* 预期抛错 */
   }
+  // 第一次 run 已 FAILED：显式把服务端置为「成功」，第二次续跑必然收到 'done'（不再 500）
+  failCount = 0;
   const tasks1 = await tm.listTasks();
   const t1 = tasks1.find((x) => x.sessionId === 'sess_run');
   check('第一次 run 产生任务且为 FAILED', () => {

@@ -70,6 +70,8 @@ function check(name, fn) {
   const cfg = await config.resolve(ctx);
   cfg.baseUrl = 'http://127.0.0.1:' + port + '/v1';
   cfg.model = 'deepseek-v4-flash';
+  cfg.provider = 'deepseek';     // 必须是 deepseek：modelSupportsNativeTools 对云厂商才返回 native（llamacpp 等本地默认 text）
+  cfg.meta = { local: false, textOnly: false };   // 必须清掉默认 llamacpp 的 meta.local=true，否则被强制 text
   cfg.apiMode = 'chat';
   cfg.forceNonStream = true;     // 走非流式，简化断言
   cfg.visionMode = 'off';

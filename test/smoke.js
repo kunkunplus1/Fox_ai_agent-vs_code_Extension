@@ -42,6 +42,7 @@ Module._load = function (request, parent, isMain) {
 
 const { streamChat } = require('../src/client');
 const { AgentSession } = require('../src/agent');
+const { parseTextCalls, stripToolBlocks } = require('../src/textParser');
 const term = require('../src/tools/terminal');
 const ws = require('../src/tools/workspace');
 
@@ -138,23 +139,24 @@ function once(content) {
 <fox:tool name="read_file">
 {"path": "src/app.js", "start_line": 1}
 </fox:tool>`;
-  const calls = session.parseTextCalls(text);
+  // 1.1.23 起 parseTextCalls/stripToolBlocks 是 textParser 模块函数（agent.js 拆出）
+  const calls = parseTextCalls(text);
   check('解析出工具名与参数', () => {
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].name, 'read_file');
     assert.deepStrictEqual(JSON.parse(calls[0].rawArgs), { path: 'src/app.js', start_line: 1 });
   });
   check('剥离工具块后保留正文', () =>
-    assert.strictEqual(session.stripToolBlocks(text), '我先看看文件。'));
+    assert.strictEqual(stripToolBlocks(text), '我先看看文件。'));
   check('未闭合标签也能兜住', () => {
-    const c = session.parseTextCalls('<fox:tool name="list_dir">\n{"path":"."}');
+    const c = parseTextCalls('<fox:tool name="list_dir">\n{"path":"."}');
     assert.strictEqual(c.length, 1);
     assert.strictEqual(c[0].name, 'list_dir');
   });
   check('纯文本回答不会误判为工具', () =>
-    assert.strictEqual(session.parseTextCalls('这里没有工具调用').length, 0));
+    assert.strictEqual(parseTextCalls('这里没有工具调用').length, 0));
   check('兼容模型输出的 <foxtool> 无冒号标签', () => {
-    const c = session.parseTextCalls('<foxtool name="web_search">{"query":"test"}</foxtool>');
+    const c = parseTextCalls('<foxtool name="web_search">{"query":"test"}</foxtool>');
     assert.strictEqual(c.length, 1);
     assert.strictEqual(c[0].name, 'web_search');
     assert.deepStrictEqual(JSON.parse(c[0].rawArgs), { query: 'test' });

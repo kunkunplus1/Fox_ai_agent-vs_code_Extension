@@ -208,7 +208,10 @@ class SessionManager {
       updatedAt: s.updatedAt || 0,
       provider: s.provider || null,
       model: s.model || null,
-      attachments: s.attachments || []
+      attachments: s.attachments || [],
+      // 会话进度摘要（对齐 DSH session checkpoint）：工具执行流水账的紧凑渲染，
+      // 重开/断点续跑时由 chatView 回灌给 agent，模型凭它知道「上次干到哪、下一步做什么」。
+      progress: s.progress || null
     };
   }
 
@@ -225,7 +228,9 @@ class SessionManager {
       updatedAt: now,
       provider: session.provider || null,
       model: session.model || null,
-      attachments: session.attachments || []
+      attachments: session.attachments || [],
+      // 会话进度摘要持久化（对齐 DSH session-persistence）：写后置落盘，\n      // 崩溃/重开/断点续跑时 load 回灌，模型凭紧凑流水知道自己干到哪。
+      progress: session.progress || null
     };
     ensureDir(this.sessionsDir());
     safeWriteJson(this._sessionPath(id), toSave);
@@ -250,7 +255,8 @@ class SessionManager {
       updatedAt: now,
       provider: opts.provider || null,
       model: opts.model || null,
-      attachments: opts.attachments || []
+      attachments: opts.attachments || [],
+      progress: opts.progress || null
     };
     this.save(session);
     this._currentId = id;

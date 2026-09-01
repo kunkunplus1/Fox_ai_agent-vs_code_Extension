@@ -1,9 +1,11 @@
 'use strict';
+const { TOOL_OPEN, TOOL_BLOCK, TOOL_END, findTagCloseIn, extractFoxToolBlocks, writeAgentLog, safeParseArgs, repairArgsJson, extractBalanced, collectJsonToolCandidates, parseTextCalls, validateTextCalls, stripToolBlocks } = require('./textParser');
 
 const vscode = require('vscode');
 const path = require('path');
 const { chatOnce, chatNonStream, streamResponses, chatNonStreamResponses } = require('./client');
 const anthropic = require('./anthropic');
+const cacheControl = require('./cacheControl');
 const config = require('./config');
 const tools = require('./tools');
 const weakModel = require('./weakModel');
@@ -13,7 +15,6 @@ const ctxTools = require('./tools/context');
 const undo = require('./undo');
 const kb = require('./knowledgeBase');
 const kbOrg = require('./knowledgeOrganizer');
-const mcpAuthor = require('./tools/mcpAuthor'); // 自写 MCP 服务器：注入格式说明到系统提示词
 const caps = require('./capabilities');
 const harness = require('./harness');
 const bridge = require('./extensionBridge');
@@ -26,7 +27,9 @@ const projectScan = require('./projectScan');
 const reviewer = require('./reviewer');
 const { shouldAutoContinue, buildContinuePrompt, isStuckRepeat } = require('./autoContinue');
 const reasoning = require('./reasoningParams'); // 深度思考：跨后端参数映射
-const providerProfiles = require('./providerProfiles'); // 厂商专属适配：缩小厂商原生 vs 第三方 agent 差距
+const agentEvents = require('./agentEvents'); // 关键运行状态事件化：空轮/引导/续跑/final 可重放恢复
+const prompts = require('./prompts'); // 提示词构建（buildSystemPrompt/buildDeepThinkingHint/buildExtensionCommandsSection）已迁至 src/prompts.js
+const approvalPolicy = require('./approvalPolicy'); // 审批纯策略：autoApprove/alwaysAllow/kind 自动放行判定（可单测）
 
 const fs = require('fs');
 const os = require('os');
@@ -77,6 +80,15 @@ function _qOverlap(a, b) {
   return inter / Math.min(a.size, b.size);
 }
 
+// —— 纯问候/闲聊判定（1.1.32：聊天轮直答，省「你好也调工具」的冤枉 token）——
+// 命中条件：极短（≤10 字，与 isShortQuery 同阈值）+ 不含任何任务/时效性关键词。
+// 时效性词（几点/时间/天气/新闻/日期/最新）必须排除——它们虽短但要调 current_time/web_search。
+const CHATTER_BLOCK_RE = /帮我|请|读取|读一下|打开|查看|检查|运行|执行|搜索|查找|生成|创建|删除|移动|复制|安装|修复|报错|错误|为什么|如何|怎么|什么|几点|时间|天气|新闻|日期|最新|文件|代码|命令|测试|配置|设置|编译|构建|部署|分析|解释|推荐|优化|调试|写|git/;
+function isChatter(query) {
+  const q = String(query || '').trim();
+  return q.length > 0 && q.length <= 10 && !CHATTER_BLOCK_RE.test(q);
+}
+
 // —— 内容指纹（易变大块「变了才更新」判据，1.1.15）——
 // 对动态上下文候选文本做 SHA-1 指纹；空/无实质变化时返回 ''（视为未变化）。
 function _contentFingerprint(text) {
@@ -102,69 +114,16 @@ const llmLimiter = createLimiter(MAX_CONCURRENT_LLM);
 // 例如 mcp__fetch__fetch-url、mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page。
 // 早期版本用 [a-z_]+ 导致带特殊字符的工具名匹配失败、工具从不执行（表现为「返回空」）。
 // 兼容模型输出 <fox:tool>（规范写法）、<foxtool>（吞冒号）、<tool> / <fox-tool> 等变体。
-const TOOL_OPEN = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/i;
-const TOOL_BLOCK = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>\s*([\s\S]*?)\s*<\/(fox:?tool|fox-tool|tool)>/gi;
-const TOOL_END = '</fox:tool>';
+// （TOOL_OPEN/TOOL_BLOCK/findTagCloseIn/extractFoxToolBlocks 已迁至 src/textParser.js）
 
 /**
- * 从 from 位置起找与开标签 tagName 配对的闭合标签，跳过参数 JSON 字符串值内部的闭合标签。
- * （1.1.39 闭合标签感知：模型在工具参数里传 HTML 片段时，字符串里的 </foxtool> 不再被误判为块结束）
- * @returns {number} 闭合标签 '<' 的索引；找不到返回 -1
- */
-function findTagCloseIn(text, from, tagName) {
-  let inStr = null; // '"' / "'" / null：当前是否在 JSON 字符串内
-  for (let i = from; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === inStr) inStr = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") { inStr = ch; continue; }
-    if (ch === '<') {
-      const mm = /<\/(fox:?tool|fox-tool|tool)>/i.exec(text.slice(i, i + 24));
-      if (mm && mm[1].toLowerCase() === tagName.toLowerCase()) return i;
-    }
-  }
-  return -1;
-}
-
-/** 扫描 <foxtool name="..">…</foxtool> 块（含 <fox:tool>/<fox-tool>/<tool>），闭合标签感知 */
-function extractFoxToolBlocks(text) {
-  const blocks = [];
-  const openRe = /<(fox:?tool|fox-tool|tool)\s+name\s*=\s*["']([^\s"'<>]+)["']\s*>/gi;
-  let m;
-  while ((m = openRe.exec(text)) !== null) {
-    const tag = m[1];
-    const end = findTagCloseIn(text, openRe.lastIndex, tag);
-    if (end < 0) break; // 无配对闭合（流被截断）→ 后续交给截断兜底
-    blocks.push({ name: m[2], body: text.slice(openRe.lastIndex, end) });
-    openRe.lastIndex = end + tag.length + 3; // 跳过闭合标签 '</' + tag + '>'
-  }
-  return blocks;
-}
-
-/** 流式诊断专用日志：~/.fox-ai/logs/agent-stream.log，失败静默忽略。 */
+ * 流式诊断专用日志：~/.fox-ai/logs/agent-stream.log，失败静默忽略。 */
 function streamLog(line) {
   try {
     const dir = path.join(os.homedir(), '.fox-ai', 'logs');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, 'agent-stream.log');
     fs.writeFileSync(file, new Date().toISOString() + ' [pid:' + process.pid + '] ' + line + '\n', { flag: 'a' });
-  } catch (_) { /* 日志写入失败不得影响主流程 */ }
-}
-
-/** 写一条调试日志到 ~/.fox-ai/logs/agent-<name>.log，失败静默忽略 */
-function writeAgentLog(name, lines) {
-  try {
-    const dir = path.join(os.homedir(), '.fox-ai', 'logs');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, 'agent-' + name + '.log');
-    const prefix = new Date().toISOString() + ' [pid:' + process.pid + '] ';
-    const text = (Array.isArray(lines) ? lines : [String(lines)])
-      .map((l) => prefix + (typeof l === 'string' ? l : JSON.stringify(l)))
-      .join('\n') + '\n';
-    fs.writeFileSync(file, text, { flag: 'a' });
   } catch (_) { /* 日志写入失败不得影响主流程 */ }
 }
 
@@ -194,6 +153,25 @@ function selectBackend(cfg) {
     responses: useResp
   };
 }
+
+// ===== 1.1.26 韧性常量（用户「增加重试与兜底逻辑」）=====
+// 空响应（content 与 reasoning 全空）最大重试次数：指数退避 500ms → 1s → 2s，耗尽后明确报错终止。
+// 旧行为：空响应与「空轮」混在一条计数上，空响应从不重试 API，直接走向收尾 = 会话中断。
+const EMPTY_RESP_MAX_RETRY = 3;
+// 1.1.26「同一资源反复访问」检测：读取类工具的「目标字段」与提醒阈值。
+// 用法：同一工具 + 同一目标值累计调用达阈值时，注入一条非阻断的效率提醒（不拦截工具）。
+const READ_TARGET_FIELD = {
+  read_file: 'path', list_dir: 'path', find_files: 'path',
+  search_text: 'glob', grep: 'path', search_codebase: 'query',
+  read_terminal: 'id', get_diagnostics: 'path', index_codebase: 'path'
+};
+const READ_REPEAT_LIMIT = 8;
+// 空轮（有正文但无工具块）最大连续轮次：每轮一次分级 nudge，超过才收尾。
+// 旧值 2 太苛刻：模型常在「解释下一步」那一轮被误杀（日志实证——模型明说
+// 「参数解析失败，我用合法 JSON 重建计划任务」却只因没吐工具块就被判死）。
+// 取值 3 = 给 2 次 nudge 机会。不再往上加：分级提示（第 2 次已明令「禁止再写计划」
+// 第 3 次「只准输出一个调用块」）约束力足够，继续加只是浪费 API 调用去骚扰已完成的对话。
+const EMPTY_TURN_MAX = 3;
 
 /**
  * 判断模型是否「开箱即用原生 function calling」。用于 toolProtocol='auto' 时在不撞 400 的前提下
@@ -227,11 +205,10 @@ function modelSupportsNativeTools(cfg) {
   }
   // 某些推理模型（o1/o3 系列旧版）在 chat 接口不支持 tools；命中走 text 更稳
   if (/^o[13]-/.test(model)) return false;
-  // DeepSeek 专用适配：原生 function calling 的 tools 字段序列化在 messages 之后、不参与前缀缓存，
-  // 导致 ~7000 token 的工具 schema 每轮按原价计费、命中率封顶在 ~85%。改用文本协议把工具写进 system（可缓存），
-  // 长任务命中率可达 ~98%。用户可用 foxAi.agent.toolProtocol=native 显式覆盖回原生。
-  if (provider === 'deepseek' || provider === 'openrouter' && model.includes('deepseek')) return false;
-  // 主流云厂商（OpenAI、SiliconFlow、Gemini、Anthropic、GLM、ERNIE、Qwen-Turbo 等）默认 native
+  // 1.1.25（照 dsh 删改重构，用户「除 web 外全走原生」）：不再用「强制 text 教格式」换前缀缓存命中率——
+  // 文本协议让模型纠结格式（<foxtool> vs [[tool:]] 自定义标签）、空轮回灌、会话莫名中断（日志实证）。
+  // dsh 同样 DeepSeek 原生 function calling 一轮完成。主流云厂商（OpenAI/DeepSeek/SiliconFlow/Gemini/
+  // Anthropic/GLM/ERNIE/Qwen-Turbo 等）统一 native。
   return true;
 }
 
@@ -288,152 +265,9 @@ function makeToken() {
  * 这里做多层容错修复，让同一套本地工具对所有模型都可用（增强③核心之一）。
  * 修复层级：标准 JSON → 去 markdown 包裹 → 修尾部逗号/单引号/未加引号键 → 行式 key:value 兜底。
  */
-function safeParseArgs(raw) {
-  if (raw == null || raw === '') return {};
-  if (typeof raw === 'object') return raw;
-  let text = String(raw).replace(/^﻿/, '').trim();
-  const tryJson = (s) => {
-    try { return JSON.parse(s); } catch (_) { return undefined; }
-  };
-  let v = tryJson(text);
-  if (v && typeof v === 'object') return v;
 
-  // 1) 去掉 ```json 包裹
-  const fenced = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-  v = tryJson(fenced);
-  if (v && typeof v === 'object') return v;
+// ===== 宽松参数解析 / JSON 修复 / 平衡括号 / JSON 候选 =====
 
-  // 2) 抽取第一个 { ... } 块，做「宽松 JSON 修复」：单引号→双引号、未加引号键加引号、尾部逗号
-  const start = fenced.indexOf('{');
-  const end = fenced.lastIndexOf('}');
-  if (start !== -1 && end > start) {
-    let body = fenced.slice(start, end + 1);
-    body = body
-      .replace(/\/\/.*$/gm, '')               // 行注释
-      .replace(/,\s*([}\]])/g, '$1')          // 尾部逗号
-      .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)\s*:/g, '$1"$2":')  // 未加引号键
-      .replace(/:\s*'([^']*)'/g, ': "$1"')    // 单引号值→双引号
-      .replace(/'([^']*)'\s*:/g, '"$1":')     // 单引号键→双引号
-      .replace(/:\s*'([^']*)'/g, ': "$1"');   // 再次兜底单引号值
-    v = tryJson(body);
-    if (v && typeof v === 'object') return v;
-  }
-
-  // 3) 行式 key: value 兜底（模型用 YAML 风格输出参数时）
-  if (text.includes(':') && !text.includes('{')) {
-    const obj = {};
-    let ok = false;
-    for (const line of text.split(/\n+/)) {
-      const m = line.match(/^\s*([A-Za-z_$][\w$-]*)\s*[:=]\s*(.*)$/);
-      if (m) { obj[m[1]] = m[2].trim().replace(/^["']|["']$/g, ''); ok = true; }
-    }
-    if (ok) return obj;
-  }
-
-  throw new Error('参数不是合法 JSON：' + text.slice(0, 200));
-}
-
-/**
- * 1.1.15：WebAI2API 网页渲染把 JSON 字符串值里的转义序列破坏后的修复器。
- * 网页会把 \n 渲染成真换行、把 \" 渲染成引号、吞掉反斜杠（如 c:\Users 的 \U 变成非法转义），
- * 使整段 JSON 变成非法文本。这里在「字符串内部」做最小修复，不动字符串外的结构：
- *   - 字符串值内未转义的真换行 / 制表符 → 转义为 \n / \t
- *   - 字符串值内未转义的双引号（被网页渲染破坏的 \"）→ 转义为 \"
- *   - 字符串值内反斜杠后跟非法转义字符（如 \U、\a）→ 转义为 \\U（保留字面反斜杠）
- * 实现：逐字符扫描，维护 inString 状态与 stringKind（键/值）。只处理值字符串内的破坏；
- * 键的结束引号、值的结束引号（后跟 , 或 }）保持原样。结构破坏（缺括号/键值对）交给 safeParseArgs。
- */
-function repairArgsJson(raw) {
-  const s = String(raw || '');
-  let out = '';
-  let inString = false;
-  let stringKind = null; // 'key' | 'value'
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (!inString) {
-      if (ch === '"') {
-        // 确定字符串类型：前面非空白字符是 { 或 , → 键；否则（: 后）→ 值
-        let j = i - 1;
-        while (j >= 0 && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n' || s[j] === '\r')) j--;
-        const prev = j >= 0 ? s[j] : '';
-        stringKind = (prev === '{' || prev === ',') ? 'key' : 'value';
-        inString = true;
-        out += ch;
-      } else {
-        out += ch;
-      }
-      continue;
-    }
-    if (ch === '\\') {
-      const n = i + 1 < s.length ? s[i + 1] : '';
-      if (n && /[\\"\/bfnrtu]/.test(n)) {
-        out += ch + n; i++;            // 合法转义，保留
-      } else if (n) {
-        out += '\\\\' + n; i++;        // 非法转义（\U 等）→ 字面反斜杠 + 字符
-      } else {
-        out += '\\\\';                 // 行尾裸反斜杠
-      }
-      continue;
-    }
-    if (ch === '"') {
-      if (stringKind === 'key') {
-        // 键的结束引号（后跟 :），保持原样
-        inString = false; stringKind = null; out += ch; continue;
-      }
-      // 值字符串内：判断是结束引号还是被网页破坏的 \"
-      let j = i + 1;
-      while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
-      const nxt = j < s.length ? s[j] : '';
-      if (nxt === ',' || nxt === '}' || nxt === '' || nxt === '\n' || nxt === '\r') {
-        inString = false; stringKind = null; out += ch;   // 值的结束引号
-      } else {
-        out += '\\"';                   // 值内的裸引号 → 转义
-      }
-      continue;
-    }
-    if (ch === '\r') {
-      if (i + 1 < s.length && s[i + 1] === '\n') i++;      // \r\n 合并为一个换行
-      out += '\\n';
-      continue;
-    }
-    if (ch === '\n') { out += '\\n'; continue; }
-    if (ch === '\t') { out += '\\t'; continue; }
-    out += ch;
-  }
-  return out;
-}
-
-/**
- * 从文本 start 位置起，找到与首个 { 匹配的闭合 }（正确处理字符串内的括号与转义）。
- * 用于从模型的自由文本里截出一个完整的 JSON 对象块。
- */
-function extractBalanced(s, start) {
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (esc) { esc = false; continue; }
-    if (ch === '\\') { esc = true; continue; }
-    if (ch === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (ch === '{') depth++;
-    else if (ch === '}') { depth--; if (depth === 0) return s.slice(start, i + 1); }
-  }
-  return '';
-}
-
-/** 从模型输出里抽取疑似工具调用的 JSON 块（含 ```json 围栏 与 裸对象 {name/tool/action:...}） */
-function collectJsonToolCandidates(text) {
-  const out = [];
-  const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
-  let m;
-  while ((m = fence.exec(text)) !== null) out.push(m[1]);
-  const objRe = /\{[^{}]*"name"\s*:|\{[^{}]*"tool"\s*:|\{[^{}]*"action"\s*:/g;
-  while ((m = objRe.exec(text)) !== null) {
-    const slice = extractBalanced(text, m.index);
-    if (slice) out.push(slice);
-  }
-  return out;
-}
 
 /**
  * read_file 去重用的「区间签名」：把 路径 + 行范围 + 字符范围 归一化成一个字符串。
@@ -452,214 +286,16 @@ function readFileSig(p, a) {
   return path + '#' + sl + '#' + el + '#' + sc + '#' + ec;
 }
 
-function buildExtensionCommandsSection() {
-  const allowed = bridge.allowedCommands();
-  if (!allowed.length) return '';
-  const catalog = bridge.commandCatalog();
-  const lines = [];
-  for (const id of allowed) {
-    const entry = catalog.find((c) => c.command === id);
-    const title = entry ? entry.title : id;
-    const ext = entry ? entry.extension : '';
-    lines.push(`- ${title}（${id}${ext ? ' · ' + ext : ''}）`);
-  }
-  return `
+// 提示词构建（buildExtensionCommandsSection / buildDeepThinkingHint / buildSystemPrompt）已迁至 src/prompts.js
 
-【已授权的扩展命令（插件联动）】
-用户已在「狐狸 AI · 环境与插件 · 插件联动」页面勾选下列命令。当用户明确要求「调用插件」「用插件做某事」或提到对应功能时，请使用 call_extension_command 工具，从下列命令中选择最匹配的一项调用：
-${lines.join('\n')}
-
-调用示例：
-<foxtool name="call_extension_command">
-{"command": "${allowed[0]}"}
-</foxtool>`;
-}
-
-/**
- * 深度思考的「提示词兜底」（模型没有原生思考开关时用）。与 buildSystemPrompt 解耦，
- * 作为动态附录每轮注入，避免「切换思考开关 → system 前缀变化 → 前缀缓存整段失效」的漂移。
- */
-function buildDeepThinkingHint(cfg) {
-  try {
-    const rp = reasoning.buildReasoningParams(cfg || {}, { stream: !((cfg && cfg.forceNonStream)) });
-    return rp && rp.promptHint ? rp.promptHint : '';
-  } catch (_) {
-    return '';
-  }
-}
-
+/** 薄壳转发：buildSystemPrompt 已迁至 src/prompts.js（调用点零改动） */
 function buildSystemPrompt(cfg, envBrief, protocol, queryText) {
-  const base = cfg.systemPrompt || '你是一位资深工程师，回答简洁准确。';
-  const extSection = buildExtensionCommandsSection();
-  // 本地小模型（Ollama / LM Studio / llama.cpp 等）上下文窄、指令跟随弱：
-  // 用精简版系统提示，避免 21 条工作准则 + 12 条编码铁律 + 全工具 schema + MCP 自写指南把它压垮。
-  const isLocal = !!(cfg.meta && cfg.meta.local);
+  return prompts.buildSystemPrompt(cfg, envBrief, protocol, queryText);
+}
 
-  if (protocol === 'chat') {
-    return `${base}
-
-（当前无法调用工具：可能是智能体模式未开启、当前协议/模型不支持 function calling，或 Responses 协议下工具调用被服务端拒绝。你只能基于用户提供的信息做文字回答，不要声称自己读取、修改或执行了任何操作。）`;
-  }
-
-  const structured = cfg.structuredOutput
-    ? '\n【结构化输出】在总结、计划、任务清单、配置说明等场景，优先输出 JSON 或 YAML 等结构化格式，避免冗余自然语言描述。'
-    : '';
-
-  // 多厂商原生联网（服务端执行）：按 provider/apiMode 生成「你有可用联网能力」提示段，
-  // 覆盖 DeepSeek / OpenAI / 通义百炼（Responses 与 Chat enable_search）/ 智谱 / Kimi / Claude。
-  const provider = cfg.provider || 'llamacpp';
-  const apiMode = cfg.apiMode || 'chat';
-  const nativeSearchHint = nativeSearch.nativeSearchSystemHint({ provider, apiMode }) || '';
-
-  // 强制引用与溯源护栏（对应生产级方法论「生成必附来源、无依据输出信息不足」）。
-  // 开启后，要求基于检索/文件/代码的内容必须标注来源；无可靠依据不得编造，须明确说信息不足。
-  const citationGuard = cfg.guardrails && cfg.guardrails.forceCitation
-    ? '\n【引用与溯源护栏（已强制开启）】' +
-      '1) 凡是回答依据了【本地知识库参考】、文件内容、搜索结果、诊断/终端输出或代码，必须附上可核验的来源标记，' +
-      '例如「（来源：知识库《xxx》/ 文件 src/a.js:12 / web_search 结果 / 终端输出）」，不得凭空给出无出处的事实。' +
-      '2) 若用户问题超出上述任何可依据资料的范围、或检索/搜索未给出答案，必须如实说「信息不足，无法确认」，' +
-      '严禁编造看似合理的细节、路径、版本号、数据或结论。' +
-      '3) 当某结论与已知资料冲突时，以资料为准并说明冲突，不要掩盖不确定性。'
-    : '';
-
-  // 多模态能力指引：明确告诉主控模型「用户要画图必须调 generate_image」「图片会自动经中转转文字」。
-  // 否则模型容易退回用 SVG/代码替代生图，或误以为自己无法处理图片。
-  const multimodalGuide = `
-【多模态能力】
-- 生图（重要）：用户要画图/生成图片/做海报/图标/logo/示意图/配图时，必须调用 generate_image 工具（走独立配置的生图模型，与你隔离）；除非用户明确要「矢量图/SVG/HTML 动画」，否则不要用 SVG、Python、HTML/CSS 代替生图。
-- 识图：用户发的图片会自动经识图中转转成文字再交给你，无需调用工具即可理解；若看到“图片已忽略”，说明未开启识图中转或当前模型不支持读图，向用户说明需开启 foxAi.vision 或换支持读图的模型。`;
-
-  // 12 条编码铁律（用户要求注入，尽量省 token：极简中文 + 单行，不重复工作准则已有内容）。
-  // 作为系统提示词的固定一小段，让所有厂商模型在编码时都遵循同一套方法论。
-  const codingRules = `
-【编码铁律（必须遵守，越界时优先于“尽快完成”）】
-1. 先想后写：不臆测，先暴露取舍与风险。
-2. 极简优先：最小代码，不写猜测性/防御性冗余。
-3. 手术式改动：只动必须动的地方。
-4. 目标驱动：先定义“完成”标准，循环直到可验证通过。
-5. 模型只做判断：确定性/体力活交给工具与脚本。
-6. Token 预算是硬约束，不是建议：优先省 token，必要时再展开。
-7. 暴露冲突，不要折中平均：方案相悖就明说，别各取一半。
-8. 写之前先读：改文件前必须看过真实内容。
-9. 测试验证意图而非行为：测“为什么对”，不是“能不能跑”。
-10. 每步留检查点：完成一步就落实（保存/校验/记录），可随时恢复。
-11. 顺应既有约定：即便不认同也先遵循项目风格与规范。
-12. 失败要响亮：出错就明确报错并停下，别静默吞掉或假装成功。`;
-
-  // MCP 自写指南约 1.7k 字符（含完整协议模板），只在用户开启 MCP（foxAi.mcp.enabled）时注入；
-  // 默认关闭 MCP 的大多数用户直接省下这一整块固定前缀 token。
-  const mcpGuide = (() => {
-    try { return config.conf().get('mcp.enabled', false) ? mcpAuthor.MCP_AUTHORING_GUIDE : ''; } catch (_) { return ''; }
-  })();
-
-  const common = `${base}
-
-你现在是 VS Code 里的编程智能体「狐狸 AI」，` + (cfg.model ? `由 ${cfg.model} 驱动，` : '') + `可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
-
-【当前环境】
-${structured}${nativeSearchHint}${citationGuard}
-
-【工作准则】
-1. 先了解再动手：修改任何文件前，必须先用 read_file 看过真实内容，不要凭空猜测代码。文件只需读取一次——如果已经读过、内容未变，不要反复读取同一个文件，直接基于已有信息推进任务。**注意：系统已启用「未读禁止写」硬门控——本会话未 read_file 过的已存在文件，edit_file/write_file 会被直接拦截并回灌「请先读取」；所以对要改的文件务必先读，不要试图跳过。**
-2. 改动用 edit_file 做最小必要修改；只有新建文件或整体重写时才用 write_file。edit_file 支持 start_line/end_line 限定范围，以及 start_char/end_char 做字符级替换，优先用这些方式而不是重写整文件。
-3. old_text 必须与原文逐字符一致（含缩进与空行），并且在文件里唯一；可先用 read_file 读一段，再在该范围内替换。
-4. 执行命令必须是非交互式的（带上 -y、--yes 等），不要启动会一直挂着的进程（如开发服务器）。
-5. 改完代码后，用 get_diagnostics 确认没有引入新的错误；用户提到“报错/跑不起来”时，先用 get_terminal_output 或 get_diagnostics 看真实错误再动手。
-6. 一次只做一步，根据工具返回结果决定下一步。不要假设工具已经成功。
-7. 任务完成后，用中文简明总结你改了什么、为什么改，不要复述整个文件内容。
-8. 如果需求不清晰或有破坏性风险，先说明并询问用户，不要擅自大改。
-9. 当用户询问当前时间、日期、天气、新闻、最新版本、实时数据等时效性信息时，必须调用 current_time 或 web_search 工具获取信息后再回答。绝对禁止直接说"我无法获取当前时间"或"我没有实时信息"。
-10. 可复用的固定流程可用 create_skill 沉淀成用户技能，下次 use_skill 激活；**若技能已存在（list_skills 可见）或刚激活过，绝对不要再 create_skill 同名技能**，直接按其指导执行。
-11. 若你启动或指导用户使用了需要终端交互的程序（例如由 use_skill 激活的交互式脚本、游戏、REPL），必须在让用户输入后调用 get_terminal_output 读取终端最新输出，再根据输出继续交互；不要假设你知道用户输入了什么。
-12. 多步骤项目任务先用 create_plan_task 拆成可见清单（pending/in_progress/completed）；**强烈推荐用 set_plan_tasks 一次性给出完整清单做整表替换**（标记完成、调整计划时一律用它）——它不需要任务 id，彻底避免「记不住 id → 找不到任务 → 状态没改」的坑。**禁止再用 update_plan_task 反复重试同一 id**——如果 update_plan_task 返回「找不到任务 #xxx」，必须立即改用 set_plan_tasks 整表替换，不要重试同 id。**唯一允许** update_plan_task 的场景：你要精确改单条 subject/description（不依赖状态）。用户问“进度”“还剩哪些”用 list_plan_tasks。**已通过 use_skill 激活的技能不要当任务去 create_skill**，直接执行并用 create_plan_task 记录步骤。
-13. 编码类任务收尾时，除自动语法校验（node --check/写后诊断），还应主动 run_command 跑项目测试（package.json test / pytest / go test / cargo test）；无测试则至少跑一次构建或类型检查，结果写入最终总结。
-14. 系统提示词中的【本地知识库参考】已包含用户整理好的知识库文件内容，回答相关问题时请优先基于其中信息，不要调用 find_files / search_text 去工作区“找知识库文件”，也不要因检索关键词未命中就声称没有知识库。
-15. 保持谨慎：动手前先想清影响范围，优先可逆最小改动；删除/覆盖/移动/重命名文件及 rm -rf、git reset --hard 等不可逆命令务必先确认后果（autoApprove 关闭时先征得用户同意）。声称“完成”前必须用工具核实结果（get_diagnostics/跑测试/读回文件），不要凭假设说成功；拿不准先问清楚再动手。
-16. 当用户明确说“读 / 看 / 打开 / 检查某个文件”或提及具体文件名并要求了解其内容时，必须**立即调用 read_file** 读真实内容，不要反问、不要凭记忆猜测或编造文件内容，读完再基于原文回答。
-17. 自动代码审查：每轮写操作后，只读审查子代理会把意见发回；若有明显问题（🔴 严重项）请及时修正，无问题则继续。
-18. 自我验证：声称“完成”前先自检——结论是否来自工具返回、有无编造路径/结果、是否真正回答了用户问题；剔除不准确或冗余信息。
-19. 安全自检双盲校验：security_audit 结果仅供参考，**禁止作为修复唯一依据**；据自检修复后必须再调用 referee_review 对比语义差异，若判定「修复前后等价」（疑似误报）则**强制挂起转人工**。
-20. 子代理编排：多条互不相干的支线、或子任务要翻十几个文件时，用 spawn_subagent 派出去（子代理有独立上下文，你只收到结论，省 token 更快）。角色：explorer 只读 / coder 改代码 / reviewer 挑错 / tester 跑命令 / researcher 联网 / planner 拆解。task 必须自包含，背景写进 context，有依赖用 depends_on。**别滥用**：一两次工具调用能搞定的自己做。
-21. 后台任务：仅当用户**明确要求异步**（「后台帮我做 X」）或任务极耗时时，才用 run_background_agent 丢后台；丢完立刻回复「已在后台处理」，**不要**原地反复查询。后台在 git 仓库自动开独立分支、不碰你正在编辑的文件，非 git 降级只读；结束后结论不会自动出现，用户问起用 background_jobs(action=get) 取回。` + (cfg.planAndExecute && cfg.planAndExecute.enabled ? `\n\n22. 规划确认模式已开启：多步骤任务先用 create_plan_task 列出完整计划，再调用 present_plan 提交确认；调用 present_plan 后必须停止，等待用户确认。确认后逐步执行，每步用 set_plan_tasks 整表更新状态（或 update_plan_task 单条标记）；执行中需调整计划（增删步骤/改目标）时，先用 set_plan_tasks 改好计划再调用 revise_plan 说明原因，等用户再次确认后继续。` : '') + codingRules + extSection + (mcpGuide ? '\n\n' + mcpGuide : '');
-
-  // 本地小模型精简版：去掉重型工作准则（多模态/技能/子代理/后台/MCP 自写）、MCP_AUTHORING_GUIDE，
-  // 只保留编码铁律 + 8 条最关乎工具正确调用的核心准则，降低指令跟随负担。
-  const commonLocal = `${base}
-
-你现在是 VS Code 里的编程智能体「狐狸 AI」，` + (cfg.model ? `由 ${cfg.model} 驱动，` : '') + `可以直接读写用户工作区的文件、执行终端命令、读取报错信息。
-
-${structured}
-
-【工作准则（精简版，针对本地模型）】
-1. 修改任何文件前，必须先用 read_file 看过真实内容；编辑用 edit_file 做最小必要改动，不要整文件重写。
-2. 执行命令必须是非交互式的（带上 -y / --yes 等），不要启动会一直挂起不返回的进程。
-3. 一次只做一步，根据工具返回结果决定下一步；不要假设工具已经成功，要核实结果。
-4. 任务完成后用中文简明总结改了什么、为什么改；需求不清晰或有破坏性风险时先说明并询问用户。
-5. 删除 / 覆盖 / 移动 / 重命名等不可逆操作，以及 rm -rf、git reset --hard 这类命令，务必先确认目标与后果。
-6. 声称「完成」之前，必须用工具核实结果（get_diagnostics 看报错、跑测试、读回文件），不要凭假设说成功。
-7. 当用户问当前时间、日期、天气、新闻、最新版本等时效性信息时，必须调用 current_time 或 web_search 工具后再回答，不要说"我无法获取"。
-8. 如果回复文本里没有任何工具调用块，系统会把它当作最终回答直接展示给用户。${codingRules}`;
-
-  const commonUsed = isLocal ? commonLocal : common;
-  // 厂商专属适配：缩小「厂商原生 agent vs 第三方 agent」在同一模型上的质量差距。
-  // 文本随 system 前缀一起缓存、字节稳定；可设 foxAi.agent.providerProfile 覆盖（auto / deepseek / openai / claude / none / 自定义文本）。
-  const providerProfile = providerProfiles.resolveProfile(cfg);
-  const withProfile = providerProfile ? (commonUsed + '\n\n' + providerProfile) : commonUsed;
-
-
-
-  if (protocol === 'text') {
-    // 1.1.14：工具手册「按需检索」模式。textOnly（WebAI2API 网页接入）默认启用：
-    // 不再把 86 个工具的完整 schema 塞进 system（模型不遵守还容易上下文污染），
-    // 改为「首轮锁死必须先调 get_tools」——第一轮就用 <foxtool> 固定格式调用一次检索工具，
-    // 锚定格式后按需查工具。普通 text 模型（本地/DeepSeek）保持全量手册（可缓存、命中率优）。
-    const tgMode = cfg.toolGuideMode || 'auto';
-    const useGuide = tgMode === 'on' || (tgMode === 'auto' && cfg.meta && cfg.meta.textOnly);
-    if (useGuide) {
-      return `${withProfile}
-
-【调用工具的方式】
-你没有原生函数调用，必须用下面的固定格式调用工具，一次只调用一个。系统只认工具调用块：
-
-${tools.wrapToolCall('工具名', '{"参数名": "参数值"}')}
-
-规则：
-1. 【第一步·锁死】开始任何任务前，你的第一条回复必须且只能是下面这一个工具调用（先获取可用工具清单，再决定怎么做）：
-${tools.wrapToolCall('get_tools', '{}')}
-   在成功调用 get_tools 拿到工具清单之前，系统不会执行任何其他工具；若第一轮没有输出该调用，系统会回灌提示要求你重试。
-2. 之后想用某个工具时，先按需调用 get_tools（query 填关键词，如"文件""搜索""执行命令"）检索它的参数与调用示例，再照抄格式调用；拿不准有什么工具就随时再查。
-3. 工具块必须独立成段，里面是合法 JSON。写完调用块后立刻停止输出，等待工具结果。
-4. 如果文本中没有任何工具调用块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
-5. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出工具调用块，不要额外解释。
-6. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
-7. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、不要把它写进代码块围栏、不要模拟系统提示/日志/记忆沉淀、更不要用「我已使用 write_file 创建了…」这类叙述代替执行——那些都不会触发任何执行。调用工具唯一可靠的写法就是上面的工具调用块。
-8. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用工具调用块执行下一步；有多套方案就选最合理的直接做。系统会把每一步的真实执行与结果展示出来，只有遇到真正无法决定或危险的操作才询问用户。
-9. 复杂任务善用特色工具（全部见 get_tools 清单，按需检索）：多步骤任务先用 create_plan_task 列计划、用 set_plan_tasks 更新进度；多条互不相干的支线用 spawn_subagent 派子代理；写完代码用 run_in_sandbox 隔离自测、security_audit 只读自检、get_diagnostics 核对报错；跨会话回忆用 allow_session_access；需要配图用 generate_image。别只会 read/write。
-
-【常用工具速记】（完整清单与参数请调用 get_tools 检索）：
-read_file 读文件 · write_file 写文件 · edit_file 改文件 · list_dir 列目录 · find_files 找文件 · search_text 搜文本 · run_command 执行命令 · get_tools 查工具`;
-    }
-    return `${withProfile}
-
-【调用工具的方式】
-你没有原生函数调用，必须严格用下面格式调用工具，一次只调用一个。口头说"我要读取 xxx"不会触发任何工具，系统只看工具调用块：
-
-${tools.wrapToolCall('工具名', '{"参数名": "参数值"}')}
-
-规则：
-1. 工具块必须独立成段，里面是合法 JSON。写完调用块后立刻停止输出，等待我把结果发给你。
-2. 如果文本中没有任何工具调用块，系统将认为你不需要调用工具，会直接把你的话当作最终回答展示给用户。
-3. 不要在一个回复里混用自然语言解释和工具块；想调用工具时只输出工具调用块，不要额外解释。
-4. 收到工具返回后，再基于返回内容整理成最终回答；工具返回为空时要明确说明「工具返回为空」。
-5. 严禁用「假装调用」冒充工具：不要输出 read_file("路径") 这类函数调用样式、也不要把它写进代码块围栏、更不要模拟系统提示/日志/记忆沉淀——那些不会被识别成工具调用（个别情况下系统会尽力识别函数调用样式作为兜底，但参数顺序按工具定义 path 在前，容易出错）。调用工具唯一可靠的写法就是上面的工具调用块。
-6. 严禁用自然语言「声称已调用」代替执行：不要输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述——系统没有收到任何调用块时，这些陈述**不会触发任何执行**，会被判定为无效并回灌修正提示。想执行就输出工具调用块，别无他法。
-7. 不要「只说不做」：不要先输出方案征求用户确认（如「请确认是否执行」「确认后我将写入」）——收到任务或审查意见后，**直接**用工具调用块执行下一步；有多套方案就选最合理的直接做，系统会把每一步的真实执行与结果展示出来，只有真正无法决定或危险的操作才询问用户。
-
-【可用工具】
-${tools.toTextManual(queryText, cfg)}`;
-  }
-
-  return withProfile;
+/** 薄壳转发：buildDeepThinkingHint 已迁至 src/prompts.js */
+function buildDeepThinkingHint(cfg) {
+  return prompts.buildDeepThinkingHint(cfg);
 }
 
 /**
@@ -693,30 +329,57 @@ class AgentSession {
     // 本会话后续轮次都保持文本协议，避免每轮先 400 再重试（见 run() 降级分支）。
     this._forceText = false;
     // 1.1.14：声称调用但无实际调用的回灌修正计数（限 2 次，防死循环）
-    this._claimNudges = 0;
     // 1.1.14：get_tools 首轮强制——是否已获取工具清单、强制回灌计数
     this._toolGuideFetched = false;
     this._guideNudges = 0;
+    this._emptyStreak = 0;
+    // 1.1.26 韧性加固：区分「空响应」与「空轮」——
+    //   空响应 = 模型 content 与 reasoning 全空（服务端异常/限流抖动），应带指数退避重试 API；
+    //   空轮   = 有正文但没工具块（模型在叙述而非执行），应 nudge 而不是重试。
+    //   二者此前混在 _emptyStreak 一条路上：空响应被当空轮，重试机会为零 → 会话直接收尾中断。
+    this._emptyRespRetries = 0;
+    // 1.1.26：native 协议「只叙述不调工具」的对症开关。
+    // 日志实证：protocol=native 下模型输出「我先看一下工作区里的题目文件」这类正文却从不发起
+    // tool_calls（nativeCalls=0），连着 3 轮空轮收尾。text 协议时系统提示会强制教格式、模型照做；
+    // native 下模型「自由」了反而不调。对策：空轮后的 nudge 轮强制 tool_choice，
+    // Anthropic 用 'any'、OpenAI 兼容用 'required'（两者语义都是「本轮必须调用某个工具」）。
+    this._forceToolChoice = false;
+    // 1.1.26：native 空轮耗尽后是否已自动降级过 text（每会话只降一次，避免来回横跳）
+    this._nativeDowngraded = false;
     // 1.1.15：恢复旧会话（重启服务/切换会话）时，若历史里已有 get_tools 成功记录，
     // 视为「工具清单已获取」，避免再强制模型重发一遍 get_tools 调用。
+    // 1.1.19：恢复会话识别——历史里已有 get_tools 结果即视为「恢复」，_resumedSession=true。
+    // 用户终止服务后再在原对话里继续聊天时，不会再重复发一次强制 get_tools 引导（原本会发）。
+    this._resumedSession = false;
+    // 1.1.19：textOnly（WebAI2API）新会话「前置 get_tools 引导」是否已发出（每会话一次）
+    this._prependedGuide = false;
+    // 1.1.19：首轮引导是否已摘除用户问题并把引导放在历史头部（引导写回源历史只允许一次）
+    this._guideAtHead = false;
     try {
       const msgs = this.messages || [];
+      // 注意：⚠️ 不能用「历史里有 user 消息」判定恢复会话——当前这条提问本身就是 user，
+      // 若这么判，新会话也会被误判为「恢复」→ 前置 get_tools 引导被跳过、用户问题先发（样式错误）。
+      // 只有历史里【已存在 get_tools 结果】才是真正的「恢复会话」（服务终止后在原对话续聊），
+      // 此时工具清单早已拿到，不该再强制重发一遍 get_tools。
       for (const m of msgs) {
         if (!m) continue;
         // text 协议：工具结果以 [工具 get_tools 的结果] 的 user 消息存在
         if (typeof m.content === 'string' && /\[工具\s+get_tools\s*的结果\]/.test(m.content)) {
           this._toolGuideFetched = true;
+          this._resumedSession = true;
+          this._ev(agentEvents.EV.RESUMED, { source: 'text' });
           break;
         }
         // native 协议：工具结果以 role:'tool' + name 存在
         if (m.role === 'tool' && m.name === 'get_tools') {
           this._toolGuideFetched = true;
+          this._resumedSession = true;
+          this._ev(agentEvents.EV.RESUMED, { source: 'native' });
           break;
         }
       }
     } catch (_) {}
     // 1.1.14：只说不做/请求确认的回灌计数（限 2 次）
-    this._askNudges = 0;
     // 1.1.15：textOnly（WebAI2API）动态上下文「内容哈希去重」缓存（见 _dynCache.env 位点）；
     // 1.1.14 的轮次降频（_dynTick/DYN_EVERY）已废弃，改为内容变化才注入。
     this._dynTick = 0;
@@ -753,18 +416,43 @@ class AgentSession {
     // 续跑：关联会话 id 与要复用的任务 id
     this.sessionId = opts.sessionId || null;
     this.resumeTaskId = opts.resumeTaskId || null;
+    // ★ 会话进度摘要（对齐 DSH session-checkpoint）：重开/断点续跑时 chatView 把存档里的
+    // progress 块传进来，模型凭它知道自己「上次干到哪、下一步做什么」，不再对当前上下文一片空白。
+    // 运行期每条工具流水记进 _progressEntries，_renderProgressBlock() 渲染成紧凑块回灌请求尾部。
+    this.sessionProgress = opts.sessionProgress || null;
+    this._progressEntries = [];
+    try {
+      if (this.sessionProgress) {
+        // 存档里的进度块是「【会话进度】…」渲染文本；拆回流水条目，让续跑的模型能直接看到
+        this._progressEntries.push({
+          t: Date.now(),
+          tool: '_session_restore',
+          text: '[会话恢复] 上次断点时已完成的进度：\n' + String(this.sessionProgress).slice(0, 1200)
+        });
+      }
+    } catch (_) {}
     // 会话标识：每个会话固定一个 conversationId，仅作内部标识/日志关联使用，
     // 不注入任何 HTTP 头（已核实：DeepSeek 等 stateless API 不认 conversation id，缓存按前缀内容自动匹配）。
     this.conversationId = opts.conversationId || opts.sessionId || ('fox-' + crypto.randomBytes(8).toString('hex'));
     // 缓存命中监控状态
     this._cachePrefixHash = null;       // 本轮请求前缀（system+tools）SHA 指纹
-    this._cacheBaselineHash = null;     // 本会话首次请求前缀指纹（用于漂移检测）
+    this._cacheDriftState = { baseline: null, prev: null }; // 前缀基线判定状态（见 src/cacheBaseline.js）
+    this._cacheBaselineHash = null;     // 兼容字段：= _cacheDriftState.baseline（report 用）
+    this._lastDriftWarnKey = null;      // 已告警过的漂移对（baseline→current），避免同一条反复刷屏
     this._stableBlock = null;           // 跨会话字节稳定的「稳定上下文块」（规则/技能/结构/任务/人格/扁平记忆），会话级冻结
     this._cachePrevHitRate = null;      // 上一轮命中率（用于「命中骤降」告警）
     this._cachePrevRequested = false;
     this._cacheWarmed = false;          // 预热是否已做过
     this._webResetSent = false;         // WebAI2API 文本协议：新建会话的重置信号是否已发过
     this._reviewResetSent = false;      // 审查子代理独立新会话信号是否已发过（每次审查首轮只发一次）
+    // 1.1.27：审查提示去重（避免同一轮多次合并审查把「正在检查 / 未返回额外意见」刷屏）。
+    // 每轮用户提问在 run() 里重置；_reviewNoticeSent 保证「正在检查」整轮只发一次，
+    // _reviewHadOpinion 记录本轮是否出现过审查意见，有则不发「未返回额外意见」。
+    this._reviewNoticeSent = false;
+    this._reviewHadOpinion = false;
+    // 1.1.19：审查新会话「前置 get_tools 引导」标记与结果缓存（两轮分离专用）
+    this._reviewGuideSent = false;      // 审查引导轮是否已发过（幂等：每会话一次）
+    this._reviewGuideResult = '';       // 引导轮 get_tools 结果（合并进真正的审查消息流）
     // 易变块指纹缓存（对齐 DSH「变了才更新」）：会话级缓存 RAG/主题记忆等 query 驱动块的
     // 结果，query 无实质变化时复用旧字节，避免每轮重检 → 每轮 miss 数千 token（命中率 71% 的主因）。
     this._dynCache = { kb: null, topicMem: null, env: null, diag: null };
@@ -855,6 +543,25 @@ class AgentSession {
     this._finalStarted = false;
     this._finalStreamed = false; // 最终正文是否已实时流式推送（用于轮末避免重复 flush）
     this._inFinalPhase = false;
+    // ---- 关键运行状态事件化（对齐 dsh：事件日志派生、一切可重放）----
+    // AgentSession 每轮重建，空轮/引导/续跑/final 状态此前只活在实例字段，会话中断后
+    // 恢复只能靠 messages 字符串猜测（脆弱）。现在统一从本会话事件日志重放重建，
+    // 让重启后的会话正确接续（不会因计数归零而重发引导/空轮回灌）。
+    try {
+      const sessionKey = this.sessionId || this.conversationId;
+      if (sessionKey) agentEvents.replayState(sessionKey, this);
+    } catch (_) { /* 事件重放失败不影响主流程（保持默认状态） */ }
+  }
+
+  /**
+   * 关键运行状态事件（事件化的统一出口）：写一行可重放事件日志 + 在内存里留痕。
+   * 所有空轮/引导/续跑/final 状态变更都走这里，杜绝散落的裸字段手改。
+   */
+  _ev(ev, fields) {
+    try {
+      const sessionKey = this.sessionId || this.conversationId;
+      if (sessionKey) agentEvents.logEvent(sessionKey, ev, fields);
+    } catch (_) { /* 事件日志写入失败不影响主流程 */ }
   }
 
   /**
@@ -1097,6 +804,9 @@ class AgentSession {
     }
     const redirected = this._redirectArgsToCwd(args, envInfo);
     return tools.execute(name, redirected, {
+      // 1.1.24（删减重构）：后台通道同样透传 toolName——否则 get_tools 在后台拿不到
+      // _catalogLimit 目录豁免，被 4000 中间挖掉 → 后台任务一样空轮。
+      toolName: name,
       maxToolOutput: 4000,
       sessionId: this.sessionId,
       background: envInfo.job.id,
@@ -1277,6 +987,8 @@ class AgentSession {
       } catch (_) {}
     }
     return tools.execute(name, args, {
+      // 1.1.24（删减重构）：子代理通道同样透传 toolName，get_tools 目录豁免才能命中
+      toolName: name,
       maxToolOutput: 4000,
       sessionId: this.sessionId,
       subagent: (meta && meta.spec && meta.spec.name) || '',
@@ -1420,6 +1132,31 @@ class AgentSession {
    * @param {number} used      已消耗的步数预算
    * @returns {Promise<boolean>} true=用户点了继续（追加预算续跑）；false=无法挂起，按旧逻辑返回
    */
+  /**
+   * 步数预算补充（自动或手动）后写回一条「续跑提示」消息。
+   * 自动续跑与用户点「继续」共用同一段注入文案，保证模型拿到一致的断点续跑语义。
+   */
+  _pushResumePrompt(kind) {
+    this.messages.push({
+      role: 'user',
+      content: `[系统] ${kind === 'auto' ? '已达到单轮步数上限，系统已自动为你追加预算继续推进' : '用户已确认继续'}。请从上次中断处接着做，先用一句话说明当前进度（已做了什么、卡在哪、下一步做什么），再继续推进；能收尾就尽快收尾。若你已完成的步骤足够达到目标，可直接收尾，不必硬跑满预算。`
+    });
+  }
+
+  /**
+   * 方法论「限制思考-行动轮次」：达到硬性步数上限时的挂起处理。
+   *
+   * 1.1.20 起支持**自动续跑**：默认不再干等用户手点「继续」——触发上限时若
+   * `foxAi.agent.autoResume`（默认 true）开启，自动追加一轮预算并把「续跑提示」写回历史，
+   * 模型带上断点信息直接继续；仅当自动续跑累计轮数达到上限（`foxAi.agent.autoResumeRounds`，
+   * 默认 5）或开关关闭时才真正挂起等待用户确认。这样长任务不再每隔 N 步就被打断一次。
+   * 用户手动「暂停」永远优先于自动续跑（paused 一经置位立即挂起）。
+   *
+   * @param {string} queryText 本轮用户问题（供压缩器摘要用）
+   * @param {string} envBrief  环境摘要
+   * @param {number} used      已消耗的步数预算
+   * @returns {Promise<boolean>} true=可继续（已自动追加预算或用户已点继续）；false=无法挂起，按旧逻辑返回
+   */
   async _hardStopPause(queryText, envBrief, used) {
     // 先尝试压缩上下文（丢弃长链路里无用的推理痕迹），给续跑腾出空间
     try {
@@ -1428,13 +1165,55 @@ class AgentSession {
       }
     } catch (_) {}
     const { appendLog } = require('./log');
+    // 1.1.20：自动续跑开关（默认开）——长任务达到步数上限时自动追加预算，不再干等用户
+    const autoResume = !!(this.cfg.autoResume !== undefined ? this.cfg.autoResume : true);
+    const autoResumeRounds = Math.max(1, Number(this.cfg.autoResumeRounds) || 5);
+    if (this.cancelled) return false;
+
+    // 用户已手动暂停：绝不自动续跑，直接挂起等「继续」
+    if (this.paused) {
+      this.emit('state', { state: 'paused' });
+      if (this.task) {
+        try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.PAUSED); } catch (_) {}
+      }
+      await new Promise((resolve) => this._resumeWaiters.push(resolve));
+      if (this.cancelled) throw new Cancelled();
+      this.paused = false;
+      this._pausedLogged = false;
+      if (this.task) {
+        try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.RUNNING).catch(() => {}); } catch (_) {}
+      }
+      this.emit('state', { state: 'running' });
+      appendLog('maxSteps', '[resume] budget+=' + (this.cfg.maxSteps || 0) + ' (manual)');
+      this._pushResumePrompt('manual');
+      return true;
+    }
+
+    // 自动续跑分支：开关开启且本会话自动续跑轮数未达上限 → 不挂起，直接续跑
+    if (autoResume && (this._autoResumeCount || 0) < autoResumeRounds) {
+      this._autoResumeCount = (this._autoResumeCount || 0) + 1;
+      appendLog(
+        'maxSteps',
+        '[auto-resume] steps=' + used + ' round=' + this._autoResumeCount + '/' + autoResumeRounds +
+        ' autoCompress=' + !!(this.cfg.autoSummarize && this.cfg.autoSummarize.enabled)
+      );
+      this.emit('notice', {
+        text: `已达到 ${used} 步上限，正在自动续跑（${this._autoResumeCount}/${autoResumeRounds}轮）…如需人工干预可随时「暂停」。`
+      });
+      this._pushResumePrompt('auto');
+      return true;
+    }
+
     appendLog(
       'maxSteps',
-      '[limit] steps=' + used + ' hold; autoCompress=' + !!(this.cfg.autoSummarize && this.cfg.autoSummarize.enabled)
+      '[limit] steps=' + used + ' hold; autoCompress=' + !!(this.cfg.autoSummarize && this.cfg.autoSummarize.enabled) +
+      ' autoResume=' + autoResume + ' rounds=' + (this._autoResumeCount || 0) + '/' + autoResumeRounds
     );
     if (this.cancelled) return false;
     this.emit('notice', {
-      text: `已连续执行 ${used} 步仍未结束，达到硬性上限，已暂停在断点。点上方「继续」即可接着做（也可停止，或调大 foxAi.agent.maxSteps）。`
+      text: autoResume
+        ? `已连续执行 ${used} 步仍未结束，自动续跑 ${autoResumeRounds} 轮后仍未能收尾，已暂停在断点。点上方「继续」可接着做（也可停止，或调大 foxAi.agent.maxSteps / foxAi.agent.autoResumeRounds）。`
+        : `已连续执行 ${used} 步仍未结束，达到硬性上限，已暂停在断点。点上方「继续」即可接着做（也可停止，或调大 foxAi.agent.maxSteps）。`
     });
     this.emit('step', { kind: 'notice', title: `达到 ${used} 步上限，等待确认`, status: 'warn' });
     // 真正挂起：pause() + gate() —— run() 停在这里，session 不被回收
@@ -1452,10 +1231,7 @@ class AgentSession {
     }
     this.emit('state', { state: 'running' });
     appendLog('maxSteps', '[resume] budget+=' + (this.cfg.maxSteps || 0));
-    this.messages.push({
-      role: 'user',
-      content: '[系统] 用户已确认继续。请从上次中断处接着做，先用一句话说明当前进度，再继续推进；能收尾就尽快收尾。'
-    });
+    this._pushResumePrompt('manual');
     return true;
   }
 
@@ -1479,6 +1255,51 @@ class AgentSession {
     });
     await this.taskManager.updateState(task.id, harness.TASK_STATES.RUNNING);
     return task;
+  }
+
+  /**
+   * 会话级「任务进度摘要」：运行期维护一条紧凑的执行流水账（每步工具名 + 参数摘要 + 结果摘要），
+   * 并随 checkpoint / 每次会话存档持久化。重开会话或断点续跑时，模型凭它知道自己「做过什么、做到哪、下一步做什么」，
+   * 不再出现「重启后对当前上下文一片空白」。
+   * @param {string} toolName 本步工具名（如 read_file / edit_file / run_command）
+   * @param {object} args     工具参数
+   * @param {string} output   工具结果摘要（截断后）
+   */
+  _recordProgress(toolName, args, output) {
+    try {
+      if (!this._progressEntries) this._progressEntries = [];
+      const argKeys = (args && typeof args === 'object') ? Object.keys(args).filter((k) => !['content', 'new_text', 'old_text', 'text'].includes(k)) : [];
+      let argHint = '';
+      argHint = argKeys.map((k) => {
+        let v = args[k];
+        if (typeof v === 'string') v = v.length > 120 ? v.slice(0, 120) + '…' : v;
+        return k + '=' + v;
+      }).join(' ');
+      if (argKeys.length) argHint = ' 参数: ' + argHint;
+      const outText = String(output || '').replace(/<foxtool[\s\S]*?<\/foxtool>/gi, '').replace(/\s+/g, ' ').trim();
+      const outStr = outText ? ' → ' + outText.slice(0, 240) : '';
+      this._progressEntries.push({
+        t: Date.now(),
+        tool: toolName,
+        text: toolName + argHint + outStr
+      });
+      // 只保留最近 80 条，避免无界增长
+      if (this._progressEntries.length > 80) {
+        this._progressEntries = this._progressEntries.slice(-80);
+      }
+    } catch (_) {}
+  }
+
+  /** 把进度流水账渲染成一个紧凑的会话进度块（供存档与恢复回灌） */
+  _renderProgressBlock() {
+    try {
+      const entries = this._progressEntries || [];
+      if (!entries.length) return '';
+      const lines = entries.slice(-30).map((e) => '· ' + e.text);
+      return '【会话进度】\n' + lines.join('\n');
+    } catch (_) {
+      return '';
+    }
   }
 
   /**
@@ -1509,10 +1330,29 @@ class AgentSession {
    */
   _collectStableParts(flatMemory) {
     const parts = [];
-    // 用户技能：agent 自己编写的可复用工作流清单，跨会话稳定
+    // 用户技能：agent 自己编写的可复用工作流清单，跨会话稳定（对齐 DSH skill catalog：
+    // 把可用技能摘要常驻上下文，模型每轮都知道有什么技能、需要时按名 use_skill 加载正文）
     try {
-      const skillText = this.skills.renderForPrompt();
-      if (skillText) parts.push('【用户技能】\n' + skillText);
+      let skillText = this.skills.renderForPrompt();
+      // 内置技能目录（对齐 DSH bundled skill）：知识库检索始终可用（不需要知识库就绪，
+      // 检索空知识库也返回空结果而不是报错），模型按需自主调取
+      const builtin = '- _knowledge_base：知识库检索（内置技能。用户问题需要参考本地知识库文档时调用 use_skill 激活它，query 传用户问题的关键词，返回命中的知识内容；知识库为空时返回空结果）';
+      const joined = skillText ? skillText + '\n' + builtin : '你拥有以下内置技能（agent 可直接按需调用 use_skill 激活）：\n' + builtin;
+      parts.push('【技能目录】\n' + joined);
+      // CLI 固定模板指令（省 token + 稳定）：长任务需要反复执行工具时，
+      // 用本插件自带的 fox CLI（位于 fox-ai/src/cli/fox.js，命令名 fox），
+      // 每次「一字不差地复述固定调用串」以命中 Prompt Cache，不要换措辞。
+      const cliGuide =
+        '【CLI 固定模板】（长任务省 token 关键）\n' +
+        '需要反复执行工具（读文件/写文件/搜索/命令/技能/审计/转换/计划/记忆/时间）时，' +
+        '用 fox CLI 代替自然语言描述，调用串固定为：\n' +
+        '  fox <工具名> --json \'{"参数":"值"}\' [--full] [--cwd 目录]\n' +
+        '- 每次复用同一调用串（一字不差），命中 Prompt Cache 不花重复 token；不要重新造句。\n' +
+        '- 输出协议：成功 foxai-ok <工具> <耗时ms> [truncated]，失败 foxai-err <工具> <码> <摘要>（stderr）。\n' +
+        '- 默认输出截断 8000 字符，需要全量时追加 --full；不要让模型反复「只看前 10 行」。\n' +
+        '- 超时不挂死：默认 120s，可 --timeout 调；失败信息单行摘要，模型一次看懂，不来回重发。\n' +
+        '- 可用工具清单：fox --list（35 个可独立执行）；编辑器绑定工具（诊断/编辑器上下文/预览等）不能用 CLI。';
+      parts.push(cliGuide);
     } catch (_) {}
     // 项目根规则（CLAUDE.md / AGENTS.md / .cursorrules …）：懒加载 + mtime 缓存，跨会话稳定
     try {
@@ -1548,35 +1388,7 @@ class AgentSession {
     return parts;
   }
 
-  _buildSkeletonSummary(root, proj) {
-    try {
-      const mainFiles = (proj.languages || [])
-        .map((l) => l.mainPath && require('path').relative(root, l.mainPath))
-        .filter(Boolean);
-      const map = projectScan.buildSkeletonMap(root);
-      const keys = Object.keys(map);
-      if (!keys.length) return '';
-      const lines = [];
-      // 优先输出主入口文件
-      for (const f of mainFiles) {
-        if (map[f]) {
-          lines.push(`📄 ${f}\n${map[f]}`);
-          delete map[f];
-        }
-      }
-      // 再输出其它文件，按路径排序，限制数量
-      const rest = Object.keys(map).sort().slice(0, 20);
-      for (const f of rest) lines.push(`📄 ${f}\n${map[f]}`);
-      if (Object.keys(map).length > rest.length) {
-        lines.push(`… 还有 ${Object.keys(map).length - rest.length} 个文件未展示`);
-      }
-      return lines.join('\n\n');
-    } catch (_) {
-      return '';
-    }
-  }
-
-  async run() {
+async run() {
     // 缓存能力点对点判定：决定预热是否执行、以及不支持的模型只提醒一次
     if (!this._cacheCapability) {
       try { this._cacheCapability = require('./client').getCacheCapability(this.cfg && this.cfg.meta, this.cfg && this.cfg.transport, this.cfg && this.cfg.model); } catch (_) { this._cacheCapability = { supported: true, kind: 'auto', provider: 'openai-compatible' }; }
@@ -1646,6 +1458,9 @@ class AgentSession {
     this._reviewConsumed = false;
     this._reviewResult = null;
     this._reviewQuotaError = null;
+    // 1.1.27：每轮重置审查提示去重标记（本轮审查提示整轮只发一次）
+    this._reviewNoticeSent = false;
+    this._reviewHadOpinion = false;
     // 产物只统计「本轮用户提问」内的改动，避免把上一轮/上一任务的产物重复展示
     this._artifacts = [];
 
@@ -1696,6 +1511,12 @@ class AgentSession {
       // auto：按模型能力智能选协议，开箱即用兼容各厂商/本地模型（增强③）
       this.protocol = modelSupportsNativeTools(cfg) ? 'native' : 'text';
     }
+    // 1.1.25（用户「除了 web 要用自定义，其他降级 text 也不能和 web 一样自定义」）：
+    // 自定义工具标签（[[tool:]]）只为 WebAI2API 防风控而生，**只认 cfg.meta.textOnly**——
+    // native 直连、以及 native 失败降级后的 text 直连，一律渲染标准 <foxtool>：
+    // 降级 text 只是「把 text 协议当工具调用通道」，绝不是 WebAI2API，不需要也不应该
+    // 附带网页风控用的自定义标签（否则直连模型又陷入 [[tool:]] vs <foxtool> 格式打架→空轮中断）。
+    tools.setCustomTagMode(!!(this.cfg && this.cfg.meta && this.cfg.meta.textOnly));
     // 本地弱模型辅助模式（1.1.17）：决定是否进入弱模型适配逻辑（约束解码/检索/闭环/锚点）。
     // cfg.localWeak 由 config.resolve 计算（auto 下本地模型默认开）。
     this._weakLocal = !!(cfg.localWeak);
@@ -1731,35 +1552,34 @@ class AgentSession {
 
   // ===== 铁打前缀：system 只放「绝对静态」的基础系统提示词；其余内容分两类 =====
   let baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol, queryText);
-  // ===== RAG / 主题记忆「按需注入」（对齐 DSH 工具式 RAG 的前缀缓存核心）=====
-  // 关键认知：RAG 每轮注入 = 每轮把 4000+ token 拼进请求尾部 = 每轮纯 miss（命中率 71% 主因）。
-  // DSH 的做法是「知识库检索是工具，模型按需调用」——不进每轮请求前缀。
-  // 这里折中：只在【首轮】或【话题明显切换】时注入一次并烤回源（模型此后可从历史回看），
-  // 同话题后续轮次【完全不注入】，避免每轮重复 miss。话题切换用 query 指纹重叠率判定。
+  // ===== RAG / 知识库「纯工具化」（对齐 DSH 工具式 RAG 的前缀缓存核心）=====
+  // 关键认知：RAG 每轮注入 = 每轮把 4000+ token 拼进请求尾部 = 每轮纯 miss（命中率崩主因）。
+  // DSH 的做法是「知识库检索是工具，模型按需调用」——知识内容不进每轮请求前缀。
+  // 这里只发一行技能提示（几十字，非知识内容），模型需要时用 use_skill(_knowledge_base)
+  // 按需检索；同话题后续轮次【完全不注入】，避免每轮重复 miss。话题切换用 query 指纹判定。
   const qFp = _qFingerprint(queryText);
   const isShortQuery = String(queryText || '').trim().length < 10;
   const topicSwitched = (fp, c) => !c || (!isShortQuery && _qOverlap(fp, c.fp) < 0.2);
 
-  // 知识库检索（RAG）：首轮 / 话题切换才注入，同话题后续轮次不注入。
-  // 1.1.18f（对齐 DSH agent-instructions 增量语义）：首轮全量基线注入后记录文件清单指纹；
-  // 同话题续轮若知识库文件清单变化（新增/移除/整理产物刷新）→ 只发一条「知识库已更新」增量块，
-  // 提醒模型先前的基线已过期、按新清单使用；没变则完全不发（RAG 已在历史里，模型可回看）。
+  // 知识库技能提示（RAG 纯工具化，对齐 DSH）：知识内容绝不进请求前缀——模型需要时
+  // 用 use_skill(name=_knowledge_base, query=…) 按需检索。只发一行技能提示，
+  // 且仅首轮 / 话题明显切换才发；文件清单变化时补一行增量提醒，同话题无变化则完全不发
+  // （知识库在工具清单与历史里，模型可回看，杜绝每轮重复粘贴）。
   let knowledgeText = '';
   {
     const c = this._dynCache.kb;
     if (topicSwitched(qFp, c)) {
-      const kbSys = await this._augmentWithKnowledge(baseSystem, queryText);
-      knowledgeText = this.kbInjectedSegment(kbSys, baseSystem);
+      knowledgeText = await this._buildKnowledgeHint();
       let filesFp = '';
       try { filesFp = kb.filesFingerprint(kb.listKnowledgeFiles(this.sessionId)); } catch (_) {}
       this._dynCache.kb = { fp: qFp, text: knowledgeText, filesFp };
     } else if (c && c.filesFp) {
-      // 同话题续轮：只对「文件清单变化」发增量（不重发全文，保住前缀缓存；也让模型知道基线已刷新）
+      // 同话题续轮：只对「文件清单变化」发一行增量（不重发提示全文，保住前缀缓存）
       let curFp = '';
       try { curFp = kb.filesFingerprint(kb.listKnowledgeFiles(this.sessionId)); } catch (_) {}
       if (curFp && curFp !== c.filesFp) {
         this._dynCache.kb = { ...c, filesFp: curFp };
-        knowledgeText = `【知识库已更新】\n先前注入的知识库基线（文件清单 ${c.filesFp}）已过期；相关知识库文件有新增、移除或整理产物刷新。如需最新内容请按需检索或参考最新基线，不要引用先前基线中已不存在的文件。`;
+        knowledgeText = '【知识库已更新】知识库文件清单已变化（新增/移除/整理产物刷新）。如需最新内容请用 use_skill(name=_knowledge_base, query=…) 按需检索。';
       }
       // 未变化：knowledgeText 保持空，不注入
     }
@@ -1853,6 +1673,18 @@ class AgentSession {
   // 仅在命中时才注入（不进 stable，避免污染可缓存前缀）；这是对抗长上下文注意力衰减的关键。
   const batchHint = buildBatchModeHint(queryText);
   if (batchHint) dynParts.push(batchHint);
+  // 1.1.32：纯问候/闲聊轮直答护栏——极短且无任务意图时追加一行提示，让模型直接文字回复、
+  // 不调任何工具（含 get_tools/联网/时间查询）。只进动态附录、不写回 system，前缀缓存基线不受影响。
+  if (isChatter(queryText)) {
+    dynParts.push('【纯对话轮】本轮用户只是问候/闲聊/简短回应：请直接文字回复，不要调用任何工具（包括 get_tools、联网搜索、时间查询）。');
+  }
+  // ★ 会话进度回灌（对齐 DSH goal_round「Treat current workspace/tool results as authoritative」）：
+  // 把本会话已执行的工具流水账（上一步做了什么、结果如何）注入请求尾部，模型凭此知道自己干到哪，
+  // 断点续跑/重开会话时不再「对当前上下文一片空白」。只有非空才注入，避免空块污染动态附录。
+  try {
+    const progressBlock = this._renderProgressBlock();
+    if (progressBlock) dynParts.push(progressBlock);
+  } catch (_) {}
 
   // —— 稳定上下文块：规则/技能/结构/任务/人格/扁平记忆，跨轮字节稳定。
   // 首轮（源历史尚无稳定哨兵）注入一次并烤回 this.messages 源，之后随历史沉淀进缓存、每轮命中，
@@ -1920,6 +1752,109 @@ class AgentSession {
         const varAppendix = dynParts.filter(Boolean).join('\n\n');
         // 稳定块已前移进 system 前缀（见上方 _stableBlock 拼接），此处不再注入 user 消息。
         const preparedHistory = await this.prepareHistory();
+        // 1.1.19：textOnly（WebAI2API）新会话首轮「前置 get_tools 引导」（对齐样品.md 三步分离）——
+        // ★ 网页端（WebAI2API）是「模拟点击」：它把请求里的 messages 拼成虚拟上下文整段粘贴进
+        // 网页输入框。若把 system+历史+当前问题一次性发出，网页里只会出现一条「巨型用户消息」，
+        // 用户问题混在历史段里不独立成条（用户实测「顺序对了但消息没发出去」的根因）。
+        // 因此改为【三步独立请求】，每次只带一条 user 消息（不带 system/历史）：
+        //   ① 发强制 get_tools 引导（新会话信号 fox_new_session 只在第一步带）
+        //   ② 模型输出工具调用 → 本地执行 get_tools → 把工具结果作为独立消息发出
+        //   ③ 发用户真实问题（含动态上下文）→ 模型带着工具清单正式回答
+        // 网页对话里即呈现样品.md 的独立三条：引导 → 工具结果 → 真实问题。
+        // 恢复会话（服务终止后在原对话续聊 / 切换会话）时 _resumedSession=true，跳过。
+        let _webGuideResult = null;
+        const isWebTextSess = !!(cfg.meta && cfg.meta.textOnly);
+        if (isWebTextSess && !this._resumedSession && !this._toolGuideFetched && !this._prependedGuide) {
+          this._prependedGuide = true;
+          this._ev(agentEvents.EV.PREPENDED_GUIDE, {});
+          const b = selectBackend(cfg);
+          const mkOpts = (messages) => ({
+            baseUrl: cfg.baseUrl,
+            apiKey: cfg.apiKey,
+            model: cfg.model,
+            messages,
+            temperature: cfg.temperature,
+            maxTokens: cfg.maxTokens,
+            timeout: cfg.timeout,
+            insecureHttpParser: cfg.insecureHttpParser,
+            streamFormat: cfg.streamFormat,
+            signal: this._abortCtrl ? this._abortCtrl.signal : undefined
+          });
+          try {
+            // 1.1.32：引导轮可视化——get_tools 动作卡推进会话栏/工作链（对齐样品.md「模型先输出 get_tools」），
+            // 结果一并展示（卡片折叠区），引导失败则卡片标错，不再静默无痕。
+            const guideUiId = 'guide-' + Date.now().toString(36);
+            let _guideEnded = false;
+            const guideEnd = (ok, output) => {
+              if (_guideEnded) return;
+              _guideEnded = true;
+              this.emit('toolEnd', { id: guideUiId, ok, output });
+            };
+            this.emit('toolStart', { id: guideUiId, name: 'get_tools', kind: 'read', title: '🧰 获取工具', args: {}, preview: null });
+            // ① 引导轮（独立消息）
+            // ★ 1.1.19 修复：fox_new_session 只在【真·新会话】时带（messages 无历史 = 用户刚点新建会话），
+            // 同一会话继续对话（有历史）时【不带】——否则每次提问都让网页「新对话」，之前的会话被冲掉、
+            // 每次都重新 get_tools（用户实测「每发一句 web 就来一次获取工具」的根因）。
+            // 判定：preparedHistory 里除当前提问外还有历史 user 消息 = 同会话继续。
+            const _histUsers = preparedHistory.filter((m) => m && m.role === 'user');
+            const _isFreshSession = _histUsers.length <= 1;
+            const guideBody = { role: 'user', content: '[系统] 本任务的第一步必须先调用 get_tools 获取可用工具清单（这是固定格式要求）。请立即只输出下面这一个工具调用块，不要附加任何解释：\n\n' + tools.wrapToolCall('get_tools', '{}') };
+            // ★ 1.1.19：三步引导第①步若带了 fox_new_session（真·新会话），必须同步置 _webResetSent=true——
+            // 否则三步引导绕过 _request 后，主循环后续轮次（如工具结果回填后的继续请求）会因 _webResetSent
+            // 仍为 false 而再次携带 fox_new_session → 网页每轮工具调用都「新对话」冲掉会话（日志里 list_dir
+            // 工具结果带 foxNewSession=true 的根因）。
+            if (_isFreshSession) this._webResetSent = true;
+            const g1 = await llmLimiter.run(() => b.nonStream(Object.assign(mkOpts([guideBody]), {
+              extraBody: _isFreshSession ? { fox_new_session: true } : {}
+            })));
+            const g1Text = (g1 && (g1.content != null ? g1.content : g1.text)) || '';
+            // 解析 get_tools 工具块并本地执行。
+            // ★ 必须用 parseTextCalls（内部先 normalizeToolTags）——模型常输出自定义符号
+            //   [[tool:get_tools]]{}[[/tool]]，TOOL_BLOCK 只认 <fox:tool> XML 格式会解析失败
+            //   → get_tools 不执行、工具结果不发、直接跳去发用户消息（用户实测「没按样品.md」的根因）。
+            let toolFeed = '';
+            const gCalls = parseTextCalls(g1Text, this._toolNameSet());
+            const gCall = gCalls && gCalls.find((c) => String(c.name).toLowerCase() === 'get_tools');
+            if (gCall) {
+              let gargs = {};
+              try { gargs = JSON.parse(gCall.rawArgs || '{}'); } catch (_) {}
+              const out = await tools.execute('get_tools', gargs, { token: this.token, toolName: 'get_tools' });
+              this._toolGuideFetched = true;
+              this._ev(agentEvents.EV.TOOL_GUIDE_FETCHED, {});
+              toolFeed = '[工具 get_tools 的结果]\n' + String(out) + '\n\n请根据结果继续，或给出最终回答。';
+              guideEnd(true, String(out).slice(0, 800));
+              // ★ 1.1.19 修复：get_tools 结果【写回 this.messages 源历史】——
+              // 每次提问都新建 AgentSession，构造函数扫描 messages 里是否有 [工具 get_tools 的结果]
+              // 来判定「已获取清单」（_resumedSession）。若不写回，同会话第二次提问扫不到 →
+              // _resumedSession=false → 又触发三步引导 + 网页反复 get_tools（用户实测每句一次）。
+              // 写回后：同会话继续时构造函数扫到 → 跳过三步引导，只走正常主循环（网页会话历史自带清单）。
+              this.messages.push({ role: 'user', content: toolFeed });
+            }
+            // ② 工具结果轮（独立消息；引导没产出调用则跳过本步）
+            if (toolFeed) {
+              await llmLimiter.run(() => b.nonStream(mkOpts([{ role: 'user', content: toolFeed }])));
+            }
+            // ③ 真实问题轮：把本轮用户提问作为独立消息发出，
+            //    并附上动态上下文（深度思考/环境/记忆等，对齐样品.md 用户消息后的【狐狸AI·动态上下文】）
+            const lastU = preparedHistory.slice().reverse().find((m) => m && m.role === 'user');
+            const userContent = lastU
+              ? (typeof lastU.content === 'string' ? lastU.content
+                : (Array.isArray(lastU.content) ? lastU.content.filter((c) => c && c.type === 'text').map((c) => c.text).join('\n') : ''))
+              : '';
+            if (userContent) {
+              let finalContent = userContent;
+              if (varAppendix) {
+                finalContent = userContent + '\n\n' + this._wrapAppendix(varAppendix, DYN_MARK);
+                // 同步记录 webBlockCache 指纹，避免后续轮重复注入同内容动态块
+                if (this._webBlockCache) this._webBlockCache.set(DYN_MARK, { fp: _contentFingerprint(varAppendix) });
+              }
+              _webGuideResult = await llmLimiter.run(() => b.nonStream(mkOpts([{ role: 'user', content: finalContent }])));
+            }
+          } catch (_) {
+            // 三步引导失败不影响主流程：回落到主循环正常 payload（模型可能缺清单，但至少问题能发出去）
+            guideEnd(false, '获取工具清单失败，已回落主流程');
+          }
+        }
         if (varAppendix) {
           this._injectDynamicAppendix(preparedHistory, varAppendix, DYN_MARK);
           // ★ 关键修复（1.1.22）：易变附录必须同步烤回 this.messages 源历史，否则源里该 user 消息是裸的、
@@ -1951,13 +1886,17 @@ class AgentSession {
           maxTokens: cfg.maxTokens,
           contextWindow: cfg.contextWindow
         });
+        // ★ 注：textOnly（WebAI2API）首轮「前置 get_tools 引导」已在 prepareHistory() 之后、
+        // _injectDynamicAppendix 之前执行过一次（见上方 1940-1956 段落），此处不复述，避免重复。        
         const payload = [{ role: 'system', content: system }].concat(preparedHistory);
         const useNative = this.protocol === 'native';
 
         let result;
         try {
           // 长度截断续跑轮：强制文本协议（不给工具），让模型只续写正文、不被工具调用带偏
-          result = await this.callModel(payload, useNative, this._lenContinue ? [] : undefined);
+          // 首轮三步引导（_webGuideResult）已把真实问题发给模型并拿到回复 → 直接复用，
+          // 不再重复走 callModel（否则网页里用户问题会再发一遍）。
+          result = _webGuideResult || await this.callModel(payload, useNative, this._lenContinue ? [] : undefined);
         } catch (err) {
           // 模型不支持 tools（或 MCP 大 schema 触发 400）→ 自动降级到文本协议再试一次
           // DeepSeek Responses API 必须保持 native 才能触发官方 {type:'web_search'} 原生联网；
@@ -1973,13 +1912,8 @@ class AgentSession {
             // 由主循环统一注入到最后一条 user 消息，绝不写回 system —— system 始终等于
             // baseSystem，铁打不变、可缓存。
             baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol) + (this._stableBlock ? '\n\n' + this._stableBlock : '');
-            // 复用首轮已缓存的 RAG 结果（同轮 query 未变），不重复检索、不重复 miss
-            if (this._dynCache.kb && this._dynCache.kb.text) {
-              knowledgeText = this._dynCache.kb.text;
-            } else {
-              const kbSys2 = await this._augmentWithKnowledge(baseSystem, queryText);
-              knowledgeText = this.kbInjectedSegment(kbSys2, baseSystem);
-            }
+            // 复用首轮已缓存的知识库技能提示（同轮 query 未变），不重复生成、不重复 miss
+            knowledgeText = (this._dynCache.kb && this._dynCache.kb.text) || await this._buildKnowledgeHint();
             this.emit('notice', {
               text: '当前模型不支持原生函数调用，已自动切换为文本协议模式继续。'
             });
@@ -2001,11 +1935,24 @@ class AgentSession {
             ? String(result.content || '') + '\n' + String(result.reasoning || '')
             : String(result.content || '');
 
+        // ===== 1.1.26 韧性加固④：每轮原始返回落盘 =====
+        // 排查「空轮/中断」的第一手证据：模型本轮到底说了什么、有没有吐工具块。
+        // 重点看 hasToolTag —— 为 false 说明模型压根没按格式输出（用户「重点看是否有 Action 字样
+        // 如果没有说明解析失败，需要加强输出格式约束」）。
+        try {
+          const _raw = String(textSource || '');
+          const _hasTag = /<(fox:?tool|fox-tool|tool)\s+name\s*=/i.test(_raw) || /\[\[tool:/i.test(_raw);
+          appendLog('agent', `[turn-raw] step=${step} protocol=${this.protocol} len=${_raw.length} hasToolTag=${_hasTag} `
+            + `contentLen=${String(result.content || '').length} reasoningLen=${String(result.reasoning || '').length} `
+            + `nativeCalls=${this.protocol === 'native' ? (result.toolCalls || []).length : '-'} `
+            + `head=${JSON.stringify(_raw.slice(0, 160))}`);
+        } catch (_) { /* 日志绝不影响主流程 */ }
+
         const calls =
           this.protocol === 'native'
             ? (result.toolCalls || []).map((c) => ({ id: c.id, name: c.name, rawArgs: c.arguments }))
             : this.protocol === 'text'
-            ? this.parseTextCalls(textSource, this._toolNameSet())
+            ? parseTextCalls(textSource, this._toolNameSet())
             : [];
 
         // 单轮工具调用数超限（1.1.39）：把「被截断」的事实回传模型，不再静默丢弃。
@@ -2029,7 +1976,7 @@ class AgentSession {
         // 1.1.39：textOnly（WebAI2API 网页版接入）同样启用参数校验，畸形 JSON 有闭环兜底。
         const textNeedsArgCheck = this._weakLocal || (this.cfg && this.cfg.meta && this.cfg.meta.textOnly);
         if (this.protocol === 'text' && textNeedsArgCheck && calls.length) {
-          const checked = this._validateTextCalls(calls);
+          const checked = validateTextCalls(calls);
           if (checked.invalid.length) {
             if (this._weakArgRetries < this._weakArgMax) {
               this._weakArgRetries++;
@@ -2053,10 +2000,24 @@ class AgentSession {
         // 兜底：模型把完整答案放在 thinking 而 content 为空时，才用 reasoning 剥块后作正文
         //（此时 reasoning 就是答案本体而不是思考过程）。
         const rawContent = String(result.content || '');
-        let visibleText = this.protocol === 'text' ? this.stripToolBlocks(rawContent) : rawContent;
+        // 1.1.32：展示路径保留 STEP 边界标记（keepStepMark=true）——前端 renderAssistant 要靠它把
+        // 一轮输出切成「文本段→💭思考卡 / 工具段→🖥️动作卡 / 最后一段→正文」（DSH 式三通道）。
+        // 此前未传该参数（默认 falsy）导致标记被剥光、前端只切出 1 段，三通道卡片永不出现。
+        // 注意：回灌历史绝不保留标记（见下方 messages.push，另外剥成纯正文）。
+        let visibleText = this.protocol === 'text' ? stripToolBlocks(rawContent, true) : rawContent;
         // 兜底：content 为空而 reasoning 非空（模型把完整答案写在思考里）→ 用 reasoning 作正文
         if (this.protocol === 'text' && !String(visibleText).trim() && String(result.reasoning || '').trim()) {
-          visibleText = this.stripToolBlocks(String(result.reasoning));
+          visibleText = stripToolBlocks(String(result.reasoning), true);
+        }
+        // 1.1.26 韧性加固③（用户「确保即使流式文本为空白，也能从最终消息中提取有效内容作为兜底」）：
+        // 三级内容兜底链 content → reasoning → 流式累积文本。
+        // 流式已把正文逐字推给用户、但轮末 result.content 聚合为空时（传输中断/聚合失败），
+        // 用 onDelta 累积的 _finalStreamedText 兜底，保证「用户看到的」与「进历史的」一致，
+        // 不会显示有内容却在历史里变成空消息（下一轮模型就不知道自己说过什么）。
+        if (!String(visibleText).trim() && String(this._finalStreamedText || '').trim()) {
+          const fb = String(this._finalStreamedText || '');
+          visibleText = this.protocol === 'text' ? stripToolBlocks(fb, true) : fb;
+          appendLog('agent', `[content-fallback] result.content 为空，用流式累积文本兜底 len=${fb.length}`);
         }
 
         // 模型生成图片：暂存到本轮缓冲区，最终随 channel（thinking/final）统一发出
@@ -2083,8 +2044,11 @@ class AgentSession {
           if (resultImages.length) msg.images = resultImages;
           if (msg.content || msg.tool_calls || msg.images) this.messages.push(msg);
         } else if (this.protocol === 'text' && visibleText) {
-          // 文本协议：保存去掉工具标签后的可见文本；若 content 为空但 reasoning 有内容，也能记录下来
-          const m = { role: 'assistant', content: visibleText };
+          // 文本协议：保存去掉工具标签后的可见文本；若 content 为空但 reasoning 有内容，也能记录下来。
+          // 1.1.32：展示版 visibleText 带 \u0002STEP: 边界标记（供前端切三通道卡片），回灌历史必须是
+          // 纯正文——否则模型下一轮会照抄标记、在正文里输出「STEP:xxx」（08-29 已踩过的坑）。
+          const historyText = stripToolBlocks(visibleText, false);
+          const m = { role: 'assistant', content: historyText };
           if (resultImages.length) m.images = resultImages;
           this.messages.push(m);
         } else if (result.content) {
@@ -2093,7 +2057,38 @@ class AgentSession {
           this.messages.push(m);
         }
 
+        // 本轮产出合法工具调用 → 解除「强制 tool_choice」（模型已回到工具循环，无需再施压）
+        if (calls.length) this._forceToolChoice = false;
+
         if (!calls.length) {
+          // ===== 1.1.26 韧性加固①：空响应带指数退避重试 =====
+          // 先分清两种「没有工具调用」，二者此前共用 _emptyStreak 一条路，导致空响应从不重试：
+          //   A. 空响应 —— content 与 reasoning 全空。这不是「模型在叙述」，而是服务端异常/
+          //      限流抖动/模型名写错，值得重试 API（500ms → 1s → 2s）而不是立刻收尾。
+          //   B. 空轮   —— 有正文但没工具块。模型在描述计划而非执行，该 nudge 而不是重试。
+          // 流式累积文本也算「有输出」：流式已把正文推给用户、但轮末聚合 result.content 为空时
+          //（传输中断/聚合失败），不能误判成空响应去重试，否则白白多花 API 调用还冲掉已显示内容。
+          const _streamFallback = String(this._finalStreamedText || '').trim();
+          const _hasAnyOutput = String(result.content || '').trim() || String(result.reasoning || '').trim() || _streamFallback;
+          if (!_hasAnyOutput) {
+            if (this._emptyRespRetries < EMPTY_RESP_MAX_RETRY) {
+              this._emptyRespRetries += 1;
+              const delay = Math.min(8000, 500 * Math.pow(2, this._emptyRespRetries - 1));
+              appendLog('agent', `[empty-resp] 模型返回完全空内容（content 与 reasoning 均空），退避重试 ${this._emptyRespRetries}/${EMPTY_RESP_MAX_RETRY} delay=${delay}ms model=${cfg.model || '?'}`);
+              this.emit('notice', { text: `模型返回空响应，${(delay / 1000).toFixed(1)}s 后重试（${this._emptyRespRetries}/${EMPTY_RESP_MAX_RETRY}）…` });
+              await this._sleep(delay);
+              step--; // 重试本轮（与 native 降级分支同一重试模式）
+              continue;
+            }
+            // 重试耗尽：明确报错终止，绝不静默收尾（用户「重试失败后给出明确报错」）
+            appendLog('agent', `[empty-resp] 连续 ${EMPTY_RESP_MAX_RETRY} 次空响应，明确报错终止 model=${cfg.model || '?'}`);
+            this.state = 'done';
+            this.emit('notice', {
+              text: `模型连续 ${EMPTY_RESP_MAX_RETRY} 次返回空响应，已停止。\n常见原因：1) 模型名不存在或已下架；2) API Key 无效/额度耗尽；3) 服务端不稳定。\n当前模型：${cfg.model || '未配置'}。可尝试切换模型，或稍后重试。`
+            });
+            break;
+          }
+          // ===== 有输出 → 走下面的 nudge（空轮）逻辑 =====
           // 1.1.14：拦截「声称已调用工具但实际无任何调用」的角色扮演式输出。
           // 网页接入（WebAI2API）模型在 1.1.14 函数样式容错之后，学会了连函数样式都不输出，
           // 直接用「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述冒充执行。
@@ -2101,22 +2096,17 @@ class AgentSession {
           // 这里回灌修正提示，迫使模型输出真实调用；限 2 次避免死循环。
           // 1.1.14：仅对 text 协议生效——native（原生 function calling）/chat 模型有原生工具通道或本就不带工具，
           // 正常回答里出现「请确认…」「我将执行…」属于普通对话，不应被这套文本兜底误拦。
-          if (this.protocol === 'text' && (this._claimNudges || 0) < 2 && this._detectClaimedTool(textSource)) {
-            this._claimNudges = (this._claimNudges || 0) + 1;
-            this.messages.push({
-              role: 'user',
-              content: `[系统] 你刚才声称已使用某个工具（如 write_file / list_dir / read_file），但系统没有收到任何工具调用——既没有工具调用块，也没有 read_file("路径") 这类函数调用样式，因此没有任何文件操作真正发生。请立即用工具调用块输出你要执行的真实工具调用，一次只调用一个；在输出真实调用之前，系统不会执行任何操作。`
-            });
-            this.emit('notice', { text: `检测到模型「声称已调用工具但无实际调用」（第 ${this._claimNudges}/2 次），已回灌修正提示，要求输出真实工具调用块` });
-            appendLog('agent', `[claim-nudge] 声称调用但无实际调用，回灌修正 (${this._claimNudges}/2)`);
-            continue;
-          }
-          // 1.1.14：textOnly（WebAI2API）首轮锁死——必须先调 get_tools 获取工具清单。
-          // 若本会话尚未成功执行过 get_tools 且本轮仍无任何调用，回灌强制其输出固定格式调用，限 2 次。
+          // 1.1.23：裸参数段保活（对齐 dsh 稳定性，治「新会话还会中断」的第二变体）。
+          // STEP 修复后模型不再输出 STEP:，但长会话里仍会把工具参数「裸写」成
+          // `command: "powershell -NoProfile ..."` / `argv: [...]` / `path: "..."` 这类
+          // 键=值段落（没有 <foxtool> 外壳、没有 STEP: 前缀、不是完成式叙述、不是请求确认），
+          // 四级 nudge 里 step/claim/ask 全不命中 → 空轮 → 静默 final = 用户看到的「还是断」。
+          // 这里检测「参数键=值 + 已知工具名出现在可疑上下文」的裸参数段，回灌修正提示，限 2 次。
           const needGuide = !this._toolGuideFetched && this.cfg && this.cfg.meta && this.cfg.meta.textOnly
             && (this.cfg.toolGuideMode === 'on' || this.cfg.toolGuideMode === 'auto');
           if (needGuide && (this._guideNudges || 0) < 2) {
             this._guideNudges = (this._guideNudges || 0) + 1;
+            this._ev(agentEvents.EV.GUIDE_NUDGE, { count: this._guideNudges });
             // 首轮精简：模型第一轮往往只会输出一大段"分析/方案"而没有任何工具调用——这段对任务
             // 无价值还占历史。直接移除该轮 assistant 消息，让下一轮从「请先调用 get_tools」的
             // 系统提示干净开始，省掉一问一答的浪费轮次（1.1.14）。
@@ -2137,18 +2127,75 @@ class AgentSession {
           // 1.1.14：拦截「只说不做 + 请求确认」——模型输出方案/征求确认（"请确认是否执行""确认后我将写入"）
           // 却没有输出任何工具调用。回灌"直接执行"提示，限 2 次避免死循环。
           // 1.1.14：仅 text 协议生效，native/chat 不误拦（理由同上）。
-          if (this.protocol === 'text' && (this._askNudges || 0) < 2 && this._detectAskOnly(textSource)) {
-            this._askNudges = (this._askNudges || 0) + 1;
-            this.messages.push({
-              role: 'user',
-              content: `[系统] 你刚才只输出了方案或请求确认，没有输出任何工具调用。请**直接**用工具调用块调用工具执行下一步（一次只调用一个）；若有多套方案，选最合理的直接做，不要先征求用户确认——系统会把每一步的真实执行与结果展示出来。只有遇到真正无法决定或危险的操作才询问用户。`
-            });
-            this.emit('notice', { text: `检测到模型「只说不做/请求确认」（第 ${this._askNudges}/2 次），已回灌提示要求直接执行` });
-            appendLog('agent', `[ask-nudge] 只说不做/请求确认，回灌直接执行 (${this._askNudges}/2)`);
+          // ★ 统一空轮契约（减法重构）：解析器只认标准 <foxtool> 块（保留 JSON/截断格式容错）。
+          //   模型本轮没产出合法调用块——无论写的是计划文 / 裸参数段 / STEP 占位 / 声称已调用 / 请求确认，
+          //   都走同一条路：有可见文本先当普通回复展示（绝不静默）→ 连续空轮计数 +1 → 回灌统一提示 → 连续 2 轮收尾。
+          // 1.1.32 修复：native 协议下「输出正文但不调工具」= 模型已完成任务/纯聊天给出答案
+          //（原生 function calling 用「不调工具」表达结束）。已执行过工具、或本就是纯闲聊时，
+          // 直接收尾，不 nudge 强制继续调工具——否则模型被反复 nudge 反复调工具，正文糊成一团
+          // + 审批「已允许」刷屏（safe_operation 问一次「工作区有什么」输出 5 段正文的根因）。
+          // 首轮既没调工具、也非闲聊的「空话」仍走 nudge/降级 text 兜底（治「该调工具却不调」）。
+          const _nativeAnswerDone = this.protocol === 'native' && !this._nativeDowngraded
+            && String(result.content || '').trim()
+            && (this.messages.some((m) => m && m.role === 'tool') || isChatter(queryText));
+          this._emptyStreak = (_nativeAnswerDone ? EMPTY_TURN_MAX : ((this._emptyStreak || 0) + 1));
+          this._ev(agentEvents.EV.EMPTY_TURN, { streak: this._emptyStreak });
+          appendLog('agent', `[empty-turn] 本轮无合法工具调用块（连续 ${this._emptyStreak} 轮）${this._emptyStreak >= EMPTY_TURN_MAX ? '，达到上限直接收尾' : `，分级 nudge 第 ${this._emptyStreak} 次`}`);
+          if (this._emptyStreak >= EMPTY_TURN_MAX) {
+            // 1.1.26 自适应协议降级（用户「每个厂商都要看官方文档进行适配」）：
+            // 官方资料实证——DeepSeek 系列「工具调用能力相对较弱，不建议用于 Tool Calling」，
+            // 硅基流动官方 Claude Code 预设默认配的也是 Kimi-K2.6 而非 DeepSeek。
+            // 日志实证：native 下 nativeCalls=0、连空 3 轮、强制 tool_choice=any 仍唤不起调用；
+            // 而同一模型在 text 协议下（系统提示词强制教 <foxtool> 格式）反而能照做并成功调用。
+            // 因此 native 空轮耗尽时不再直接收尾中断，而是降级 text 再给一轮机会。
+            if (this.protocol === 'native' && !this._nativeDowngraded && this.toolsEnabled && !_nativeAnswerDone) {
+              this._nativeDowngraded = true;
+              this._forceText = true;
+              this.protocol = 'text';
+              this._emptyStreak = 0;
+              this._forceToolChoice = false;
+              baseSystem = buildSystemPrompt(cfg, envBrief, this.protocol) + (this._stableBlock ? '\n\n' + this._stableBlock : '');
+              tools.setCustomTagMode(!!(this.cfg && this.cfg.meta && this.cfg.meta.textOnly));
+              appendLog('agent', '[proto-downgrade] native 连续空轮耗尽（模型未产生任何 tool_calls）→ 自动降级 text 协议重试');
+              this.emit('notice', { text: '模型在原生工具协议下未产生工具调用，已自动切换为文本协议继续（常见于工具调用能力较弱的模型）。', internal: true });
+              continue;
+            }
+            appendLog('agent', `[empty-turn] 连续 ${EMPTY_TURN_MAX} 轮无合法工具调用，进入 final 收尾（不静默）`);
+          } else {
+const emptyGuide = this.protocol === 'text'
+            ? '\n\n[系统] 你本轮没有输出合法的工具调用块，你的文字已作为普通回复展示。若任务还需继续，唯一可靠的执行方式是输出上面那种完整的工具调用块（<foxtool> 包裹合法 JSON，一次一次，写完立刻停止）；若你认为任务已完成，请直接给出最终结论即可。'
+            : '';
+            // 1.1.25：native 路径空轮时绝不回灌「输出文本工具块」的格式提示——
+            // 原生 function calling 的工具调用来自 API 的 tool_calls 字段，模型输出纯文本即是合法回复，
+            // 教 <foxtool>/[[tool:]] 格式只会与原生调用语义冲突（dsh 一轮完成的根因对照）。
+            // 1.1.26 分级 nudge（用户「实现轻推机制，强制模型产生输出」）：
+            //   第 1 次温和给格式；第 2 次明令禁止再写计划；第 3 次只准输出一个调用块。
+            //   实测根因场景：模型说「参数解析失败，我用合法 JSON 重建」却只吐说明不吐调用块，
+            //   旧版统一提示对它毫无压力，第 2 轮即被判死 → 会话中断。
+            const sample = tools.wrapToolCall('工具名', '{"参数名": "参数值"}');
+            let nudgeText;
+            if (this.protocol !== 'text') {
+              nudgeText = '[系统] 本轮你没有调用任何工具。若任务还需继续，请直接继续完成；若任务已完成，请给出最终结论。';
+            } else if (this._emptyStreak === 1) {
+              nudgeText = '[系统] 本轮没有检测到工具调用块。若你需调用工具，唯一可靠的格式是：' + sample + emptyGuide;
+            } else if (this._emptyStreak === 2) {
+              nudgeText = '[系统] 这是第 2 轮没有工具调用。请停止描述计划或解释——直接输出一个工具调用块：' + sample +
+                '\n不要任何前言、分析与说明文字。若任务确实已完成，请直接给出最终结论。';
+            } else {
+              nudgeText = '[系统] 第 3 次提醒：立刻只输出一个工具调用块，形式为 ' + sample +
+                ' 。不要输出分析、计划或说明。若你认为任务已完成，请直接给出最终结论并结束。';
+            }
+            // native 协议下「模型只叙述不调工具」的对症手段：下一轮强制 tool_choice，
+            // 光靠文本提示压不住——模型会继续礼貌地描述计划而不发起调用。
+            if (this.protocol === 'native') this._forceToolChoice = true;
+            this.messages.push({ role: 'user', content: nudgeText });
+            this.emit('notice', { text: `模型本轮未输出合法工具调用块（连续 ${this._emptyStreak}/${EMPTY_TURN_MAX} 轮），已分级回灌提示`, internal: true });
             continue;
           }
+
           // final 阶段：禁止再触发工具调用，把最终答案统一推送进主正文
           this._inFinalPhase = true;
+          this._ev(agentEvents.EV.FINAL_PHASE, { streak: this._emptyStreak });
           this.state = 'done';
           if ((!visibleText || !String(visibleText).trim()) && !resultImages.length) {
             const modelHint = cfg.model ? `当前模型：${cfg.model}` : '当前模型名未配置';
@@ -2178,6 +2225,7 @@ class AgentSession {
               willAutoContinue = false;
             } else {
               this._continuesUsed++;
+              this._ev(agentEvents.EV.CONTINUE_USED, { count: this._continuesUsed });
               this._lastContinuedText = visibleText;
               appendLog('agent', `[auto-continue] finishReason=${result.finishReason} count=${this._continuesUsed}/${maxContinues} contentLen=${String(visibleText || '').length}`);
               this.emit('notice', { text: `模型输出达到长度上限，正在自动继续（${this._continuesUsed}/${maxContinues}）…` });
@@ -2194,7 +2242,13 @@ class AgentSession {
                   });
               this.messages.push({ role: 'user', content: _contMsg });
               // 标记下一轮请求强制文本协议（不给工具），让模型只续写正文
-              this._lenContinue = true;
+              // 1.1.24 例外：半截工具块续写（buildContinuePrompt 已给出「补完工具块」提示）
+              // 必须保留工具协议，否则模型被 _lenContinue 禁止输出工具 → 无法补闭合标签 →
+              // 下一轮 parseTextCalls 依旧 count=0 → 空轮 ×2 → 会话中断（对齐 dsh 续轮收口）。
+              const _halfTool = /<(fox:?tool|fox-tool|tool|function)\s+name\s*=\s*["'][^"']+["']\s*>[^]*$/i.test(visibleText || '')
+                || /\[\[tool:[^\]]*\]\][^]*$/i.test(visibleText || '');
+              if (!_halfTool) this._lenContinue = true;
+              this._ev(agentEvents.EV.LEN_CONTINUE, { count: this._continuesUsed });
             }
           }
           const truncated = result.finishReason === 'length' || result.finishReason === 'incomplete';
@@ -2207,6 +2261,7 @@ class AgentSession {
           if (!this._finalStarted) {
             this.emit('assistantStart', { channel: 'final', msg_id: this.finalMsgId });
             this._finalStarted = true;
+            this._ev(agentEvents.EV.FINAL_STARTED, {});
           }
           // 最终答案的思考过程（深度思考）渲染进主气泡顶部的「已思考」折叠面板，
           // 与最终正文同属 final 通道：物理隔离于右侧工作链，但思考过程对用户可见。
@@ -2330,14 +2385,19 @@ class AgentSession {
           this._runCodeReview();
         }
 
-        // 规划确认模式：模型刚提交/修订了计划 → 暂停，等用户在面板确认后再继续
+        // 规划确认门（对齐 DSH goal-round-driver：计划即内部状态，不再停顿等用户）
+        // present_plan/revise_plan 只把计划展示给用户看（面板可见），不设确认门。
+        // 仅当用户显式开启 foxAi.planAndExecute.confirmGate 时才真正暂停等待确认。
         if (this._planPending) {
           const plan = this.planTasks ? this.planTasks.list() : [];
           this.emit('planPending', { plan, revised: !!this._planRevised, reason: this._planRevised });
-          if (this.task) {
-            try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.AWAITING).catch(() => {}); } catch (_) {}
+          if (this.cfg.planAndExecute && this.cfg.planAndExecute.confirmGate) {
+            if (this.task) {
+              try { await this.taskManager.updateState(this.task.id, harness.TASK_STATES.AWAITING).catch(() => {}); } catch (_) {}
+            }
+            return { finished: false, reason: 'plan-pending', plan };
           }
-          return { finished: false, reason: 'plan-pending', plan };
+          this._planPending = false; // 无确认门：计划已展示，直接继续执行
         }
       }
 
@@ -2430,6 +2490,47 @@ class AgentSession {
     return `修改 ${path}${scope}：\n- 旧：${oldT}\n- 新：${newT}`;
   }
 
+  /** 审查用 before 快照：读取文件当前磁盘内容（供命令行写文件 diff 对比） */
+  async _reviewBeforeRead(path) {
+    try {
+      return await ws.readText(ws.resolveUri(path, { allowOutside: true }));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * 1.1.19：检测「命令行写文件」类命令——run_command 被当绕过 edit_file/write_file 的替代通道时，
+   * 用 shell 重定向/文本替换命令直接改文件。识别特征：
+   *   - 输出重定向：> / >> 写文件（echo x > f、cat > f、printf > f、: > f 清空）
+   *   - 原地编辑：sed -i、perl -pi、awk 重定向、tee f（覆盖）
+   *   - 复制/移动覆盖：copy /y、cp -f 到工作区、mv 覆盖
+   *   - Windows 空文件：type nul > f、copy nul f
+   * 命中即视为「命令行改文件」，需记录 diff 并提示审查。
+   */
+  _isCmdFileWrite(cmd) {
+    const c = String(cmd || '');
+    if (!c) return false;
+    // 排除明显的读/查命令
+    if (/\b(cat|type|more|less|head|tail|grep|find|dir|ls)\b/.test(c) && !/[>|]\s*[\w\\/.\-]+\.\w{1,10}/.test(c)) {
+      // 只有读命令且无重定向 → 不是写文件
+      if (!/>>?\s*[\w\\/.\-]/.test(c)) return false;
+    }
+    // 输出重定向到 .文件（echo x > f.txt / cat > f / : > f）
+    if (/>>?\s*["']?[\w\\/:.\-]+\.\w{1,10}["']?\s*$/.test(c)) return true;
+    if (/>>?\s*["']?[\w\\/:.\-]+\.\w{1,10}["']?\s+&&/.test(c)) return true;
+    // sed -i / perl -pi 原地编辑
+    if (/\bsed\s+(-[a-z]*i[a-z]*)\b/.test(c)) return true;
+    if (/\bperl\s+-[a-z]*pi[a-z]*\b/.test(c)) return true;
+    if (/\bpython\s+(-c|-m)\b[\s\S]*\b(open\s*\(|\.write\s*\()/.test(c)) return true;
+    // tee 覆盖写文件
+    if (/\btee\b/.test(c) && /[\w\\/.\-]+\.\w{1,10}/.test(c)) return true;
+    // cp -f / mv 覆盖工作区文件（排除明显系统路径）
+    if (/\b(cp|move|mv|copy)\b[\s\S]*(\.\w{1,10})[\s\S]*(\.\w{1,10})/.test(c) &&
+        !/\b(cp|mv|copy)\b[\s\S]*(\/usr\/|\/bin\/|system32|c:\\windows)/i.test(c)) return true;
+    return false;
+  }
+
   /** 不向 UI 推送的静默模型调用（用于审查子代理等内部请求） */
   async _silentCall(messages, opts) {
     opts = opts || {};
@@ -2437,17 +2538,85 @@ class AgentSession {
     const cfg = this.cfg;
     const b = selectBackend(cfg);
     const isReview = !!opts.review;
-    // 点1（审查独立会话）：审查走 WebAI2API 网页端时，首轮捎带 fox_new_session 信号，
-    // 让远端「新对话」开一个独立干净会话专门跑审查——主对话上下文不再被审查请求污染。
-    // 该信号与 fox-ai「新建会话」复用同一机制（webai2api 的 deepseek_text 及通用适配器
-    // 都读 meta.foxNewSession 点「新对话」），所以 fox-ai 支持的所有模型网址都生效；
+    // 点1（审查独立会话·方案C 隔离标签页）：审查走 WebAI2API 网页端时，首轮捎带 fox_isolate 信号，
+    // 让远端「开临时标签页」跑审查——【不切换主会话标签页】，审完自动关闭临时页回到主会话。
+    // 相比旧 fox_new_session（点「新对话」会把主页面切走、审完回不来，主对话上下文被污染），
+    // 隔离标签页对所有模型网址通用（Worker 层实现，不依赖网页「新对话」按钮/侧边栏结构），
     // 且幂等：只给每次审查的第一轮带（审查只一轮，天然只发一次），主代理完全不受影响。
     const isWebText = !!(cfg.meta && cfg.meta.textOnly);
     const extraBody = {};
-    // 幂等：同一次审查只发一次重置信号（后续轮/复用不再点新对话，避免重复开空会话）
+    // 幂等：同一次审查只发一次隔离信号（后续轮/复用不再开新页，避免重复开空标签页）
     if (isReview && isWebText && !this._reviewResetSent) {
-      extraBody.fox_new_session = true;
+      // fox_isolate=true → WebAI2API Worker 开临时标签页跑审查，主会话不动
+      // 兼容保留 fox_new_session=false（明确告诉适配器不要点「新对话」切走主页面）
+      extraBody.fox_isolate = true;
+      extraBody.fox_new_session = false;
       this._reviewResetSent = true;
+    }
+    // ★ 1.1.19 审查新会话「两轮分离」（对齐样品.md）：
+    // 审查走 WebAI2API 专用新会话时，第一轮只发「强制 get_tools」引导（不带审查问题），
+    // 拿到工具清单回填后，第二轮才真正发审查 diff —— 与主对话首轮行为完全一致。
+    // 幂等：_reviewGuideSent 只允许一次；审查只一轮，天然只补一次。
+    if (isReview && isWebText && !this._reviewGuideSent) {
+      this._reviewGuideSent = true;
+      const guideMsg = {
+        role: 'user',
+        content: '[系统] 本会话的第一步必须先调用 get_tools 获取可用工具清单（这是固定格式要求）。请立即只输出下面这一个工具调用块，不要附加任何解释：\n\n' + tools.wrapToolCall('get_tools', '{}')
+      };
+      // 先发引导轮：审查问题暂不发出（留到引导完成后）
+      const guideOnly = [guideMsg];
+      try {
+        const guideRes = await llmLimiter.run(() => b.nonStream({
+          baseUrl: cfg.baseUrl,
+          apiKey: cfg.apiKey,
+          model: cfg.model,
+          messages: guideOnly,
+          temperature: cfg.temperature,
+          maxTokens: isReview ? Math.min(cfg.maxTokens || 1024, 1024) : cfg.maxTokens,
+          timeout: isReview ? Math.min(cfg.timeout || 60000, 60000) : cfg.timeout,
+          insecureHttpParser: cfg.insecureHttpParser,
+          streamFormat: cfg.streamFormat,
+          extraBody,
+          signal: this._abortCtrl ? this._abortCtrl.signal : undefined
+        }));
+        const guideText = (guideRes && (guideRes.content != null ? guideRes.content : guideRes.text)) || '';
+        // 解析 get_tools 工具块：成功则执行并回填「[工具 get_tools 的结果]」，让第二轮的审查消息带上工具清单
+        // ★ 与主循环三步引导同款修复：必须用 parseTextCalls（内部先 normalizeToolTags）——
+        // 模型常输出自定义符号 [[tool:get_tools]]{}[[/tool]]，TOOL_BLOCK 只认 <fox:tool> XML 格式
+        // 会解析失败 → 审查拿不到工具清单。
+        const gCalls = parseTextCalls(String(guideText), this._toolNameSet());
+        const gCall = gCalls && gCalls.find((c) => String(c.name).toLowerCase() === 'get_tools');
+        if (gCall) {
+          let args = {};
+          try { args = JSON.parse(gCall.rawArgs || '{}'); } catch (_) {}
+          const out = await tools.execute('get_tools', args, { token: this.token, toolName: 'get_tools' });
+          // 存到独立字段，不污染主代理历史 this.messages；由下方合并进真正的审查消息流
+          this._reviewGuideResult = `[工具 get_tools 的结果]\n${out}\n\n请根据结果继续，或给出最终回答。`;
+          this._toolGuideFetched = true;
+          this._ev(agentEvents.EV.TOOL_GUIDE_FETCHED, {});
+        }
+      } catch (_) {
+        // 引导轮失败不影响审查主体：直接进入下方正常审查流程（审查消息仍会发出）
+      }
+      // 引导完成后，把 get_tools 结果并进审查消息（插到审查 user 之前），
+      // 真正的审查请求同一条消息流里带上工具清单，模型拿清单再审。
+      if (this._reviewGuideResult) {
+        const merged = [];
+        let userIdx = -1;
+        for (let i = 0; i < messages.length; i++) {
+          if (messages[i] && messages[i].role === 'user') { userIdx = i; break; }
+        }
+        const guideResult = { role: 'user', content: this._reviewGuideResult };
+        if (userIdx >= 0) {
+          for (let i = 0; i < userIdx; i++) merged.push(messages[i]);
+          merged.push(guideResult);
+          for (let i = userIdx; i < messages.length; i++) merged.push(messages[i]);
+        } else {
+          merged.push(guideResult);
+          merged.push(...messages);
+        }
+        messages = merged;
+      }
     }
     return llmLimiter.run(() => b.nonStream({
       baseUrl: cfg.baseUrl,
@@ -2516,7 +2685,11 @@ class AgentSession {
     let result = null;
     try {
       if (this.cancelled) return null;
-      this.emit('notice', { text: '🔍 审查子代理正在检查本次改动…' });
+      // 1.1.27：整轮只发一次「正在检查」，避免多次合并审查刷屏
+      if (!this._reviewNoticeSent) {
+        this._reviewNoticeSent = true;
+        this.emit('notice', { text: '🔍 审查子代理正在检查本次改动…', internal: true });
+      }
       const { ok, text } = await reviewer.runReview({
         silentCall: (m) => this._silentCall(m, { review: true }),
         cfg: this.cfg,
@@ -2528,7 +2701,10 @@ class AgentSession {
         result = { files: changed.map((c) => c.path).filter(Boolean), text: reviewText };
         this._reviewResult = result;
       } else {
-        this.emit('notice', { text: '（审查子代理未返回额外意见）' });
+        // 1.1.27：仅当本轮尚未出现过任何审查意见、且这是最后一轮合并审查时才提示「未返回额外意见」，避免刷屏
+        if (!this._reviewHadOpinion && this._pendingReview.length === 0) {
+          this.emit('notice', { text: '（审查子代理未返回额外意见）', internal: true });
+        }
       }
     } catch (e) {
       // 用户取消 / 请求被中止：直接退出，不再把“失败”当成需回应的审查意见
@@ -2539,16 +2715,17 @@ class AgentSession {
       if (e && e.isQuota) {
         this._reviewQuotaError = e;
         this.cancel();
-        this.emit('notice', { text: '⚠️ 模型额度/余额不足，已自动停止审查子代理。' });
+        this.emit('notice', { text: '⚠️ 模型额度/余额不足，已自动停止审查子代理。', internal: true });
         return null;
       }
-      this.emit('notice', { text: '自动代码审查失败：' + String((e && e.message) || e).split('\n')[0] });
+      this.emit('notice', { text: '自动代码审查失败：' + String((e && e.message) || e).split('\n')[0], internal: true });
     } finally {
       // 先保存结果并 emit（如果还没被 _awaitReview 消费），再触发下一次审查，
       // 避免 finally 内启动的新审查抢占 _reviewConsumed 导致本次卡片漏发。
       if (result) {
         result.id = this._reviewId;
         this._reviewResult = result;
+        this._reviewHadOpinion = true; // 本轮已出现过审查意见，不再提示「未返回额外意见」
         if (!this._reviewConsumed) {
           this._reviewConsumed = true;
           this.emit('review', result);
@@ -2694,11 +2871,6 @@ class AgentSession {
       return m.content.some((c) => c && c.type === 'text' && typeof c.text === 'string' && c.text.includes(MARK));
     }
     return typeof m.content === 'string' && m.content.includes(MARK);
-  }
-
-  /** 源历史 this.messages 里是否已有某套哨兵（用于稳定块首轮注入判定：已注入则跳过） */
-  _sourceHasMark(mark) {
-    return (this.messages || []).some((mm) => this._hasMark(mm, mark));
   }
 
   /**
@@ -2919,6 +3091,51 @@ class AgentSession {
     }
   }
 
+  /** 可取消等待（对齐 dsh llm-retry cancellableDelay）——薄壳，实现在 netRetry.js */
+  async _sleep(ms) {
+    const netRetry = require('./netRetry');
+    if (this.cancelled) return false;
+    return netRetry.sleep(ms, this._abortCtrl);
+  }
+
+  /** 网络错误指数退避（对齐 dsh retryPolicy）——薄壳，实现在 netRetry.js */
+  _networkRetryDelay(attempt, retryAfterMs) {
+    return require('./netRetry').networkRetryDelay(attempt, retryAfterMs);
+  }
+
+  /** 是否网络类错误——薄壳，实现在 netRetry.js */
+  _isNetworkError(err) {
+    return require('./netRetry').isNetworkError(err);
+  }
+
+  /**
+   * 网络错误指数退避重试（对齐 dsh llm-retry）：限流/超时/断连/5xx 时按 retryPolicy 退避重试。
+   * @param {Function} fn 发起请求的函数（每次重试重新调用）
+   * @param {number} maxRetries 最大重试次数（默认 3）
+   * @returns 成功结果；全部失败则抛最后一次错误
+   */
+  async _withNetworkRetry(fn, maxRetries) {
+    const max = maxRetries === undefined ? 3 : maxRetries;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= max + 1; attempt++) {
+      if (this.cancelled) throw lastErr || new Error('请求已取消');
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (attempt > max || !this._isNetworkError(err)) throw err;
+        const delay = this._networkRetryDelay(attempt, err && err.retryAfterMs);
+        this.emit('notice', { text: `网络/限流错误（${err.code || err.message}），${delay}ms 后重试（${attempt}/${max}）…` });
+        // 1.1.25 修复：appendLog 必须 require('./log') 引入——之前裸调用漏 import，
+        // 网络重试真正耗尽（持续 5xx）时 ReferenceError → 任务直接崩溃而非正常失败收尾。
+        require('./log').appendLog('agent', `[net-retry] attempt=${attempt}/${max} delay=${delay}ms code=${err.code || '?'} msg=${String(err.message || '').slice(0, 100)}`);
+        const ok = await this._sleep(delay);
+        if (!ok) throw err; // 用户取消
+      }
+    }
+    throw lastErr;
+  }
+
   /**
    * 判断本次是否应向本地弱模型注入 grammar 约束解码。
    * 三态（由 foxAi.agent.localConstrainedDecoding 控制）：
@@ -3013,6 +3230,28 @@ class AgentSession {
     const sysMsg = (Array.isArray(opt.messages) && opt.messages[0] && opt.messages[0].role === 'system') ? opt.messages[0].content : '';
     const prefixStr = (typeof sysMsg === 'string' ? sysMsg : JSON.stringify(sysMsg)) + '\u0000' + JSON.stringify(opt.tools || []);
     this._cachePrefixHash = crypto.createHash('sha256').update(prefixStr).digest('hex').slice(0, 16);
+    // —— 前缀缓存「强制保留本会话缓存副本」指令（按厂商）——
+    // 只把官方支持的缓存指令（OpenRouter 请求头 / OpenAI gpt-5.6+ 请求体）随请求发出；
+    // 其余厂商走稳定前缀自动命中。指令随 opt 透传给传输层（client.js）并入请求头/体。
+    if (this.cfg && this.cfg.cacheControl && this.cfg.cacheControl.enabled !== false) {
+      opt.cacheControl = cacheControl.getCacheDirective({
+        transport: targetCfg.transport,
+        baseUrl: targetCfg.baseUrl,
+        model: targetCfg.model,
+        conversationId: this.conversationId,
+        prefixHash: this._cachePrefixHash,
+        enabled: true,
+        retention: (this.cfg.cacheControl && this.cfg.cacheControl.retention) || '24h',
+        meta: targetCfg.meta
+      });
+      if (opt.cacheControl && (opt.cacheControl.provider === 'openrouter' || opt.cacheControl.provider === 'openai')) {
+        streamLog('cacheControl ' + opt.cacheControl.provider +
+          ' headers=' + JSON.stringify(opt.cacheControl.headers) +
+          ' body=' + JSON.stringify(opt.cacheControl.body));
+      }
+    } else {
+      opt.cacheControl = null;
+    }
     // 切到非主模型时，不假设它支持 grammar 约束解码，去掉以免卡死
     if (!isPrimary && opt.extraBody && opt.extraBody.grammar) {
       const eb = Object.assign({}, opt.extraBody);
@@ -3053,6 +3292,13 @@ class AgentSession {
       try {
         return await this.fallbackIfLocalEmpty(await b.nonStream(opt), opt);
       } catch (err) {
+        // 1.1.24（对齐 dsh llm-retry）：网络/限流错误优先指数退避重试，再走参数协商降级链
+        if (this._isNetworkError(err)) {
+          try {
+            const r = await this._withNetworkRetry(async () => b.nonStream(opt), 3);
+            return await this.fallbackIfLocalEmpty(r, opt);
+          } catch (netErr) { if (!this._isNetworkError(netErr)) throw netErr; err = netErr; }
+        }
         const retriedGrammar = await this.retryWithoutGrammar(err, opt);
         if (retriedGrammar) return retriedGrammar;
         const retried = await this.retryWithoutImages(err, opt);
@@ -3068,6 +3314,17 @@ class AgentSession {
     try {
       return await this.fallbackIfLocalEmpty(await promise, opt);
     } catch (err) {
+      // 1.1.24（对齐 dsh llm-retry）：网络/限流错误优先指数退避重试，再走参数协商降级链
+      if (this._isNetworkError(err)) {
+        try {
+          const retriedNet = await this._withNetworkRetry(async () => {
+            const p2 = useResp ? wrapStream(opt, streamResponses) : b.once(opt);
+            this.stream = p2.handle;
+            return p2.promise;
+          }, 3);
+          return await this.fallbackIfLocalEmpty(await retriedNet, opt);
+        } catch (netErr) { if (!this._isNetworkError(netErr)) throw netErr; err = netErr; }
+      }
       // 服务端不认 grammar 约束解码 → 去掉参数重试一次（弱模型模式优雅降级）
       const retriedGrammar = await this.retryWithoutGrammar(err, opt);
       if (retriedGrammar) return retriedGrammar;
@@ -3134,8 +3391,10 @@ class AgentSession {
     try { stats = require('./client').extractCacheStats(usage); } catch (_) { stats = null; }
     if (!stats) return;
     const prefixHash = this._cachePrefixHash || '';
-    if (!this._cacheBaselineHash) this._cacheBaselineHash = prefixHash;
-    const driftByHash = !!(this._cacheBaselineHash && prefixHash && prefixHash !== this._cacheBaselineHash);
+    // 前缀基线自愈：区分「一次性跳变（如 MCP 工具晚加载）」与「持续漂移」，避免残前缀基线导致永久误报。
+    const driftRes = require('./cacheBaseline').classifyPrefixDrift(this._cacheDriftState, prefixHash);
+    this._cacheBaselineHash = driftRes.baseline;
+    const driftByHash = driftRes.drift;
     const prevHit = this._cachePrevHitRate;
     const hitDrop = this._cachePrevRequested && prevHit != null && prevHit > 0.05 && stats.hitRate < 0.01;
     this._cachePrevHitRate = stats.hitRate;
@@ -3166,7 +3425,7 @@ class AgentSession {
         const budget = steps[Math.min(this._cacheLowHitStreak - 2, steps.length - 1)];
         if ((this.cfg.maxHistoryTokens || 60000) !== budget) {
           this.cfg.maxHistoryTokens = budget;
-          this.emit('notice', { text: `⚠️ ${this._cacheCapability ? this._cacheCapability.provider : ''} 前缀缓存连续 ${this._cacheLowHitStreak} 轮低命中（<5%），已自动收窄历史预算至 ${budget} 以控制消耗；命中恢复后自动回弹。` });
+          this.emit('notice', { text: `⚠️ ${this._cacheCapability ? this._cacheCapability.provider : ''} 前缀缓存连续 ${this._cacheLowHitStreak} 轮低命中（<5%），已自动收窄历史预算至 ${budget} 以控制消耗；命中恢复后自动回弹。`, internal: true });
         }
       }
     } else {
@@ -3194,9 +3453,14 @@ class AgentSession {
     this.emit('cacheStats', report);
     console.log('[fox-ai] prompt-cache stats', JSON.stringify(report));
     if (driftByHash) {
-      this.emit('notice', { text: '⚠️ 请求前缀哈希与本会话首次不一致（' + this._cacheBaselineHash + ' → ' + prefixHash + '），前缀缓存将整段失效，请检查系统提示词/工具定义是否被改动。' });
+      // 同一条漂移（baseline→current）只提示一次，避免每轮刷屏；自愈后基线已更新，不会再进这里。
+      const key = this._cacheBaselineHash + '>' + prefixHash;
+      if (key !== this._lastDriftWarnKey) {
+        this._lastDriftWarnKey = key;
+        this.emit('notice', { text: '⚠️ 请求前缀哈希与本会话基线不一致（' + this._cacheBaselineHash + ' → ' + prefixHash + '），前缀缓存将整段失效，请检查系统提示词/工具定义是否被改动。', internal: true });
+      }
     } else if (hitDrop) {
-      this.emit('notice', { text: '⚠️ 缓存命中率骤降：上一轮 ' + Math.round(prevHit * 100) + '% 命中，本轮 <1%，前缀缓存可能已被驱逐或失效。' });
+      this.emit('notice', { text: '⚠️ 缓存命中率骤降：上一轮 ' + Math.round(prevHit * 100) + '% 命中，本轮 <1%，前缀缓存可能已被驱逐或失效。', internal: true });
     }
   }
 
@@ -3287,6 +3551,12 @@ class AgentSession {
     return llmLimiter.run(async () => {
     const cfg = this.cfg;
     const isDeepResp = cfg.provider === 'deepseek' && cfg.apiMode === 'responses';
+    // 1.1.26：_finalStreamedText 语义修正为「本轮」流式累积文本。
+    // 此前它只在 onDelta 里累加、从不重置 → 跨轮累积整个会话的正文，导致：
+    //   ① 轮末 TailFIX 用「累积全文」与「本轮 visible」比 startsWith → 判定长期失效；
+    //   ② 内容兜底链取到的不是本轮文本（会把历史正文当本轮输出）。
+    // 每轮发起请求前清零，让它真正表示「本轮模型流式吐了什么」。
+    this._finalStreamedText = '';
     const queryForTools = (() => {
       if (!Array.isArray(payload)) return '';
       const u = payload.slice().reverse().find((m) => m && m.role === 'user');
@@ -3372,6 +3642,7 @@ class AgentSession {
           this._estDeltaPushChars = (this._estDeltaPushChars || 0) + String(pushText).replace(/\s+/g, '').length;
           if (!this._finalStarted) {
             this._finalStarted = true;
+            this._ev(agentEvents.EV.FINAL_STARTED, {});
             this.emit('assistantStart', { channel: 'final', msg_id: this.finalMsgId });
           }
           this._finalStreamed = true;
@@ -3475,6 +3746,16 @@ class AgentSession {
     // 这样热切换模型时各自安好：DeepSeek 走官方联网，其他模型走本地 web_search。
     if (useNative || isDeepResp) {
       options.tools = toolsOverride || openAiTools;
+      // 1.1.26 治「native 协议下模型只叙述不调工具」（日志实证 nativeCalls=0 连空 3 轮）：
+      // 空轮后的 nudge 轮强制 tool_choice —— 语义「本轮必须调用某个工具」。
+      // 两后端写法不同：Anthropic 用 'any'，OpenAI 兼容用 'required'（client.js 直接透传）。
+      if (this._forceToolChoice) {
+        options.toolChoice = cfg.transport === 'anthropic' ? 'any' : 'required';
+        try {
+          require('./log').appendLog('agent', '[force-tool-choice] 空轮 nudge 轮强制 tool_choice=' + options.toolChoice +
+            ' protocol=' + this.protocol + ' tools=' + (options.tools || []).length);
+        } catch (_) { /* 日志绝不影响主流程 */ }
+      }
     } else if (this.protocol === 'text') {
       options.stopMarker = TOOL_END;
     }
@@ -3529,155 +3810,7 @@ class AgentSession {
     });
   }
 
-  /**
-   * 判断最后一条 tool 角色消息对应的工具是否为官方 web_search。
-   * 用于「时效性提问在 deepseek+responses 下始终只给官方联网」的逻辑：
-   * 当官方搜索结果已回传、模型准备总结时，仍不许放开本地 fetch 等工具，避免绕圈。
-   * @param {Array} messages 当前请求的消息列表
-   * @returns {boolean}
-   */
-  _lastToolIsWebSearch(messages) {
-    const lastTool = [...messages].reverse().find((m) => m && m.role === 'tool' && m.tool_call_id);
-    if (!lastTool) return false;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-        const call = m.tool_calls.find((c) => c.id === lastTool.tool_call_id);
-        if (call) return (call.function && call.function.name) === 'web_search';
-      }
-    }
-    return false;
-  }
-
   /** 解析文本协议里的工具调用（增强：兼容 <foxtool> / <function> / 裸 JSON 多格式） */
-  parseTextCalls(content, knownTools) {
-    const out = [];
-    // 1.1.15：先把用户自定义的调用符号（tool-tag-map.json，如 [[tool:write_file]]）归一化为
-    // 内部标准 <foxtool>，再走既有解析链——网页上不再出现统一标签，规避风控识别防封号。
-    const text = tools.normalizeToolTags(String(content || ''));
-    const seen = new Set();
-    // exact=true：明确标签来源（<foxtool>/<function>/函数样式）不去重——模型一次输出多个
-    // write_file 块（如连续写多份教材文件）时，1.1.14 之前被 seen 按工具名去重，只有第一个
-    // 执行、其余静默丢弃，模型还以为都写了。模糊来源（JSON 扫描/截断兜底）仍去重防误判。
-    const push = (name, rawArgs, exact) => {
-      if (!name) return;
-      const n = String(name).trim();
-      if (!n) return;
-      const key = n.toLowerCase();
-      if (!exact) {
-        if (seen.has(key)) return;
-        seen.add(key);
-      }
-      // 已知工具名过滤：避免把随机 JSON 对象误判成工具调用（增强③防误触）
-      if (knownTools && knownTools.length && !knownTools.includes(key)) return;
-      out.push({ id: 'text_' + out.length, name: n, rawArgs: rawArgs || '' });
-    };
-    writeAgentLog('textcalls', [`parseTextCalls input len=${text.length}`, `head=${text.slice(0, 300).replace(/\s+/g, ' ')}`, `known=${knownTools ? knownTools.length : 'none'}`]);
-
-    // 1) <foxtool name="..">...</foxtool> / <fox:tool> / <tool>
-    //    闭合标签感知（1.1.39）：扫描时跳过参数 JSON 字符串值内部的闭合标签，
-    //    避免「工具参数里含 </foxtool> 字样」被提前截断导致参数解析失败。
-    for (const blk of extractFoxToolBlocks(text)) {
-      push(blk.name, blk.body, true);
-      if (out.length >= 5) { out._truncated = true; break; }
-    }
-
-    // 2) <function name="..">...</function> 风格（部分模型按 OpenAI 工具调用格式吐标签）
-    if (out.length < 5) {
-      const FN = /<function\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/function>/gi;
-      let m;
-      while ((m = FN.exec(text)) !== null) {
-        push(m[1], m[2], true);
-        if (out.length >= 5) { out._truncated = true; break; }
-      }
-    }
-
-    // 3) 还没解析到，扫描 JSON 块（```json 围栏 或 裸对象 {name/tool/action:...}）
-    if (!out.length) {
-      for (const jc of collectJsonToolCandidates(text)) {
-        let parsed;
-        try { parsed = safeParseArgs(jc); } catch (_) { parsed = null; }
-        if (!parsed || typeof parsed !== 'object') continue;
-        const nm = parsed.name || parsed.tool || parsed.action || parsed.function;
-        if (!nm) continue;
-        let args;
-        if (typeof parsed.arguments === 'string') args = parsed.arguments;
-        else if (parsed.arguments !== undefined || parsed.parameters !== undefined)
-          args = JSON.stringify(parsed.arguments || parsed.parameters || {});
-        else {
-          // 其余字段当作参数
-          const rest = Object.assign({}, parsed);
-          delete rest.name; delete rest.tool; delete rest.action; delete rest.function;
-          args = JSON.stringify(rest);
-        }
-        push(nm, args);
-        if (out.length >= 5) { out._truncated = true; break; }
-      }
-    }
-
-    // 4) 截断兜底：开头是 <foxtool>/<fox:tool>/<tool>/<function> 但缺闭合标签
-    if (!out.length) {
-      const OPEN_ANY = /<(foxtool|fox:tool|fox-tool|tool|function)\s+name\s*=\s*["']([^"']+)["']\s*>/i;
-      const open = OPEN_ANY.exec(text);
-      if (open) {
-        const name = open[2]; // 统一把工具名放在第 2 组，避免 <function> 与 <foxtool> 分组错位
-        // 1.1.39：只截到「本工具块的自然边界」（下一处工具开标签之前），
-        // 不再用「正文中任意 < 之后全吞」的过激规则，避免参数 JSON 里含 <tag>/比较表达式被误截。
-        const rest = text.slice(open.index + open[0].length);
-        const nextOpen = /<(foxtool|fox:tool|fox-tool|tool|function)\s+name\s*=/i.exec(rest);
-        const body = (nextOpen ? rest.slice(0, nextOpen.index) : rest)
-          .replace(/<\/(foxtool|fox:tool|fox-tool|tool|function)>[\s\S]*$/, '').trim();
-        if (body) push(name, body);
-      }
-    }
-
-    // 5) 函数调用语法容错（1.1.14）：网页接入（WebAI2API）等模型不遵守 <foxtool> 协议，
-    //    改为输出 read_file("路径") 这类伪调用（甚至放进代码块围栏）——之前被当作普通文本，
-    //    模型「以为」自己调了工具、继续角色扮演，实际一个都没执行。这里把它们解析为真实调用：
-    //    让「假装读取」变成「真正执行」，打破模拟循环。
-    //    安全设计：只映射参数顺序明确的工具（read 类单参 + run_command 单参 + write_file 双参），
-    //    且参数必须都是引号字符串；edit_file/delete_file 参数顺序不可靠，不自动猜（等 <foxtool>）。
-    //    写/删/exec 仍走审批 + 预览，误判也有安全门兜底。
-    if (!out.length && knownTools && knownTools.length) {
-      const FN_ARG = {
-        read_file: ['path'],
-        list_dir: ['path'],
-        find_files: ['pattern'],
-        search_text: ['query'],
-        run_command: ['command'],
-        write_file: ['path', 'content']
-      };
-      // 长名优先，避免 read_file 被 read 之类前缀误匹配（工具名都是字母数字下划线，正则安全）
-      const nameAlt = knownTools.slice().sort((a, b) => b.length - a.length).join('|');
-      const fnRe = new RegExp('\\b(' + nameAlt + ')\\s*\\(([^)]*)\\)', 'gi');
-      let fm;
-      while ((fm = fnRe.exec(text)) !== null) {
-        const nm = String(fm[1]).toLowerCase();
-        const map = FN_ARG[nm];
-        if (!map) continue;
-        // 提取括号内所有引号字符串参数
-        const strs = [];
-        const strRe = /["']([^"']*)["']/g;
-        let sm;
-        while ((sm = strRe.exec(fm[2])) !== null) strs.push(sm[1]);
-        if (strs.length < map.length) continue; // 参数不足，不猜（避免把自然语言提及误判为调用）
-        // write_file 防呆：若第 1 个参数不像路径（很可能是 content/path 顺序写反），不猜，
-        // 避免把正文当文件名写错位置；read 类/run_command 无此风险。
-        if (nm === 'write_file' && !/^[a-zA-Z]:[\\/]|[\\/]|\.\w+$/.test(strs[0])) continue;
-        const argsObj = {};
-        map.forEach((k, i) => { argsObj[k] = strs[i]; });
-        push(nm, JSON.stringify(argsObj), true);
-        if (out.length >= 5) { out._truncated = true; break; }
-      }
-      if (out.length) {
-        writeAgentLog('textcalls', [`parseTextCalls 容错: 函数调用样式命中 ${out.map((c) => c.name).join(',')}`]);
-      }
-    }
-
-    writeAgentLog('textcalls', [`parseTextCalls output count=${out.length}`, `names=${out.map((c) => c.name).join(',')}`, `rawArgsPreview=${out.map((c) => String(c.rawArgs).slice(0, 100)).join(' | ')}`]);
-    return out;
-  }
-
   /** 已知工具名集合（小写），供 parseTextCalls 过滤误判；含工具别名（如 get_memory 的 recall_memory） */
   _toolNameSet() {
     try {
@@ -3691,111 +3824,6 @@ class AgentSession {
       }
       return names;
     } catch (_) { return []; }
-  }
-
-  /**
-   * 1.1.14：检测「声称已调用工具但实际无调用」的角色扮演句式。
-   * 网页接入模型常输出「我已使用 write_file 创建了…」「我成功调用了 list_dir」这类完成式叙述，
-   * 却没有输出任何可解析的调用（既无 <foxtool> 也无 read_file("路径") 函数样式）。
-   * 保守设计：只匹配「完成式 + 工具名」句式（已使用/已调用/我用/成功调用/工具名+已执行），
-   * 不匹配教学式的一般陈述（如「使用 write_file 可以写入文件」）。
-   */
-  _detectClaimedTool(text) {
-    const t = String(text || '');
-    const TOOL = '(?:read_file|write_file|edit_file|list_dir|find_files|search_text|delete_file|run_command|get_diagnostics|get_editor_context|save_memory|get_memory|open_file)';
-    const MARK = '(?:[`*_~「」"\' ]*)'; // 容忍反引号/星号等代码标记（模型常用 `write_file` 包裹）
-    const re = new RegExp(
-      '(?:已(?:经)?|成功(?:地)?)(?:使用|调用|用)\\s*(?:了)?\\s*' + MARK + TOOL + '\\b' +   // 已使用/成功调用 + 工具
-      '|我用\\s*' + MARK + TOOL + '\\b' +                                                    // 我用 + 工具
-      '|' + MARK + TOOL + '\\s*(?:已|已经|成功)\\s*(?:执行|完成|写入|读取|创建|删除|列出|打开|修改)?',  // 工具 + 已完成式
-      'i'
-    );
-    return re.test(t);
-  }
-
-  /**
-   * 1.1.14：检测「只说不做 + 请求确认」的输出。模型在声称检测回灌后，学会改用
-   * 「修正方案如下…请确认是否执行」「确认后我将立即写入」这类预告/征求确认句式，
-   * 把"调用工具"当成"等用户点头后才会发生的事"，实际一个调用都没有。
-   * 保守设计：必须同时满足 ① 请求确认/预告执行强信号 ② 提到工具名或执行动作词，才判定。
-   */
-  _detectAskOnly(text) {
-    const t = String(text || '');
-    const ask = /(?:请(?:您|你)?确认|是否执行|确认(?:后|一下)|可以吗|好吗|要不要|我(?:将|准备|会)(?:立即|马上|接下来)?(?:使用|调用|执行|写入|创建|修改|把)|建议(?:您|你)?(?:先)?(?:确认|同意)|等(?:您|你)?(?:确认|同意)|执行(?:此|这个)?(?:方案|修正)|方案如下|修正方案|我的方案)/i;
-    if (!ask.test(t)) return false;
-    const act = /(read_file|write_file|edit_file|list_dir|find_files|search_text|delete_file|run_command|get_tools)|(写入|创建|修改|覆盖|删除|执行|移动|读取)/i;
-    return act.test(t);
-  }
-
-  /**
-   * 弱模型模式：对解析出的文本协议工具调用做 JSON Schema 轻量校验。
-   * @param {Array} calls parseTextCalls 的结果（{id,name,rawArgs}）
-   * @returns {{valid:Array, invalid:Array, report:string}}
-   */
-  _validateTextCalls(calls) {
-    const valid = [];
-    const invalid = [];
-    const reports = [];
-    for (const c of calls) {
-      const tool = (typeof tools !== 'undefined' && tools.getTool) ? tools.getTool(c.name) : null;
-      if (!tool) {
-        invalid.push(c);
-        reports.push(`- 未知工具：${c.name}（不在可用工具列表中）`);
-        continue;
-      }
-      let args;
-      const rawArgs = String(c.rawArgs || '{}');
-      // 1.1.15：WebAI2API 网页渲染会把 JSON 字符串值里的 \n 变成真换行、吞掉反斜杠（如 c:\Users 的 \U），
-      // 导致裸 JSON.parse 失败。这里先做本地容错修复（safeParseArgs 已有容错链 + repairArgsJson 处理
-      // 「字符串值内未转义的真换行/引号」），修复成功直接执行，不回灌模型白费轮次。
-      try {
-        args = JSON.parse(rawArgs);
-      } catch (_) {
-        try {
-          args = safeParseArgs(rawArgs);
-        } catch (_2) {
-          try {
-            args = JSON.parse(repairArgsJson(rawArgs));
-          } catch (_3) {
-            invalid.push(c);
-            reports.push(`- 工具 ${c.name} 的参数不是合法 JSON（本地修复失败）：${String(_3 && _3.message || '').slice(0, 120)}`);
-            continue;
-          }
-        }
-      }
-      const v = weakModel.validateToolArgs(tool, args);
-      if (!v.ok) {
-        invalid.push(c);
-        reports.push(`- 工具 ${c.name}：${v.errors.join('；')}`);
-      } else {
-        // 1.1.15：修复后参数已可用，把修复后的参数写回，本地执行时直接吃修复结果
-        valid.push(Object.assign({}, c, { rawArgs: JSON.stringify(args) }));
-      }
-    }
-    return { valid, invalid, report: reports.join('\n') };
-  }
-
-  stripToolBlocks(content) {
-    let text = String(content || '');
-    // 先归一化用户自定义符号（tool-tag-map.json 的 [[tool:%name%]] / [[/tool]]，防网页风控的
-    // 自定义调用标签），归一化成内部标准 <foxtool> 再由 TOOL_BLOCK 剥离——否则模型输出的
-    // 「正文+[[tool:...]]{json}[[/tool]]」混合流里，自定义符号调用块会原文裸露到思考/回答气泡
-    //（1.1.18 修复：stripToolBlocks 之前只剥 <foxtool>，漏掉自定义符号）。
-    text = tools.normalizeToolTags(text);
-    // 1.1.18 步骤流：剥掉工具块的同时保留「步骤边界标记」，供前端把思考流切成
-    // 「💭 思考 / 🖥️ 工具」分步卡片（对齐 DSH 的 Think/Pwsh/Read 动作步骤节奏，
-    // 但用狐狸 AI 既有 step-item 时间线卡片体系，不照抄 DSH 终端样式）。
-    // 替换回调里用 TOOL_BLOCK 捕获的工具名（$2）生成私有控制符 —— 前端按此切段：
-    //   正文段 → step-text 思考卡；\u0002STEP:<name>\u0002 → step-tool 动作卡。
-    text = text
-      .replace(TOOL_BLOCK, (_m, _a, name) => '\u0002STEP:' + name + '\u0002')
-      .replace(/<(fox:?tool|fox-tool|tool)[\s\S]*$/i, '');
-    // 未配对自定义符号兜底：normalizeToolTags 只处理完整配对块，模型输出被截断时
-    //（有 [[tool: 无 [[/tool]]）归一化后仍是 [[tool: 原文，TOOL_BLOCK 与 <tool 尾巴正则都不匹配
-    //（不是 < 开头）。此时从第一个残留 [[tool: 处截断，保留头部正文，绝不让工具调用原文裸露。
-    const customIdx = text.search(/\[\[tool:/i);
-    if (customIdx !== -1) text = text.slice(0, customIdx);
-    return text.trim();
   }
 
   /** 本地启发式：query 是否像多步骤任务（避免每次调 planner） */
@@ -3948,6 +3976,42 @@ class AgentSession {
 
     hist.push(sig);
     if (hist.length > 16) hist.shift();
+
+    // 形态三：同一资源被「读取类工具」反复访问（1.1.26）
+    // 前两种形态都要求「签名相同/成环」，而模型在大文件里分段爬行时每个区间参数都不同
+    // （start_line 120→230→340…），签名不同、不成环 → 护栏完全失效。日志实证：1678 行文件
+    // 被 read_file 连读 11 轮仍未读完，思考长度 463 → 6759 → 27233 字符，最后空轮收尾。
+    // 这里单独按「目标资源」计数：同一文件/同一查询被同一工具访问超过阈值即提醒换策略。
+    // 注意：这是**非阻断**提醒（只注入一条系统消息），不拦截工具——模型可能确实需要继续读。
+    if (!hit) {
+      const field = READ_TARGET_FIELD[name];
+      const target = field && args ? String(args[field] || '').trim() : '';
+      if (target) {
+        if (!this._toolTargetCounts) this._toolTargetCounts = new Map();
+        const key = name + '|' + target;
+        const n = (this._toolTargetCounts.get(key) || 0) + 1;
+        this._toolTargetCounts.set(key, n);
+        if (n >= READ_REPEAT_LIMIT) {
+          hit = 'over-read';
+          try {
+            require('./log').appendLog('agent', `[loop-guard] over-read tool=${name} target=${target.slice(0, 80)} count=${n}`);
+          } catch (_) {}
+          // 每达到阈值提醒一次，之后每隔 READ_REPEAT_LIMIT 次再提醒，避免刷屏
+          if (n === READ_REPEAT_LIMIT || n % READ_REPEAT_LIMIT === 0) {
+            this.messages.push({
+              role: 'user',
+              content: `[系统·效率提醒] 你已对「${target}」连续调用 ${name} ${n} 次。这种逐段通读会持续挤占上下文、` +
+                '并让后续推理质量下降。请改用一次性处理策略：\n' +
+                '1) 用 run_command 跑一段脚本（Node/Python）直接解析该文件并写出结果，而不是反复读片段；\n' +
+                '2) 或用 search_text / search_codebase 按关键词精确定位需要的部分；\n' +
+                '3) 若确实需要通读，请一次读取尽可能大的区间，并尽快进入产出阶段。'
+            });
+          }
+          return null; // 非阻断：不拦截，让工具正常执行
+        }
+      }
+    }
+
     if (!hit) return null;
 
     this._loopBlocks = (this._loopBlocks || 0) + 1;
@@ -4132,7 +4196,10 @@ class AgentSession {
         popts.path = args.path;
       } else if (kind === 'exec') {
         op = harness.OP.EXEC;
-        popts.command = args.command;
+        // argv 模式拼回字符串再交给策略引擎（1.1.22）：防策略只看 command 而 argv 绕过
+        popts.command = Array.isArray(args && args.argv) && args.argv.length
+          ? args.argv.join(' ')
+          : args.command;
       } else if (name === 'call_extension_command') {
         op = harness.OP.CALL_EXT;
         popts.command = args.command;
@@ -4266,6 +4333,10 @@ class AgentSession {
 
     const execCtx = {
       token: this.token,
+      // 1.1.24：把工具名透传给 execute → _catalogLimit/_truncate，
+      // 否则 get_tools 的「目录整条目/完整注入」分支拿不到 toolName 永远不命中，
+      // 被通用 4000 上限「头60%+尾40%+中间省略」挖掉中间工具 → 模型照抄空名 → 空轮中断。
+      toolName: name,
       maxToolOutput: this.cfg.maxToolOutput,
       blockedCommands: this.cfg.blockedCommands,
       recordUndo: (e) => undo.record(e),
@@ -4282,6 +4353,8 @@ class AgentSession {
       onStream: (chunk) => this.emit('toolStream', { id: uiId, text: chunk }),
       // 生图工具用它把生成的图片直接渲染到聊天 UI（复用 0.8.42 的 image 渲染链路）
       emitImage: (img) => this.emit('image', img || {}),
+      // 产出物预览：preview_artifact 工具触发 → chatView 在旁边开预览面板（HTML/图片/Markdown/PDF）
+      emitArtifact: (art) => this.emit('artifact', art || {}),
       outsideConfirmed,
       skipConfirm: extSkipConfirm,
       // Best-of-N 多模型对比：把“调用任意候选模型”与“评委 LLM（复用 _silentCall）”能力暴露给工具层
@@ -4366,8 +4439,64 @@ class AgentSession {
 
       const output = await tools.execute(name, args, execCtx);
       // 1.1.14：get_tools 成功执行即视为「工具清单已获取」，解除首轮强制
-      if (name === 'get_tools') this._toolGuideFetched = true;
+      if (name === 'get_tools') {
+        this._toolGuideFetched = true;
+        this._ev(agentEvents.EV.TOOL_GUIDE_FETCHED, {});
+      }
+      // ★ 1.1.19 命令行写文件防护：run_command 可能被模型当作「绕过 edit_file/write_file 的替代通道」
+      // （工具不可用/嫌审批麻烦时直接用 echo>、sed -i、copy 等改文件），此类改动：
+      //   ① 绕过「未读禁止写/冲突感知」硬门控；② 不记录 diff → 审查看不到、UI 不显示改了什么。
+      // 这里在命令执行后检测写文件特征，把改动记进 _pendingReview（供审查与 UI 展示），
+      // 并追加观察提示，让模型知道「命令行改文件同样会被审查」。
+      if (name === 'run_command') {
+        // argv 模式同样要拼回字符串检查（1.1.22）：避免「命令行写文件」防护被 argv 数组绕过
+        const cmdStr = Array.isArray(args && args.argv) && args.argv.length
+          ? args.argv.join(' ')
+          : String((args && args.command) || '');
+        if (this._isCmdFileWrite(cmdStr) && this._pendingReview) {
+          try {
+            const cw = require('./conflictWatch');
+            // 工作区内可能被命令改动的目标文件：优先取显式路径参数，否则扫描最近快照
+            let target = null;
+            const mPath = cmdStr.match(/[\w\\/.\-]+\.\w{1,10}/g);
+            if (mPath) {
+              for (const p of mPath.reverse()) {
+                const cand = p.replace(/^["']|["']$/g, '');
+                try {
+                  const u = ws.resolveUri(cand, { allowOutside: true });
+                  const st = await vscode.workspace.fs.stat(u);
+                  if (st && st.type === vscode.FileType.File) { target = cand; break; }
+                } catch (_) {}
+              }
+            }
+            if (!target && cw.lastWritten && cw.lastWritten.path) target = cw.lastWritten.path;
+            if (target) {
+              const before = await this._reviewBeforeRead(target);
+              const after = await ws.readText(ws.resolveUri(target, { allowOutside: true })).catch(() => null);
+              const existing = this._pendingReview.find((c) => c.path === target);
+              const summary = this._reviewSummary('run_command(命令行写文件)', { command: cmdStr, path: target }, before, after);
+              if (existing) { existing.summary = summary; existing.op = '命令行写文件'; }
+              else this._pendingReview.push({ name: 'run_command', op: '命令行写文件', path: target, summary });
+              // 追加观察：命令行改文件同样会被记录与审查，后续不再需要靠命令行绕审批
+              output = String(output) + '\n\n[观察] 检测到该命令可能修改了文件「' + target + '」。' +
+                '命令行改文件同样会进入改动记录与代码审查（与 edit_file/write_file 同等对待），' +
+                '且不受「未读禁止写」门控约束——如非必要请改用 edit_file/write_file 完成文件修改。';
+              // 刷新冲突感知快照：命令改的文件视为「agent 自己写入」，避免下一轮误判为外部修改
+              if (config.conf().get('conflictWatch.enabled', true)) {
+                try {
+                  const u = ws.resolveUri(target, { allowOutside: true });
+                  let st = null; try { st = await vscode.workspace.fs.stat(u); } catch (_) { st = null; }
+                  if (st) cw.noteWrite(target, st.mtime, st.size);
+                } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        }
+      }
       this.emit('toolEnd', { id: uiId, ok: true, output });
+      // ★ 会话进度快照（对齐 DSH checkpoint-policy）：每个工具执行完即记一条进度流水，
+      // 模型重启/断点续跑时凭「上一步做了什么」的紧凑摘要知道自己干到哪，不用重新读历史。
+      try { this._recordProgress(name, args, output); } catch (_) {}
       // 本地联网搜索类工具（web_fetch / browser / mcp 抓取类 / 原生 web_search 等）的返回里若含网址，
       // 抽出来喂给前端 harvest，使回答里的引用角标能带上可点击链接（与官方联网搜索同机制）。
       try {
@@ -4658,12 +4787,11 @@ class AgentSession {
 
   /** 询问用户是否允许 */
   async approve(req) {
-    const mode = this.cfg.autoApprove || 'read';
+    // 纯策略判定已迁至 src/approvalPolicy.js（可单测、可在 headless/测试环境复用），
+    // approve() 只保留「依赖实例状态」的 UI 交互部分（this.state/this.ui/this._pendingApproval）。
     const kind = req.kind;
-    if (this.alwaysAllow.has(req.name)) return 'approve';
-    if (mode === 'all') return 'approve';
-    if (mode === 'edit' && kind !== 'exec') return 'approve';
-    if (mode === 'read' && kind === 'read') return 'approve';
+    const auto = approvalPolicy.decideApproval(this.cfg, this.alwaysAllow, req.name, kind);
+    if (auto === 'approve') return 'approve';
     // 越权风控（1.1.39）：没有审批 UI 时绝不静默放行高危操作（写/执行/删除）。
     // 只读类在上面已放行；其余一律返回 reject（由 handleToolCall 拦截并回传模型），
     // 宁可少做不可越权——UI 缺失属架构异常，不能退化为「默认放行」。
@@ -4692,16 +4820,34 @@ class AgentSession {
 
   pushToolResult(callId, name, output, isError, meta) {
     meta = meta || {};
+    // 1.1.24（删减重构）：截断收敛到单一真相源 tools/execute → _truncate。
+    // 这里曾对 execute 已截断的结果再做一次「头60%+尾40%+中间省略」二次截断：
+    // get_tools 目录若走完整/整条目，会被这层再挖一遍中间工具 → 空轮中断；
+    // 且对 read_file 等大输出，execute 已按 maxToolOutput 截完，这里再截纯重复。
+    // 删除二次截断，文本原样进入消息历史（trimHistory 只做防撑爆的兜底 clamp）。
     let text = String(output == null ? '' : output);
-    const cfg = this.cfg || {};
-    const maxToolOutput = cfg.maxToolOutput || 8000;
-    if (text.length > maxToolOutput) {
-      // 智能截断（头+尾）：与 tools/_truncate 保持一致，保留尾部关键报错，避免弱模型误判
-      const headLen = Math.floor(maxToolOutput * 0.6);
-      const tailLen = maxToolOutput - headLen;
-      text = text.slice(0, headLen)
-        + '\n…（输出已截断，原 ' + text.length + ' 字，中间省略）…\n'
-        + text.slice(-tailLen);
+    // —— 1.1.26（对齐 dsh compaction-tool-result-pruner）：源头结果裁剪 ——
+    // fox-ai「每次会话 100% 卡死」根因：read_file 等大结果（可达 30000 字）原样进历史，
+    // 读几段就撑到 100% → 压缩触发时 retainTokens 尾部预算被几条大结果占满 → compressible≈0
+    // →「可压缩消息不足」→ 不压 → 模型丢已读记忆重读 → 死循环。
+    // dsh 做法：工具结果超 thresholdChars(8192) 在进历史前就裁成 头 headChars(4096) + 标记 + 尾 tailChars(1024)，
+    // 历史里永远没有大块头 → 上下文不会几分钟就 100%。
+    // 与 1.1.24 删除的「二次截断」区别：旧的是「execute 截完后再挖一遍」（get_tools 被二次挖洞）；
+    // 新的是「源头一刀 + 目录豁免 + 带显式裁剪标记 + read_file 分段续读提示」，语义完全不同。
+    if (!isError && text.length > 8192) {
+      const isCatalog = name === 'get_tools' || name === 'get_tool_catalog';
+      if (!isCatalog) {
+        const head = text.slice(0, 4096);
+        const tail = text.slice(-1024);
+        const hint = (name === 'read_file')
+          ? '\n\n[结果中间已裁] read_file 完整结果超预算，中间已省略（原始文件仍在磁盘）。'
+            + '如需中间内容，请继续用 start_line/end_line 分段读取剩余区间；每段结果都会保留头尾，'
+            + '不同区间不会被判为重复读取。'
+          : '\n\n[... tool result middle pruned ...]（工具结果中间已裁剪；如需完整内容请用更精准的检索/分段重新获取）';
+        text = head + hint + '\n' + tail;
+      }
+      // 目录类工具（get_tools）豁免：目录完整性是硬语义——整条目/完整返回，
+      // 绝不让中间工具从模型视野消失（否则空轮中断）。
     }
     const status = isError ? 'error' : 'ok';
     let observe;
@@ -4748,48 +4894,26 @@ class AgentSession {
    * @param {string} queryText 当前用户提问
    * @returns {Promise<string>} 注入知识库参考后的提示词（未命中则原样返回）
    */
-  async _augmentWithKnowledge(baseSystem, queryText) {
-    const { appendLog } = require('./log');
-    try {
-      const kbSources = [];
-      const augmented = await kb.augmentSystemPromptAsync(baseSystem, queryText, this.sessionId, {
-        context: this.context,
-        signal: this._abortCtrl ? this._abortCtrl.signal : undefined,
-        onLog: (t) => {
-          try { appendLog('kb', String(t)); } catch (_) {}
-        },
-        onSources: (list) => {
-          try {
-            for (const s of list || []) if (s && s.file) kbSources.push(s);
-          } catch (_) {}
-        }
-      });
-      if (kbSources.length) this.emit('kbSources', { sources: kbSources });
-      return augmented;
-    } catch (e) {
-      try { appendLog('kb', '向量检索异常，回退关键词检索：' + String((e && e.message) || e)); } catch (_) {}
-      try {
-        const kbSources = [];
-        const augmented = kb.augmentSystemPrompt(baseSystem, queryText, this.sessionId, {
-          onSources: (list) => { try { for (const s of list || []) if (s && s.file) kbSources.push(s); } catch (_) {} }
-        });
-        if (kbSources.length) this.emit('kbSources', { sources: kbSources });
-        return augmented;
-      } catch (_) {
-        return baseSystem;
-      }
-    }
-  }
-
   /**
-   * 从「注入知识库后的提示词」抽取相对「基准提示词」新增的片段（即真正注入主控的那段知识库参考）。
-   * 纯函数；两处 KB 注入（首轮装配 + 模型降级重试）共用，避免重复逻辑漂移。
-   * @param {string} kbSys 注入知识库后的完整提示词
-   * @param {string} base 注入前的基准提示词
-   * @returns {string} 新增片段（去除前导空行）
+   * 知识库技能提示（RAG 纯工具化，对齐 DSH 1.1.25）。
+   * dsh（deepseek-harness）权威模型：知识库本身是「工具」（inbox/use_skill 式按需调取），
+   * 不进每轮请求前缀——每轮灌 4000+ token 知识 = 前缀膨胀 + 缓存命中率崩 + 外层截断时知识残缺。
+   * 这里只返回一行技能提示（几十字），agent 需要时自行调用
+   * use_skill(name=_knowledge_base, query=…) 按需检索。
+   * @returns {Promise<string>} 技能提示文本（独立返回，不含 baseSystem，零差集）
    */
-  kbInjectedSegment(kbSys, base) {
-    return kbSys.length > base.length ? kbSys.slice(base.length).replace(/^\n+/, '') : '';
+  async _buildKnowledgeHint() {
+    try {
+      const fileCount = kb.listKnowledgeFiles(this.sessionId).length;
+      return fileCount > 0
+        ? '【知识库技能】检测到知识库已就绪（' + fileCount + ' 个文档）。'
+          + '当用户问题需要参考知识库文档时，请调用 use_skill 激活内置技能「知识库检索」'
+          + '（use_skill name=_knowledge_base，query 传用户问题的关键词）获取相关知识后再回答；'
+          + '若问题与知识库无关，直接回答即可，无需调取。'
+        : '【知识库技能】知识库为空（尚未整理文档）。不需要调用 use_skill(_knowledge_base)，直接基于通用知识回答。';
+    } catch (_) {
+      return '【知识库技能】知识库已就绪。需要参考时用 use_skill 激活「知识库检索」（name=_knowledge_base）。';
+    }
   }
 
   /**
@@ -4917,7 +5041,10 @@ class AgentSession {
 
     // 取较早消息去压缩，保留最近 keep 条
     const { clampMessage } = require('./messageSanitize');
-    const toCompress = msgs.slice(0, compressible).map((m) => clampMessage(m, 8000));
+    // 1.1.24（删减重构）：clamp 只是「防单条超大消息撑爆压缩输入」的内存兜底，
+    // 不再用 8000 硬砍——否则 get_tools 完整目录历史（可达数万字）被压缩路径挖掉中间工具，
+    // 与 _truncate 的中间省略同罪。上限提到与 trimHistory 同口径的 128000，目录可完整进入压缩。
+    const toCompress = msgs.slice(0, compressible).map((m) => clampMessage(m, 128000));
     appendLog('autoSummarize', '[compress] used%=' + usedPct + ' threshold%=' + Math.round(threshold * 100) + ' compressible=' + toCompress.length + ' reason=' + reason);
     statusStep('上下文压缩', `上下文已用约 ${usedPct}%，正在把较早的 ${toCompress.length} 条对话压缩进知识库-2…`);
 
@@ -4972,6 +5099,12 @@ class AgentSession {
         let summaryText = '';
         try {
           const points = [];
+          // text 协议下工具结果是无 name 字段的 user 消息，工具名藏在 content 前缀「[工具 X 的结果]」里。
+          // 折叠摘要必须解析出真实工具名，否则 read_file 结果被折叠成「工具[]」，模型不知道已读过什么 → 重读死循环。
+          const TOOL_RESULT_RE = /^\[工具\s+([\w.:-]+)\s+的结果\]/;
+          // 读取类工具：返回的是「内容 / 定位 / 目录」——模型"看到内容"的来源。
+          // 折叠时对它们生成【已读锚点】，明确告知已读范围，防止模型误以为没读而重复 read_file 同分段。
+          const READ_TOOLS = new Set(['read_file', 'list_dir', 'glob', 'grep', 'search_text', 'find_files', 'index_codebase', 'query_code_graph', 'read_terminal', 'get_diagnostics', 'retrieve_knowledge']);
           for (const m of dropped) {
             if (!m || !m.role) continue;
             const c = typeof m.content === 'string' ? m.content : m.content ? JSON.stringify(m.content) : '';
@@ -4981,14 +5114,23 @@ class AgentSession {
               .replace(/\[\[tool:[\s\S]*?\[\/tool\]\]/gi, '')
               .trim();
             if (!s) continue;
-            if (m.role === 'user') points.push('用户: ' + s.slice(0, 160));
-            else if (m.role === 'assistant') points.push('结论: ' + s.slice(-240));
-            else if (m.role === 'tool') {
-              const name = String(m.name || m.toolName || '工具').slice(0, 30);
-              const paths = (s.match(/[A-Za-z]:\\[^\s"']+|(?:\/[\w.-]+){2,}/g) || []).slice(0, 4);
+            // text 协议工具结果消息 role=user 但 content 以「[工具 X 的结果]」开头。
+            // 必须最先检测此前缀：否则折叠时被当成普通用户消息截 160 字，模型不知道已读过什么 → 重读死循环。
+            const prefixName = TOOL_RESULT_RE.exec(s) ? TOOL_RESULT_RE.exec(s)[1] : '';
+            const isToolResult = !!prefixName || m.role === 'tool';
+            if (isToolResult) {
+              const name = String(m.name || m.toolName || '').slice(0, 30) || prefixName;
+              const body = s.replace(/^\[工具\s+[\w.:-]+\s+的结果\]\s*/, '').trim();
+              const paths = (body.match(/[A-Za-z]:[\\/:][^\s"']+|(?:\/[\w.-]+){2,}/g) || []).slice(0, 4);
               const pathHint = paths.length ? ' 文件:' + paths.join(',') : '';
-              points.push('工具[' + name + ']: ' + s.slice(0, 120) + pathHint);
-            }
+              if (READ_TOOLS.has(name)) {
+                // 读取类工具：生成【已读锚点】——模型读到这一行就知道"已读过哪些文件哪个范围"，无需重读
+                points.push('【已读】' + name + pathHint + '（内容已折叠，无需重读同区间；可检索引用）');
+              } else {
+                points.push('工具[' + (name || '工具') + ']: ' + body.slice(0, 120) + pathHint);
+              }
+            } else if (m.role === 'user') points.push('用户: ' + s.slice(0, 160));
+            else if (m.role === 'assistant') points.push('结论: ' + s.slice(-240));
           }
           if (points.length) {
             const compactDir = path.join(os.homedir(), '.fox-ai', 'compacted');
@@ -5019,6 +5161,7 @@ class AgentSession {
           content: `[本地折叠] 因自动压缩不可用（${reason.slice(0, 80)}），已在本机把最早的 ${dropped.length} 条对话就地折叠以释放上下文空间。`
             + (archivePath ? `\n折叠档案：${archivePath}` : '')
             + (summaryText ? `\n折叠前要点：\n${summaryText}` : '\n原始内容未做语义摘要（存档失败），如需完整回顾请改用带有效 API Key 的上下文整理。')
+            + `\n【重要】折叠前已完成的「读取类工具」（read_file / list_dir / glob / grep / search_text 等）在上面要点中以【已读】标记列出——这些文件内容已读取过，无需重复调用 read_file 读取同一文件或同一行号区间；如需引用内容，请基于要点中的路径结论继续，或使用检索类工具定位新信息。`
         };
         msgs.unshift(note);
         appendLog('autoSummarize', '[fallback-local] collapsed=' + dropped.length);
@@ -5126,7 +5269,10 @@ class AgentSession {
       }
     }
     return clean(this.messages, this.protocol, cfg.maxHistory || 20, {
-      maxBytesPerMessage: cfg.maxToolOutput || 8000,
+      // 1.1.24（删减重构）：maxBytesPerMessage 不再复用 maxToolOutput（4000）——
+      // 那会把 get_tools 完整目录（整条目/完整注入）历史再挖一遍中间工具 → 空轮中断。
+      // 这里只做「防单条消息撑爆内存」的兜底 clamp，截断已收敛到 execute → _truncate 单一真相源。
+      maxBytesPerMessage: cfg.maxMessageBytesPerMsg || 128000,
       maxTotalBytes: cfg.maxMessageBytes || 1024 * 1024,
       maxHistoryTokens: cfg.maxHistoryTokens || 0
     });
@@ -5289,4 +5435,4 @@ function buildBatchModeHint(query) {
 - 先用 get_diagnostics 拉全量诊断，分批读文件、分批修复，最后统一跑一次测试/构建验证。`;
 }
 
-module.exports = { AgentSession, Cancelled, QuotaError, isQuotaError, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask, buildBatchModeHint, buildDeepThinkingHint };
+module.exports = { AgentSession, Cancelled, QuotaError, isQuotaError, buildSystemPrompt, computeOfficialSearch, _isMultiStepTask, buildBatchModeHint, buildDeepThinkingHint, isChatter };

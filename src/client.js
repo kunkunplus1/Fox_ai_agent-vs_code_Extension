@@ -114,6 +114,17 @@ function buildHeaders(apiKey, extra) {
   return headers;
 }
 
+// 前缀缓存「强制保留本会话缓存副本」指令：从 options.cacheControl 取（由 agent.js 按厂商算好）。
+// 仅 OpenRouter（请求头）/ OpenAI gpt-5.6+（请求体）会产出非空指令；其余厂商返回 null，
+// 调用方直接 Object.assign 即可，零副作用。绝不臆造参数，避免严格校验的服务端 4xx。
+function cacheControlOf(options) {
+  const cc = options && options.cacheControl;
+  if (!cc || (cc.provider !== 'openrouter' && cc.provider !== 'openai')) {
+    return { headers: null, body: null };
+  }
+  return { headers: cc.headers || null, body: cc.body || null };
+}
+
 // DeepSeek Responses web_search 不返回结构化 results/URL，只在正文里写「（来源：xxx）」。
 // 兜底：解析所有来源标签（含 web_search 的合并列表与单个站点名），用原始搜索 query 生成可点击链接。
 function cleanSourceLabel(label) {
@@ -291,6 +302,97 @@ function extractCacheStats(usage) {
  *  - 本地模型（meta.local，llama.cpp / Ollama 等）：通常无服务端缓存（supported:false）。
  * 返回 { supported, kind, provider, reason }。
  */
+/**
+ * 1.1.32：通用 token 用量抽取——**不依赖缓存字段是否存在**。
+ * 与 extractCacheStats 的分工：extractCacheStats 只在厂商返回了缓存字段时才有值（否则 null），
+ * 本函数只要响应里有 prompt/completion/total 任一字段就出数，用于「每个请求都记账」。
+ * 覆盖语义：OpenAI Chat(prompt_tokens/completion_tokens)、Responses(input_tokens/output_tokens)、
+ * Anthropic(input_tokens/output_tokens)、Gemini(promptTokenCount/candidatesTokenCount)。
+ */
+function extractUsageStats(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const cache = extractCacheStats(usage); // 可能为 null（厂商未返回缓存字段，属正常）
+  // 多字段并存时取第一个「有效正数」，避免某字段为 0 而另一字段才是真值的情况
+  const firstPos = (...vals) => {
+    let zero = null;
+    for (const v of vals) {
+      if (typeof v !== 'number' || !isFinite(v)) continue;
+      if (v > 0) return v;
+      if (zero === null) zero = v;
+    }
+    return zero === null ? 0 : zero;
+  };
+  const umd = usage.usageMetadata || usage.usage_metadata;
+  const promptTokens = firstPos(
+    usage.prompt_tokens, usage.input_tokens,
+    umd && umd.promptTokenCount, cache && cache.promptTokens
+  );
+  const completionTokens = firstPos(
+    usage.completion_tokens, usage.output_tokens,
+    umd && umd.candidatesTokenCount, cache && cache.completionTokens
+  );
+  const cachedTokens = cache ? cache.cachedTokens : 0;
+  const totalTokens = firstPos(
+    usage.total_tokens, usage.totalTokenCount,
+    umd && umd.totalTokenCount,
+    promptTokens + completionTokens
+  );
+  const reasoningTokens = firstPos(
+    usage.reasoning_tokens,
+    (usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens),
+    (usage.output_tokens_details && usage.output_tokens_details.reasoning_tokens),
+    (umd && umd.thoughtsTokenCount)
+  );
+  return {
+    promptTokens, completionTokens, cachedTokens, totalTokens, reasoningTokens,
+    hitRate: cache ? cache.hitRate : 0
+  };
+}
+
+/**
+ * 1.1.32：把一次请求的用量落到 ~/.fox-ai/logs/token-usage.log（每行一条 JSON，便于逐个分析）。
+ * 与 debugResponses 同款落盘写法（console.log 会被 VS Code Output 吞掉，必须 appendFileSync）。
+ * 记录维度：时间、模型、端点、协议、输入/输出/缓存/合计/推理 token、缓存命中率。
+ * 平台「没返回 usage」时落一行 {kind:'no_usage'} 告警（reason 区分 platform_omitted 真没给 / platform_empty 返回空对象），
+ * 绝不编造数字——真零消耗（字段齐全且全 0）仍按正常行记录。
+ */
+const _USAGE_KEYS = ['prompt_tokens','completion_tokens','total_tokens','input_tokens','output_tokens','totalTokenCount','promptTokenCount','candidatesTokenCount','usageMetadata','usage_metadata','input_tokens_details','output_tokens_details'];
+function _hasUsageFields(u) { return _USAGE_KEYS.some((k) => u[k] !== undefined); }
+function _tokenLogDir() {
+  const fs = require('fs'), path = require('path');
+  const dir = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.fox-ai', 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+function _appendToken(obj) {
+  try { require('fs').appendFileSync(require('path').join(_tokenLogDir(), 'token-usage.log'), new Date().toISOString() + ' ' + JSON.stringify(obj) + '\n'); } catch (_) {}
+}
+function logTokenUsage(usage, options) {
+  const o = options || {};
+  const meta = { model: o.model || o.modelName || '', endpoint: o.endpoint || o.baseUrl || '', transport: o.transport || o.apiMode || '' };
+  if (!usage || typeof usage !== 'object') { _appendToken(Object.assign({ kind: 'no_usage', reason: 'platform_omitted' }, meta)); return null; }
+  const st = extractUsageStats(usage);
+  if (!_hasUsageFields(usage)) { _appendToken(Object.assign({ kind: 'no_usage', reason: 'platform_empty' }, meta)); return st; }
+  _appendToken(Object.assign(meta, {
+    prompt: st.promptTokens, completion: st.completionTokens, cached: st.cachedTokens,
+    reasoning: st.reasoningTokens, total: st.totalTokens,
+    hit: st.cachedTokens > 0 ? Math.round(st.hitRate * 1000) / 1000 : 0
+  }));
+  return st;
+}
+
+/**
+ * 1.1.32：四个 builder（streamChat / chatNonStream / streamResponses / chatNonStreamResponses）
+ * 的统一 usage 出口——先记账落盘，再转发给外部 onUsage 回调（agent 的缓存统计）。
+ * 集中一处保证「每个请求都有用量日志」，不会因新增 builder 而漏记。usage 为空时不转发 onUsage。
+ */
+function emitUsage(usage, options, onUsage) {
+  if (!usage) { logTokenUsage(null, options); return null; }
+  const st = logTokenUsage(usage, options);
+  if (onUsage) { try { onUsage(usage); } catch (_) {} }
+  return st;
+}
+
 function detectOpenaiFamily(model) {
   const m = String(model || '').toLowerCase();
   if (/gemini|google/.test(m)) return 'gemini';
@@ -315,28 +417,49 @@ function getCacheCapability(meta, transport, model) {
 
 function normalizeError(err, urlString) {
   const code = err && err.code;
-  if (code === 'ECONNREFUSED') {
-    return new Error(
-      `连不上 ${urlString}\n本地服务没起来？llama.cpp 用：llama-server -m 模型.gguf --port 8080 --jinja`
-    );
+  const e = (() => {
+    if (code === 'ECONNREFUSED') {
+      const x = new Error(
+        `连不上 ${urlString}\n本地服务没起来？llama.cpp 用：llama-server -m 模型.gguf --port 8080 --jinja`
+      );
+      x.network = true;
+      return x;
+    }
+    if (code === 'ENOTFOUND') { const x = new Error('域名解析失败：' + urlString); x.network = true; return x; }
+    if (code === 'ETIMEDOUT') { const x = new Error('连接超时：' + urlString); x.network = true; return x; }
+    if (code === 'ECONNRESET') { const x = new Error('连接被重置（可能是服务端主动断开）：' + urlString); x.network = true; return x; }
+    if (typeof code === 'string' && code.startsWith('HPE_')) {
+      const x = new Error('HTTP 响应格式异常（' + code + '）。常见于模型名不存在、服务商拦截流式请求，或中间代理返回非标准响应。');
+      x.canRetryNonStream = true;
+      x.network = true;
+      return x;
+    }
+    if (err && err.message && err.message.toLowerCase().includes('parse error')) {
+      const x = new Error('流式响应解析失败：' + err.message + '\n可能原因：模型名不存在、该模型不支持流式/tools、或网络中间件截断了 SSE。');
+      x.canRetryNonStream = true;
+      return x;
+    }
+    return err instanceof Error ? err : new Error(String(err));
+  })();
+  // 1.1.24（对齐 dsh LlmError）：给错误附加结构化 code，驱动 agent 层重试策略，
+  // 不再靠 String(err.message) 包含判断（弱模型/多语言环境下消息文本不可靠）。
+  if (!e.code) {
+    if (e.network) e.code = 'NETWORK';
+    else if (e.canRetryNonStream) e.code = 'STREAM_PARSE';
+    else if (code) e.code = String(code);      // 保留 node 原生 code（ECONNRESET 等）
+    else e.code = 'UNKNOWN';
   }
-  if (code === 'ENOTFOUND') return new Error('域名解析失败：' + urlString);
-  if (code === 'ETIMEDOUT') return new Error('连接超时：' + urlString);
-  if (code === 'ECONNRESET') return new Error('连接被重置（可能是服务端主动断开）：' + urlString);
-  if (typeof code === 'string' && code.startsWith('HPE_')) {
-    const e = new Error('HTTP 响应格式异常（' + code + '）。常见于模型名不存在、服务商拦截流式请求，或中间代理返回非标准响应。');
-    e.canRetryNonStream = true;
-    return e;
+  if (e.status) {
+    if (e.status === 429) e.code = 'RATE_LIMIT';
+    else if (e.status === 401 || e.status === 403) e.code = 'AUTH';
+    else if (e.status === 402 || e.status === 402 /* 402 无标准语义，留给 QUOTA */) { /* noop */ }
+    else if (e.status >= 500) e.code = 'HTTP_5XX';
+    else e.code = 'HTTP_' + e.status;
   }
-  if (err && err.message && err.message.toLowerCase().includes('parse error')) {
-    const e = new Error('流式响应解析失败：' + err.message + '\n可能原因：模型名不存在、该模型不支持流式/tools、或网络中间件截断了 SSE。');
-    e.canRetryNonStream = true;
-    return e;
-  }
-  return err instanceof Error ? err : new Error(String(err));
+  return e;
 }
 
-function explainHttpError(status, text) {
+function explainHttpError(status, text, rawRes) {
   let msg = text;
   try {
     const j = JSON.parse(text);
@@ -354,7 +477,20 @@ function explainHttpError(status, text) {
     503: '503 服务不可用：本地模型可能仍在加载'
   };
   const hint = hints[status];
-  return (hint ? hint + '\n' : `HTTP ${status}\n`) + String(msg).slice(0, 800);
+  const err = new Error((hint ? hint + '\n' : `HTTP ${status}\n`) + String(msg).slice(0, 800));
+  err.status = status;
+  // 1.1.24：结构化 code + Retry-After（对齐 dsh retryPolicy 尊重服务端退避指令）
+  if (status === 429) err.code = 'RATE_LIMIT';
+  else if (status >= 500) err.code = 'HTTP_5XX';
+  else err.code = 'HTTP_' + status;
+  if (rawRes && rawRes.headers) {
+    const ra = rawRes.headers['retry-after'];
+    if (ra) {
+      const secs = parseInt(ra, 10);
+      if (!isNaN(secs) && secs >= 0) err.retryAfterMs = secs * 1000;
+    }
+  }
+  return err;
 }
 
 /** 普通 JSON 请求（支持 gzip/deflate/br 与重定向） */
@@ -406,9 +542,7 @@ function requestJson(urlString, { method = 'GET', apiKey, body, timeout = 15000,
       bodyStream.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode >= 400) {
-          const err = new Error(explainHttpError(res.statusCode, text));
-          err.status = res.statusCode;
-          finish(reject, err);
+          finish(reject, explainHttpError(res.statusCode, text, res));
           return;
         }
         try {
@@ -674,12 +808,14 @@ function streamChat(options) {
     body.tool_choice = toolChoice || 'auto';
   }
   Object.assign(body, extraBody || {});
+  // 前缀缓存「强制保留本会话缓存副本」：并入按厂商算好的 body 指令（OpenAI gpt-5.6+ 的 prompt_cache_*）
+  Object.assign(body, cacheControlOf(options).body || {});
   // 注意：日志里把 function 工具显示成 "fn:<name>"，明确它们是「完整对象 {type:'function', name,...}」
   // 而不是字符串占位符（之前曾被误读为把 "function" 当字符串塞进 tools 数组）。
   debugResponses('SEND', { tools: (body.tools || []).map((t) => (t.type === 'function' ? 'fn:' + (t.name || '?') : t.type)), tool_choice: body.tool_choice });
 
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
-  const headers = buildHeaders(apiKey, Object.assign({ Accept: 'text/event-stream' }));
+  const headers = buildHeaders(apiKey, Object.assign({ Accept: 'text/event-stream' }, cacheControlOf(options).headers || {}));
   headers['Content-Length'] = payload.length;
 
   let finished = false;
@@ -702,7 +838,8 @@ function streamChat(options) {
       }
       // 流式统一收尾：整条流只消费最后一次 usage（过程内多个 usage chunk 不再逐个触发，
       // 避免同一请求的累计口径 usage 被重复累加进会话统计，造成累计命中率 >100%）。
-      if (lastUsage && onUsage) { try { onUsage(lastUsage); } catch (_) {} }
+      // 1.1.32：改走统一出口 emitUsage（先落 token-usage.log，再转发 onUsage）；lastUsage 为空也会落「no_usage」告警
+      emitUsage(lastUsage, options, onUsage);
       onDone &&
         onDone({
           content,
@@ -769,8 +906,7 @@ function streamChat(options) {
         bodyStream.on('data', (c) => chunks.push(c));
         bodyStream.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8');
-          const err = new Error(explainHttpError(res.statusCode, text));
-          err.status = res.statusCode;
+          const err = explainHttpError(res.statusCode, text, res);
           err.raw = text;
           finish(err);
         });
@@ -1025,6 +1161,7 @@ async function chatNonStream(options) {
     body.tools = tools;
     body.tool_choice = toolChoice || 'auto';
   }
+  Object.assign(body, cacheControlOf(options).body || {});
   Object.assign(body, extraBody || {});
 
   // 非流式要等模型一次性算完（推理模型尤其慢），超时不能沿用流式那套短值
@@ -1035,6 +1172,7 @@ async function chatNonStream(options) {
     insecureHTTPParser,
     signal,
     conversationId,
+    extra: cacheControlOf(options).headers,
     body
   });
 
@@ -1042,7 +1180,8 @@ async function chatNonStream(options) {
     console.log('[fox-ai] non-stream error:', JSON.stringify(data.error).slice(0, 400));
     throw new Error(data.error.message || JSON.stringify(data.error));
   }
-  if (data.usage && onUsage) { try { onUsage(data.usage); } catch (_) {} }
+  // 1.1.32：统一出口（记账 + 转发）；data.usage 为空也落「no_usage」告警
+  emitUsage(data.usage, options, onUsage);
   const extracted = extractContentFromJson(data);
   console.log('[fox-ai] non-stream ok, contentLen=', (extracted.content || '').length, 'reasoningLen=', (extracted.reasoning || '').length, 'toolCalls=', extracted.toolCalls.length, 'images=', extracted.images.length);
   const result = {
@@ -1396,13 +1535,15 @@ function streamResponses(options) {
     body.tools = toResponsesTools(tools);
     body.tool_choice = toolChoice || 'auto';
   }
+  const cc = cacheControlOf(options);
+  Object.assign(body, cc.body || {});
   Object.assign(body, extraBody || {});
   // 注意：日志里把 function 工具显示成 "fn:<name>"，明确它们是「完整对象 {type:'function', name,...}」
   // 而不是字符串占位符（之前曾被误读为把 "function" 当字符串塞进 tools 数组）。
   debugResponses('SEND', { tools: (body.tools || []).map((t) => (t.type === 'function' ? 'fn:' + (t.name || '?') : t.type)), tool_choice: body.tool_choice });
 
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
-  const headers = buildHeaders(apiKey, Object.assign({ Accept: 'text/event-stream' }));
+  const headers = buildHeaders(apiKey, Object.assign({ Accept: 'text/event-stream' }, cc.headers || {}));
   headers['Content-Length'] = payload.length;
 
   let finished = false;
@@ -1428,7 +1569,8 @@ function streamResponses(options) {
         return { id: t.id || 'call_' + k, name: t.name, arguments: t.args || '{}' };
       });
       // 统一收尾：整条流只触发一次 usage（最后一次累计），避免工具循环的多个 completed 重复累加
-      if (lastUsage && onUsage) { try { onUsage(lastUsage); } catch (_) {} }
+      // 1.1.32：统一出口（记账 + 转发）；lastUsage 为空也落「no_usage」告警
+      emitUsage(lastUsage, options, onUsage);
       onDone &&
         onDone({
           content,
@@ -1472,8 +1614,7 @@ function streamResponses(options) {
         bodyStream.on('data', (c) => chunks.push(c));
         bodyStream.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8');
-          const err = new Error(explainHttpError(res.statusCode, text));
-          err.status = res.statusCode;
+          const err = explainHttpError(res.statusCode, text, res);
           err.raw = text;
           finish(err);
         });
@@ -1722,6 +1863,8 @@ async function chatNonStreamResponses(options) {
     body.tools = toResponsesTools(tools);
     body.tool_choice = toolChoice || 'auto';
   }
+  const cc = cacheControlOf(options);
+  Object.assign(body, cc.body || {});
   Object.assign(body, extraBody || {});
   // 注意：日志里把 function 工具显示成 "fn:<name>"，明确它们是「完整对象 {type:'function', name,...}」
   // 而不是字符串占位符（之前曾被误读为把 "function" 当字符串塞进 tools 数组）。
@@ -1734,6 +1877,7 @@ async function chatNonStreamResponses(options) {
     insecureHTTPParser,
     signal,
     conversationId,
+    extra: cc.headers,
     body
   });
   if (data.error) {
@@ -1741,7 +1885,8 @@ async function chatNonStreamResponses(options) {
     throw new Error(data.error.message || JSON.stringify(data.error));
   }
   const ru = data.usage || (data.response && data.response.usage);
-  if (ru && onUsage) { try { onUsage(ru); } catch (_) {} }
+  // 1.1.32：统一出口（记账 + 转发）；ru 为空也落「no_usage」告警
+  emitUsage(ru, options, onUsage);
   const parsed = parseResponsesOutput(data.output || []);
   console.log('[fox-ai] responses non-stream ok, contentLen=', (parsed.content || '').length, 'reasoningLen=', (parsed.reasoning || '').length, 'toolCalls=', parsed.toolCalls.length, 'images=', parsed.images.length);
   return {
@@ -1764,6 +1909,6 @@ async function listModels({ baseUrl, apiKey, timeout = 15000 }) {
 
 module.exports = {
   streamChat, chatOnce, chatNonStream, streamResponses, chatNonStreamResponses, toResponsesTools, listModels,
-  requestJson, fimCompleteOnce, extractCacheStats, getCacheCapability,
+  requestJson, fimCompleteOnce, extractCacheStats, extractUsageStats, logTokenUsage, emitUsage, getCacheCapability,
   cleanSourceLabel, looksLikeLocalSource, parseInlineSourceLabels, fallbackUrlForSource, buildInlineSourcesText
 };

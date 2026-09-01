@@ -39,6 +39,12 @@
   const btnStorage = $('btnStorage');
   const workchainPanel = $('workchainPanel');
   const workchainList = $('workchainList');
+  // 当前页面身份：工作链独立页用 <body class="workchain-only"> 标记。
+  // 会话页只渲染正文与用户状态提示；思考过程与内部提醒只在工作链页渲染。
+  // 用 typeof 守卫：Node 测试环境（无 document.body）下安全取 false，浏览器中正常判定。
+  const IS_WORKCHAIN = (typeof document !== 'undefined' && document.body && document.body.classList)
+    ? document.body.classList.contains('workchain-only')
+    : false;
   const workchainHead = $('workchainHead');
   const workchainCount = $('workchainCount');
   const workchainClear = $('workchainClear');
@@ -270,11 +276,14 @@
       if (/^\s*([-*_])\1{2,}[ \t]*(?:[^\s].*)?$/.test(line)) { flushPara(); closeList(); html.push('<hr>'); continue; }
       const q = line.match(/^>\s?(.*)$/);
       if (q) { flushPara(); closeList(); html.push('<blockquote>' + renderInline(q[1]) + '</blockquote>'); continue; }
-      const ul = line.match(/^\s*[-*+][ \t]*(.*)$/);
+      // 1.1.25 修复：列表标记 `*`/`-`/`+` 后必须跟空格或行尾才算列表——
+      // 旧正则 `[ \t]*` 允许零空格，`**粗**`（以 `**` 开头）被误判成无序列表 `*` → `<li><em>粗</em>*</li>`。
+      // `[-*+](?=[ \t]|$)` 前瞻保证：`* a` 是列表；`**粗**` 是加粗、`---` 是分隔线（269 已处理）、`*单星*` 是斜体。
+      const ul = line.match(/^\s*[-*+](?=[ \t]|$)([ \t]*)(.*)$/);
       if (ul) {
         flushPara();
         if (listType !== 'ul') { closeList(); html.push('<ul>'); listType = 'ul'; }
-        html.push('<li>' + renderInline(ul[1]) + '</li>');
+        html.push('<li>' + renderInline(ul[2]) + '</li>');
         continue;
       }
       const ol = line.match(/^\s*\d+[.)][ \t]*(.*)$/);
@@ -652,6 +661,10 @@
         return '\u0002STEP:' + name + '\u0002' + whole.slice(end);
       })
       .replace(/\u0002STEP:[^\u0002]*$/g, ''); // 未闭合 STEP 尾巴兜底截断
+    // 裸 JSON 工具参数（{"path":...,"start_line":...} / {"command":...}）由后端
+    // textParser.stripBareToolArgs 在源头剥离（1.1.31 已同步到源码+两端副本，测试 20/20 通过）；
+    // 前端不需要第三层 replace——replace 回调无法表达「配平整个对象」的区间，硬做会残留多键
+    // JSON 或误伤正文。这里保持只做 STEP 归一化，避免叠第三层引入新 bug。
     const { text, cites } = extractCitations(src);
     // 补全链接：标签自带 > 搜索结果索引反查；并把来源存档到该消息，供点击角标取用（URL 晚到也会在重绘时回填）
     const resolved = cites.map((c) => ({ label: c.label, url: c.url || lookupCiteUrl(c.label), type: c.type, localPath: c.localPath }));
@@ -1202,7 +1215,10 @@
             m.bubble.appendChild(wrapper);
           }
         }
-        if (m.reasoning) {
+        // 会话栏：思考已由「💭思考」步骤卡片（thinking 通道）展示，finalReasoning 是累积思考，
+        // 再渲染「已思考」折叠面板会与卡片重复（用户报「两个思考，一个气泡一个卡片」）。
+        // 仅工作链页保留该折叠面板。
+        if (IS_WORKCHAIN && m.reasoning) {
           if (!m.reasonEl) {
             m.reasonEl = document.createElement('div');
             m.reasonEl.className = 'reasoning open';
@@ -1377,8 +1393,10 @@
       card.querySelector('.tool-body').appendChild(actions);
     }
 
-    // 工具卡片物理隔离到独立工作链面板，不再和正文流抢同一个轨道，杜绝插中间问题
-    if (workchainList) workchainList.appendChild(card);
+    // 工具卡片：工作链页进独立面板；会话页直接进正文流（分步骤时间线：💭思考→🖥️工具→正文）。
+    // 关键：会话页也有 workchainList（藏在折叠的 workchainPanel 里），不能只判 workchainList 存在，
+    // 否则工具卡被塞进折叠面板、主消息流看不到（用户报「工具卡没显示」的根因）。
+    if (IS_WORKCHAIN) workchainList.appendChild(card);
     else messagesEl.appendChild(card);
     toolCards[msg.id] = card;
     updateWorkchainCount();
@@ -1440,7 +1458,12 @@
             '<div class="step-thinking"></div>' +
           '</div>' +
         '</div>';
-      el.querySelector('.step-row').addEventListener('click', () => el.classList.toggle('open'));
+      // 1.1.32：记住用户手动展开/收起状态。refreshStepNode 每次会重写 className，
+      // 若不记录，流式刷新或收尾 refresh 会把用户点开的卡片又合上（「展开不了」）。
+      el.querySelector('.step-row').addEventListener('click', () => {
+        el.classList.toggle('open');
+        el._userOpen = el.classList.contains('open');
+      });
       stepItems[msg.id] = el;
     }
     return refreshStepNode(el, msg);
@@ -1448,13 +1471,20 @@
 
   // 依据 _meta + 当前消息重新渲染步骤节点的摘要行与折叠详情
   function refreshStepNode(el, msg) {
+    // 1.1.32：容器里是否已渲染过内容。补丁消息（只改 status）不得据此隐藏已有内容，
+    // 否则一轮收尾时思考/结果/参数会被误清空。
+    const hasRendered = (node) => !!(
+      node && (String(node.textContent || '').trim() || String(node.innerHTML || '').trim())
+    );
     if (msg) applyStepMeta(el, msg);
     const m = el._meta || {};
     const isThinking = String(el.dataset.id).startsWith('thinking-');
     const grp = m.group || (isThinking ? 'reason' : 'llm');
     el.dataset.grp = grp;
+    // 1.1.32：展开状态优先尊重用户手动操作（_userOpen），未手动操作过才用「思考步骤默认展开」的初值。
+    const openState = (typeof el._userOpen === 'boolean') ? el._userOpen : isThinking;
     el.className = 'step-item kind-' + (m.kind || 'info') + ' status-' + (m.status || 'running') +
-      ' grp-' + grp + (m.detail || m.result || m.parameters ? ' has-detail' : '') + (isThinking ? ' open' : '');
+      ' grp-' + grp + (m.detail || m.result || m.parameters ? ' has-detail' : '') + (openState ? ' open' : '');
     const icon = STEP_ICON[m.kind] || GROUP_ICON[grp] || '•';
     el.querySelector('.step-icon').textContent = icon;
     el.querySelector('.step-dot').textContent = icon;
@@ -1472,23 +1502,26 @@
       pre.textContent = ptext;
       paramsEl.appendChild(pre);
       paramsEl.style.display = '';
-    } else if (paramsEl) paramsEl.style.display = 'none';
+    } else if (paramsEl && !hasRendered(paramsEl)) paramsEl.style.display = 'none';
     // 结构化结果
     const resEl = el.querySelector('.step-result');
     if (m.result) { resEl.textContent = String(m.result).slice(0, 2000); resEl.style.display = ''; }
-    else if (resEl) resEl.style.display = 'none';
+    else if (resEl && !hasRendered(resEl)) resEl.style.display = 'none';
     // 普通 detail 文本（无结构化 result 时兜底）
+    // 1.1.32：不带 detail 的补丁（如一轮收尾的 {status:'ok'}）绝不能隐藏已渲染的思考内容，
+    // 否则 assistantEnd 刷新后整段思考凭空消失（用户报「加载完就直接不显示了」）。
     const thinkEl = el.querySelector('.step-thinking');
     if (m.detail && !m.result) { thinkEl.textContent = String(m.detail); thinkEl.style.display = ''; }
-    else if (thinkEl) thinkEl.style.display = 'none';
+    else if (thinkEl && !hasRendered(thinkEl)) thinkEl.style.display = 'none';
     return el;
   }
 
   function addStep(msg) {
     hideWelcome();
     const el = renderStepItem(msg);
-    // 步骤卡片物理隔离到独立工作链面板，不再污染主聊天正文流
-    if (workchainList) workchainList.appendChild(el);
+    // 步骤卡片：工作链页进独立面板；会话页直接进正文流（分步骤时间线）。
+    // 会话页也有 workchainList（折叠面板），必须按 IS_WORKCHAIN 而非 workchainList 存在与否判断。
+    if (IS_WORKCHAIN) workchainList.appendChild(el);
     else messagesEl.appendChild(el);
     // thinking 步骤（调用模型）初始化内容容器，供后续 delta/reasoning/image 写入
     if (String(msg.id).startsWith('thinking-') || (msg.kind === 'llm' && msg.status === 'running')) {
@@ -1497,13 +1530,6 @@
     updateWorkchainCount();
     scrollDown();
     return el;
-  }
-
-  function updateStepMeta(id, patch) {
-    const el = stepItems[id];
-    if (!el) return;
-    refreshStepNode(el, patch);
-    if (patch && patch.status === 'running') scrollDown();
   }
 
   // 工具名 → 可读动作名映射（对齐 DSH 的 Pwsh/Read 可读标签：工具不裸显示 list_dir，
@@ -1563,7 +1589,7 @@
     if (!thinkEl) return;
     const parts = [];
     if (ts.reasoning && String(ts.reasoning).trim()) {
-      parts.push('<div class="thinking-section"><div class="thinking-section-title">已思考</div>' + renderReasoning(ts.reasoning) + '</div>');
+      parts.push('<div class="thinking-section">' + renderReasoning(ts.reasoning) + '</div>');
     }
     // 1.1.18 步骤流：把输出原文切成「💭 思考 / 🖥️ 工具动作」分步卡片（仿 DSH 步骤节奏，
     // 用狐狸 AI 既有 step-item 体系），而不是整段糊成一个 thinking-section。
@@ -1571,7 +1597,7 @@
       const segs = splitThinkingSteps(ts.raw);
       if (segs.length <= 1) {
         // 无工具标记：保持原样单节「输出」，避免空转（单节时不做额外包装）
-        parts.push('<div class="thinking-section"><div class="thinking-section-title">输出</div>' + renderAssistant(ts.raw) + '</div>');
+        parts.push('<div class="thinking-section">' + renderAssistant(ts.raw) + '</div>');
       } else {
         parts.push('<div class="workchain-steps">');
         for (const seg of segs) {
@@ -1905,6 +1931,17 @@ if (seg.kind === 'tool') {
     scrollDown();
   }
 
+  // 内部提醒（审查子代理/缓存漂移/空轮回灌等）：作为诊断条目追加到工作链时间线，
+  // 只在 <body class="workchain-only"> 页面可见；会话页不渲染（见 case 'notice'）。
+  function addWorkchainNotice(text) {
+    if (!workchainList) return;
+    const item = document.createElement('div');
+    item.className = 'workchain-notice';
+    item.textContent = text;
+    workchainList.appendChild(item);
+    updateWorkchainCount();
+  }
+
   // RAG 直答后，在输入栏上方提示用户可切换智能体模式
   function showRagHint() {
     if (!ragHintEl) return;
@@ -2091,16 +2128,6 @@ if (seg.kind === 'tool') {
     }
   }
   // 进度栏已移除（用户要求）：原 miniStatusBar 状态轨迹不再渲染，工作链面板仍独立展示步骤。
-  function focusWorkchainStep(id) {
-    if (!id) return;
-    const safe = String(id).replace(/"/g, '\\"');
-    const el = (workchainList && workchainList.querySelector('[data-id="' + safe + '"]')) || stepItems[id] || toolCards[id];
-    if (!el) return;
-    if (workchainPanel) { workchainPanel.classList.remove('collapsed'); workchainPanel.classList.add('open'); }
-    el.classList.add('open', 'flash');
-    setTimeout(() => el.classList.remove('flash'), 900);
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }
   providerChip.addEventListener('click', () => vscode.postMessage({ type: 'pickProvider' }));
   modelChip.addEventListener('click', () => vscode.postMessage({ type: 'pickModel' }));
   apiModeChip.addEventListener('click', () => vscode.postMessage({ type: 'pickApiMode' }));
@@ -2499,7 +2526,7 @@ if (seg.kind === 'tool') {
         }
         case 'assistantStart': {
           if (msg.channel === 'thinking') {
-            // thinking 通道：复用 state:thinking 已创建的步骤卡片，只初始化内容容器
+            // 会话栏 + 工作链都渲染思考步骤：容器由 step(kind:'llm') 消息先建，这里补记 thinkingSteps 映射
             if (!thinkingSteps[msg.msg_id]) {
               const el = stepItems[msg.msg_id];
               if (el) {
@@ -2658,9 +2685,9 @@ if (seg.kind === 'tool') {
         }
         case 'assistantEnd': {
           if (msg.channel === 'thinking') {
+            // 会话栏 + 工作链都收尾思考步骤
             const ts = thinkingSteps[msg.msg_id];
             if (ts && ts.el) {
-              // 用结构化刷新收尾思考步骤（保留分组/类型，仅把状态置 ok）
               refreshStepNode(ts.el, { status: 'ok' });
               delete thinkingSteps[msg.msg_id];
             }
@@ -2686,7 +2713,9 @@ if (seg.kind === 'tool') {
           addToolCard(msg);
           break;
         case 'step':
-          addStep(msg);
+          // 1.1.32：思考步骤（kind==='llm'）会话栏+工作链都渲染，形成「思考→工具→正文」分步骤时间线；
+          // 审批/状态 step 后端已只推工作链，这里仅工作链 addStep（会话页不出现「已允许」气泡）。
+          if (IS_WORKCHAIN || msg.kind === 'llm') addStep(msg);
           break;
         case 'toolStream':
           appendToolStream(msg);
@@ -2730,7 +2759,13 @@ if (seg.kind === 'tool') {
           addApproval(msg);
           break;
         case 'notice':
-          addNotice(msg.text);
+          if (msg.internal) {
+            // 内部提醒（审查子代理/缓存漂移/空轮回灌等）：只在工作链页呈现，会话页保持纯净
+            if (IS_WORKCHAIN) addWorkchainNotice(msg.text);
+          } else {
+            // 用户状态提示（后台任务/取消确认等）：只在会话页呈现，工作链页聚焦诊断信息
+            if (!IS_WORKCHAIN) addNotice(msg.text);
+          }
           break;
         case 'ragHint':
           showRagHint();

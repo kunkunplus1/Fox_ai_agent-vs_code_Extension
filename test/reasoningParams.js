@@ -175,7 +175,8 @@ t('promptFallback=false 时不注入提示词', () => {
   assert.strictEqual(o.promptHint, '');
 });
 
-t('DeepSeek V4 原生思考：thinking:{enabled} + reasoning_effort（high→max）', () => {
+// DeepSeek 官方直连（provider=deepseek）：沿用 DeepSeek 自家扩展字段 thinking:{type:'enabled'}
+t('DeepSeek V4 官方直连：thinking:{enabled} + reasoning_effort（high→max）', () => {
   const o = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: true, effort: 'high' } }));
   assert.deepStrictEqual(o.extraBody.thinking, { type: 'enabled' });
   assert.strictEqual(o.extraBody.reasoning_effort, 'max');
@@ -184,6 +185,24 @@ t('DeepSeek V4 原生思考：thinking:{enabled} + reasoning_effort（high→max
   assert.strictEqual(med.extraBody.reasoning_effort, 'high');
   const low = rp.buildReasoningParams(mk('deepseek', 'deepseek-v4-flash', { deepThinking: { enabled: true, effort: 'low' } }));
   assert.strictEqual(low.extraBody.reasoning_effort, 'low');
+});
+
+// 1.1.26 厂商适配：同为 OpenAI 兼容端点，硅基流动字段名与 DeepSeek 官方不同
+// （api-docs.siliconflow.cn/docs/api/chat-completions-post：enable_thinking + thinking_budget）
+t('DeepSeek V4 经硅基流动：enable_thinking + thinking_budget + reasoning_effort，不发 thinking 块', () => {
+  const o = rp.buildReasoningParams(mk('siliconflow', 'deepseek-ai/DeepSeek-V4-Flash', { deepThinking: { enabled: true, effort: 'high' } }));
+  assert.strictEqual(o.extraBody.enable_thinking, true, '应发硅基流动官方的 enable_thinking 开关');
+  assert.ok(o.extraBody.thinking_budget >= 128 && o.extraBody.thinking_budget <= 32768,
+    'thinking_budget 应在官方 128~32768 区间，实际 ' + o.extraBody.thinking_budget);
+  assert.strictEqual(o.extraBody.reasoning_effort, 'max');
+  assert.strictEqual(o.native, true);
+  assert.ok(!o.extraBody.thinking, '硅基流动不识别 DeepSeek 的 thinking 块，绝不能发');
+  // 显式预算优先：设置 budgetTokens 时按用户值走
+  const custom = rp.buildReasoningParams(mk('siliconflow', 'deepseek-ai/DeepSeek-V4-Flash', { deepThinking: { enabled: true, effort: 'high', budgetTokens: 4096 } }));
+  assert.strictEqual(custom.extraBody.thinking_budget, 4096);
+  // Anthropic 传输另有 anthropic 策略负责（不会走 deepseek 分支），此处仅确认不串味
+  const anth = rp.buildReasoningParams(mk('siliconflow', 'deepseek-ai/DeepSeek-V4-Flash', { transport: 'anthropic', deepThinking: { enabled: true, effort: 'high' } }));
+  assert.ok(anth.extraBody.thinking && anth.extraBody.thinking.budget_tokens > 0, 'Anthropic 传输应走原生扩展思考');
 });
 
 t('DeepSeek Responses：reasoning.effort（high→max），第三方不加 summary', () => {

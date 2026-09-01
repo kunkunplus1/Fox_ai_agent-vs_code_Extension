@@ -294,7 +294,6 @@
   "foxai.n293": "Fox AI · Codebase Semantic Index",
   "foxai.n294": "File extensions to include in the semantic index (e.g. .ts, .py). Empty uses the built-in defaults.",
   "foxai.n295": "Maximum number of files to index, protecting memory on huge repositories.",
-  "foxai.n296": "Use the dedicated DeepSeek /completions FIM endpoint (Beta) instead of chat/completions. When on, the prefix/suffix are submitted as native params; set this completion's baseUrl to https://api.deepseek.com/beta and use a FIM-capable model. fimStrategy is ignored in this mode.",
   "foxai.n296": "Rebuild the index automatically before the next search once it is older than this many hours.",
   "foxai.n297": "Fox AI · Structured Long-term Memory",
   "foxai.n298": "Enable topic-based long-term memory. Only topics relevant to the current question are loaded into context.",
@@ -304,5 +303,9 @@
   "foxai.n302": "Fox AI: Roll Back to Checkpoint",
   "foxai.n303": "Fox AI: Rebuild Codebase Semantic Index",
   "foxai.n304": "Fox AI: Edit Lifecycle Hooks",
-  "foxai.n305": "Fox AI: Open Structured Memory Folder"
+  "foxai.n305": "Fox AI: Open Structured Memory Folder",
+  "foxai.n339": "Force inject: when ON, knowledge base is injected into the system prompt every turn (legacy behavior). When OFF (default), the knowledge base is not auto-injected; the agent activates the 'knowledge base retrieval' skill via use_skill when needed - saves tokens and hits more accurately.",
+  "foxai.n340": "Auto-resume: when reaching the step limit, automatically append budget and continue instead of waiting for manual \"Continue\". Long tasks auto-resume without losing the checkpoint.",
+  "foxai.n341": "Maximum auto-resume rounds before actually pausing for user confirmation (default 5).",
+  "foxai.n342": "Plan confirm gate (default off, aligning with DSH goal-round-driver: plan = execute). When off, presenting/revising a plan immediately continues execution without a confirmation gate; only when enabled, the agent pauses for your confirmation after presenting the plan."
 }

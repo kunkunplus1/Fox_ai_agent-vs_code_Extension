@@ -40,6 +40,28 @@ function buildContinuePrompt(lastText, opts) {
   const head = goal
     ? `【目标续轮】\n当前整体目标：${goal}\n本次是同一任务的第 ${round} 次续写。请始终围绕上述目标继续推进，不要偏离到无关内容；续写完成后检查是否达到目标，若已达到就明确收尾，不要空转。\n\n`
     : '';
+
+  // ---- 半截工具块续写分支（对齐 dsh 续轮收口，1.1.24）----
+  // 病灶：模型输出被 max_tokens 掐断时，若截断点正好卡在工具调用中间
+  // （如 <foxtool name="read_file">\n{"path":"… 有开无合，或 [[tool:read_file]] 只有开头），
+  // 旧续写提示只让模型「续正文」，模型照着补了一段话而不是补完工具块 →
+  // 下一轮 parseTextCalls 依旧 count=0（无合法完整块）→ 空轮 ×2 → 会话中断（日志 pid:16484 08-30 02:31 实锤）。
+  // 检测必须是「最后一个开标签之后【没有】对应闭合标签」才算半截——
+  // 不能用「末尾存在开标签」就判定：已闭合的 <foxtool>…</foxtool> 后跟正文，
+  // 开标签同样出现在尾部，但并非半截（1.1.24 回归第 6 用例实锤误判）。
+  // 命中时回传「从开标签处起的完整半截块」，明确要求补闭合标签并继续执行该工具。
+  const halfBlock = _halfOpenBlock(tail);
+  if (halfBlock) {
+    const half = halfBlock.slice(0, 600); // 只回传半截块本体（从开标签起，最多 600 字）
+    return (
+      head + '你刚才的输出因达到单次长度上限被截断，截断点正好落在【还没写完的工具调用块】中间。' +
+      '你最后写到的工具块是下面这段（不完整，缺少闭合标签）：\n' +
+      '「' + half + '」\n\n' +
+      '请【接着把该工具调用块补完整】：补上缺失的参数 JSON（如 {"path": "…"}）、补上闭合标签 ' +
+      '</foxtool>（或对应的 [[/tool]]），然后立即停止输出并等待该工具结果——不要输出正文、不要另起新工具块、不要重复上面的内容。'
+    );
+  }
+
   if (tail.length > 400) {
     const slice = tail.slice(tail.length - 400);
     return (
@@ -73,4 +95,35 @@ function isStuckRepeat(prevChunk, newChunk) {
   return total > 0 && hit / total > 0.85;
 }
 
-module.exports = { shouldAutoContinue, buildContinuePrompt, isStuckRepeat };
+/**
+ * 检测文本尾部是否存在【未闭合】的工具调用块（对齐 dsh 续轮收口，1.1.24）。
+ * 规则：取【最后一个】工具开标签，检查其之后是否有对应的闭合标签——
+ *   有闭合 → 不是半截（已闭合完整块后跟正文属正常轮，不误判）；
+ *   无闭合 → 半截块（<foxtool/<fox:tool/<fox-tool/<tool/<function 或自定义 [[tool:…]]）。
+ * 返回半截块原文（从开标签起），无半截返回 null。
+ * @param {string} text 上一轮被截断的可见文本
+ * @returns {string|null}
+ */
+function _halfOpenBlock(text) {
+  const s = String(text || '');
+  if (!s) return null;
+  // 标准 XML 风格开标签
+  const OPEN_RE = /<(fox:?tool|fox-tool|tool|function)\s+name\s*=\s*["'][^"']+["']\s*>/gi;
+  // 自定义 [[tool:name]] 开标签
+  const OPEN_CUSTOM_RE = /\[\[tool:[^\]\n]*\]\]/gi;
+  let lastOpen = null;
+  let lastIndex = -1;
+  let m;
+  OPEN_RE.lastIndex = 0;
+  while ((m = OPEN_RE.exec(s)) !== null) { lastOpen = m[0]; lastIndex = m.index; }
+  OPEN_CUSTOM_RE.lastIndex = 0;
+  while ((m = OPEN_CUSTOM_RE.exec(s)) !== null) { lastOpen = m[0]; lastIndex = m.index; }
+  if (!lastOpen) return null;
+  const after = s.slice(lastIndex + lastOpen.length);
+  // 找对应闭合标签：标准 </...tool> 或自定义 [[/tool]]
+  const closeRe = /<\/(fox:?tool|fox-tool|tool|function)\s*>/i.test(after) || /\[\[\/tool\]\]/.test(after);
+  if (closeRe) return null; // 已有闭合 → 不是半截
+  return s.slice(lastIndex);
+}
+
+module.exports = { shouldAutoContinue, buildContinuePrompt, isStuckRepeat, _halfOpenBlock };

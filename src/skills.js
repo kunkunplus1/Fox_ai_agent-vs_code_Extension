@@ -109,6 +109,16 @@ function parseGitHubUrl(url) {
     }
     return { type: 'repo', owner: m[1], repo: m[2].replace(/\.git$/i, ''), branch, path };
   }
+  // C. GitLab raw 文件：https://gitlab.com/{owner}/{repo}/-/raw/{branch}/{path...}/SKILL.md
+  m = u.match(/^https?:\/\/gitlab\.com\/([^/]+)\/([^/?#]+)\/-\/raw\/([^/]+)\/([\s\S]+)$/i);
+  if (m) return { type: 'raw', owner: m[1], repo: m[2].replace(/\.git$/i, ''), branch: m[3], path: m[4] };
+  // D. Gitee raw 文件：https://gitee.com/{owner}/{repo}/raw/{branch}/{path...}/SKILL.md
+  m = u.match(/^https?:\/\/gitee\.com\/([^/]+)\/([^/?#]+)\/raw\/([^/]+)\/([\s\S]+)$/i);
+  if (m) return { type: 'raw', owner: m[1], repo: m[2].replace(/\.git$/i, ''), branch: m[3], path: m[4] };
+  // E. 任何 https 直链：文件以 .md/.txt 结尾 → 直接当 SKILL.md 内容源（普通文件链接 / zip 内的 SKILL.md 不适用，zip 需先解压）
+  if (/^https?:\/\/[^/]+\/[^?#]+\.(md|markdown|txt)(\?|#|$)/i.test(u)) {
+    return { type: 'file', url: u, owner: '', repo: 'skill', branch: '', path: '' };
+  }
   return null;
 }
 
@@ -267,11 +277,17 @@ async function importFromUrl(url, opts = {}) {
       if (r.status !== 200 || !r.body) return { ok: false, errors: ['raw 文件下载失败（HTTP ' + r.status + '）：' + url + (proxy ? '' : '（若直连被墙，可先配置系统代理或用镜像链接）')], name: '', path: '' };
       skillMd = r.body;
       const dir = parsed.path.slice(0, parsed.path.lastIndexOf('/'));
-      if (dir) {
-        const scriptUrl = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${parsed.branch}/${dir}/run.js`;
+      if (dir && parsed.owner) {
+        // 同平台同位置试 run.js：把 SKILL.md 文件名换成 run.js（GitHub/GitLab/Gitee raw 通用）
+        const scriptUrl = url.slice(0, url.indexOf(parsed.path)) + dir + '/run.js';
         const sr = await httpsGet(scriptUrl, 0, proxy);
         if (sr.status === 200 && sr.body && sr.body.trim()) scriptRaw = sr.body;
       }
+    } else if (parsed.type === 'file') {
+      // 任意 https 直链（.md/.markdown/.txt）：直接当 SKILL.md 内容源
+      const r = await httpsGet(url, 0, proxy);
+      if (r.status !== 200 || !r.body) return { ok: false, errors: ['文件直链下载失败（HTTP ' + r.status + '）：' + url], name: '', path: '' };
+      skillMd = r.body;
     } else {
       // 仓库链接：候选路径逐个试
       const cands = candidateSkillUrls(parsed);
@@ -484,4 +500,4 @@ class UserSkillStore {
   }
 }
 
-module.exports = { UserSkillStore, defaultDir, sanitizeName, resolveDir, parseGitHubUrl, candidateSkillUrls, inferSkillName, normalizeSkillFile, httpsGet, fetchFirst, detectProxy };
+module.exports = { UserSkillStore, defaultDir, sanitizeName, resolveDir, parseGitHubUrl, parseSkillUrl: parseGitHubUrl, candidateSkillUrls, inferSkillName, normalizeSkillFile, httpsGet, fetchFirst, detectProxy };

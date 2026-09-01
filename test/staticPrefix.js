@@ -59,12 +59,13 @@ session.memory = { renderForPrompt: () => 'FLAT_BODY' };
 
 console.log('\n[1] _collectStableParts 拼接规则（技能/结构/任务/扁平记忆，rules 因 root=null 跳过、mode 因 null 跳过）');
 const collected = session._collectStableParts('FLAT_BODY');
-check('返回数组且含【用户技能】', () => assert.ok(collected.some((p) => p === '【用户技能】\nSKILL_BODY'), JSON.stringify(collected)));
+// 1.1.25：技能块标题已从「用户技能」改为「技能目录」（1.1.23 拆 prompts 时对齐 dsh 技能目录命名），断言同步
+  check('返回数组且含【技能目录】', () => assert.ok(collected.some((p) => p.startsWith('【技能目录】') && p.includes('SKILL_BODY')), JSON.stringify(collected)));
 check('含【项目结构】', () => assert.ok(collected.some((p) => p === '【项目结构】\nPROJ_BODY'), JSON.stringify(collected)));
 check('不含【项目任务清单】(已移出稳定块，改由 list_plan_tasks 按需查询)', () => assert.ok(!collected.some((p) => p.startsWith('【项目任务清单】')), JSON.stringify(collected)));
 check('含【长期记忆】(扁平)', () => assert.ok(collected.some((p) => p === '【长期记忆】\nFLAT_BODY'), JSON.stringify(collected)));
 check('顺序为 技能→结构→长期记忆', () => {
-  const i1 = collected.findIndex((p) => p.startsWith('【用户技能】'));
+  const i1 = collected.findIndex((p) => p.startsWith('【技能目录】'));
   const i2 = collected.findIndex((p) => p.startsWith('【项目结构】'));
   const i4 = collected.findIndex((p) => p.startsWith('【长期记忆】'));
   assert.ok(i1 >= 0 && i2 > i1 && i4 > i2, JSON.stringify(collected));
@@ -133,12 +134,14 @@ session._injectDynamicAppendix(hist, 'S', '狐狸AI·稳定上下文'); // 重�
 session._injectDynamicAppendix(hist, 'D', '狐狸AI·动态上下文'); // 重注同 mark → 不变
 check('同 mark 重复注入幂等（内容不变）', () => assert.strictEqual(hist[0].content, before));
 
-console.log('\n[6] _bakeAppendixIntoSource 烤回源 + _sourceHasMark 门控');
+console.log('\n[6] _bakeAppendixIntoSource 烤回源 + 哨兵门控');
 session.messages = [{ role: 'user', content: 'Q' }];
 session._bakeAppendixIntoSource('S', '狐狸AI·稳定上下文');
+// 1.1.25：_sourceHasMark 方法已被重构移除（哨兵判定统一走 _hasMark），
+// 源消息列表只含 messages[0] 一条 user，等价 session._hasMark(session.messages[0], mark)。
 check('烤回源后源含 STABLE 哨兵', () => assert.ok(session.messages[0].content.includes(STABLE)));
-check('_sourceHasMark(STABLE) 变 true（门控将跳过首轮注入）', () => assert.strictEqual(session._sourceHasMark('狐狸AI·稳定上下文'), true));
-check('_sourceHasMark(DYN) 仍 false（易变块未烤）', () => assert.strictEqual(session._sourceHasMark('狐狸AI·动态上下文'), false));
+check('STABLE 哨兵已烤入（门控将跳过首轮注入）', () => assert.strictEqual(session._hasMark(session.messages[0], '狐狸AI·稳定上下文'), true));
+check('DYN 仍未烤入（易变块未烤）', () => assert.strictEqual(session._hasMark(session.messages[0], '狐狸AI·动态上下文'), false));
 session._bakeAppendixIntoSource('S', '狐狸AI·稳定上下文'); // 重烤同 mark → 不变
 check('同 mark 重烤幂等', () => assert.strictEqual(session.messages[0].content.includes(STABLE_END) && (session.messages[0].content.match(new RegExp(STABLE, 'g')) || []).length === 1, true));
 session._bakeAppendixIntoSource('D', '狐狸AI·动态上下文');
@@ -146,9 +149,9 @@ check('再烤 DYN 后源同时含两套哨兵', () => assert.ok(session.messages
 
 console.log('\n[7] 首轮注入门控（run 决策等价：源无 STABLE 才收集，有则跳过）');
 session.messages = [];
-check('源为空 → 门控放行（应收集 stableAppendix）', () => assert.strictEqual(session._sourceHasMark('狐狸AI·稳定上下文'), false));
+check('源为空 → 门控放行（应收集 stableAppendix）', () => assert.strictEqual(session._hasMark(session.messages[0], '狐狸AI·稳定上下文'), false));
 session.messages = [{ role: 'user', content: 'Q' + session._wrapAppendix('S', '狐狸AI·稳定上下文') }];
-check('源已含 STABLE → 门控拦截（stableAppendix 应为空、不再重注）', () => assert.strictEqual(session._sourceHasMark('狐狸AI·稳定上下文'), true));
+check('源已含 STABLE → 门控拦截（stableAppendix 应为空、不再重注）', () => assert.strictEqual(session._hasMark(session.messages[0], '狐狸AI·稳定上下文'), true));
 
 console.log('\n[8] _applyAppendix 替换语义（降级重算场景：内容变化也对齐，不重复叠加）');
 check('无 mark 时追加到尾部（首追补 \\n\\n 分隔）', () => {

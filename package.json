@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.18",
+  "version": "1.1.26",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -29,6 +29,9 @@
     "copilot"
   ],
   "main": "./extension.js",
+  "bin": {
+    "fox": "./src/cli/fox.js"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -1426,6 +1429,11 @@
             "default": 3000,
             "description": "%foxai.n173%"
           },
+          "foxAi.knowledgeBase.forceInject": {
+            "type": "boolean",
+            "default": false,
+            "description": "%foxai.n339%"
+          },
           "foxAi.knowledgeBase.chunkSize": {
             "type": "number",
             "default": 800,
@@ -1845,6 +1853,13 @@
             "order": 1.5,
             "description": "%foxai.n215%"
           },
+          "foxAi.planAndExecute.confirmGate": {
+            "type": "boolean",
+            "default": false,
+            "order": 1.6,
+            "description": "%foxai.n342%",
+            "markdownDescription": "%foxai.n342%"
+          },
           "foxAi.review.enabled": {
             "type": "boolean",
             "default": true,
@@ -1888,6 +1903,20 @@
             "default": 3,
             "order": 4,
             "description": "%foxai.n219%"
+          },
+          "foxAi.agent.autoResume": {
+            "type": "boolean",
+            "default": true,
+            "order": 4.5,
+            "description": "%foxai.n340%",
+            "markdownDescription": "%foxai.n340%"
+          },
+          "foxAi.agent.autoResumeRounds": {
+            "type": "number",
+            "default": 5,
+            "order": 4.6,
+            "description": "%foxai.n341%",
+            "markdownDescription": "%foxai.n341%"
           },
           "foxAi.routing.gateEnabled": {
             "type": "boolean",

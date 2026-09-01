@@ -83,6 +83,8 @@ function check(name, fn) {
   const cfg = await config.resolve(ctx);
   cfg.baseUrl = 'http://127.0.0.1:' + port + '/v1';
   cfg.model = 'deepseek-v4-flash';
+  cfg.provider = 'openai';       // 非 deepseek：避免 isDeepResp 强制 native 禁降级；云厂商才走原生
+  cfg.meta = { local: false, textOnly: false };  // 清掉默认 llamacpp 的 meta.local=true
   cfg.apiMode = 'responses';     // 关键：Responses 协议
   cfg.forceNonStream = true;
   cfg.visionMode = 'off';

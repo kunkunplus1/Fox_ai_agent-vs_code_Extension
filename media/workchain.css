@@ -166,3 +166,31 @@ body.workchain-only .workchain-list:empty::before {
 .step-tool::before,
 .step-text::before,
 .step-tool .step-card::before { display: none; }
+
+/* 1.1.27：内部提醒（审查子代理/缓存漂移/空轮回灌等）作为诊断条目挂在工作链时间线，
+   与 step-card 同款节奏（左侧圆点 + 竖线），但不带分组色，默认始终可见（无 data-grp，不被筛选隐藏）。 */
+.workchain-notice {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1.6;
+  margin: 2px 0 2px 4px;
+  padding: 2px 8px 4px 18px;
+  font-size: 12px;
+  color: var(--fox-fg-soft, #9aa0a6);
+  border-left: 2px solid var(--fox-line-soft, rgba(128,128,128,.22));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.workchain-notice::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 9px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fox-accent, #f0883e);
+  opacity: .8;
+}

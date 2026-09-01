@@ -83,6 +83,7 @@ Module._load = function (request, parent, isMain) {
 };
 
 const { AgentSession } = require('../src/agent');
+const { parseTextCalls } = require('../src/textParser');
 const config = require('../src/config');
 const mcp = require('../src/tools/mcp');
 
@@ -155,18 +156,18 @@ function check(name, fn) {
 
   console.log('\n[文本协议工具名正则覆盖真实 MCP 命名空间]');
   check('可解析含连字符的 MCP 工具名', () => {
-    const calls = session.parseTextCalls('<fox:tool name="mcp__fetch__fetch-url">{}</fox:tool>');
+    const calls = parseTextCalls('<fox:tool name="mcp__fetch__fetch-url">{}</fox:tool>');
     assert.strictEqual(calls.length, 1, '应解析到 1 个调用');
     assert.strictEqual(calls[0].name, 'mcp__fetch__fetch-url');
   });
   check('可解析含点/斜杠/大写的 VS Code 原生 MCP 工具名', () => {
-    const calls = session.parseTextCalls('<fox:tool name="mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page">{"url":"x"}</fox:tool>');
+    const calls = parseTextCalls('<fox:tool name="mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page">{"url":"x"}</fox:tool>');
     assert.strictEqual(calls.length, 1, '应解析到 1 个调用');
     assert.strictEqual(calls[0].name, 'mcp__io.github.ChromeDevTools/chrome-devtools-mcp__new_page');
   });
   check('可解析嵌在自然语言中的工具标签（前有大写正文）', () => {
     const text = 'fetch 没返回，我换 Playwright： <fox:tool name="mcp__playwright__browser_navigate"> {"url":"https://x"} </fox:tool> 用户想抓取页面';
-    const calls = session.parseTextCalls(text);
+    const calls = parseTextCalls(text);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].name, 'mcp__playwright__browser_navigate');
   });
@@ -174,14 +175,14 @@ function check(name, fn) {
   console.log('\n[1.1.39 闭合标签感知 / 溢出回传 / 记忆别名]');
   check('参数 JSON 内嵌 </foxtool> 字面量不被提前截断', () => {
     const text = '<foxtool name="write_file">{"path":"a.html","content":"<div></foxtool>尾巴"}</foxtool>';
-    const calls = session.parseTextCalls(text, session._toolNameSet());
+    const calls = parseTextCalls(text, session._toolNameSet());
     assert.strictEqual(calls.length, 1, '应恰好解析到 1 个调用，实际 ' + calls.length);
     assert.strictEqual(calls[0].name, 'write_file');
     assert.ok(calls[0].rawArgs.includes('</foxtool>尾巴'), '参数 body 应完整含内嵌闭合标签，实际：' + calls[0].rawArgs);
   });
   check('参数 JSON 内嵌 HTML 标签（<b>）不被过激截断', () => {
     const text = '<foxtool name="edit_file">{"path":"x.md","content":"<b>粗体</b>"}</foxtool>';
-    const calls = session.parseTextCalls(text, session._toolNameSet());
+    const calls = parseTextCalls(text, session._toolNameSet());
     assert.strictEqual(calls.length, 1);
     assert.ok(calls[0].rawArgs.includes('<b>粗体</b>'), '参数应完整保留 HTML：' + calls[0].rawArgs);
   });
@@ -190,7 +191,7 @@ function check(name, fn) {
     const names = ['read_file', 'write_file', 'edit_file', 'list_dir', 'search_text', 'open_file'];
     let text = '';
     for (let i = 0; i < names.length; i++) text += `<foxtool name="${names[i]}">{"path":"f${i}.txt"}</foxtool>\n`;
-    const calls = session.parseTextCalls(text, session._toolNameSet());
+    const calls = parseTextCalls(text, session._toolNameSet());
     assert.strictEqual(calls.length, 5, '应只取前 5 个，实际 ' + calls.length);
     assert.strictEqual(calls._truncated, true, '应标记截断');
   });
@@ -205,7 +206,11 @@ function check(name, fn) {
 
   const r = await session.run();
   check('会话正常结束', () => assert.strictEqual(r.finished, true));
-  check('工具被调用（发生了 2 次模型请求）', () => assert.strictEqual(callCount, 2, '应有第一次工具调用 + 第二次最终回答'));
+  // 1.1.14 统一空轮契约：text 协议下模型输出纯正文（无工具块）时，
+  // 有正文先展示 → 空轮计数+1 → 回灌「继续/输出工具块」确认 → 模型再次纯正文 → 空轮达到上限 → 收尾。
+  // 1.1.26 韧性加固：空轮上限 2 → 3（EMPTY_TURN_MAX），即给 2 次分级 nudge 机会再收尾。
+  // 所以「工具调用(请求1) + 工具结果后最终回答(请求2) + 空轮 nudge1(请求3) + nudge2(请求4)」= 4 次请求。
+  check('工具被调用且最终正文经空轮确认收尾（4 次模型请求）', () => assert.strictEqual(callCount, 4, '应发生 工具调用→正文→空轮 nudge×2 共 4 次请求，实际 ' + callCount));
   check('最终文本包含正确结论', () => assert.ok(String(r.text).includes('工具已执行'), '最终文本：' + r.text));
 
   console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');

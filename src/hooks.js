@@ -170,7 +170,12 @@ function matches(hook, payload) {
     const args = p.args || {};
     for (const key of Object.keys(m.argsMatch)) {
       const re = safeRegex(String(m.argsMatch[key]));
-      const val = args[key] === undefined || args[key] === null ? '' : String(args[key]);
+      let val = args[key] === undefined || args[key] === null ? '' : String(args[key]);
+      // argv 数组兜底（1.1.22）：run_command 传 argv 时 command 为空，把 argv 拼回字符串再匹配，
+      // 避免「危险命令需人工确认」这类 command 正则钩子被 argv 模式绕过。
+      if (!val && key === 'command' && Array.isArray(args.argv) && args.argv.length) {
+        val = args.argv.join(' ');
+      }
       if (!re || !re.test(val)) return false;
     }
   }
@@ -205,7 +210,11 @@ function interpolate(str, payload) {
     else if (key === 'cwd') v = p.cwd;
     else if (key === 'error') v = p.error;
     else v = args[key];
-    if (v === undefined || v === null) return '';
+    if (v === undefined || v === null) {
+      // argv 兜底（1.1.22）：${command} 在 argv 模式下拼回字符串，message/描述不显示空值
+      if (key === 'command' && Array.isArray(args.argv) && args.argv.length) v = args.argv.join(' ');
+      else return '';
+    }
     return String(v).replace(/[\r\n\u0000-\u001f]/g, ' ').slice(0, 500);
   });
 }

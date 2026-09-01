@@ -131,38 +131,15 @@ function pickStrategy(ctx) {
   // 2) Responses API：reasoning.effort（OpenAI/DeepSeek 等均用此格式）
   if (apiMode === 'responses') return 'responses';
 
-  // 3) 按 provider 判断
-  switch (provider) {
-    case 'dashscope':
-      return /qwen|qwq|tongyi/.test(model) ? 'qwen' : 'none';
-    case 'siliconflow':
-      return byModel(model);
-    case 'zhipu':
-      return /glm|chatglm/.test(model) ? 'zhipu' : 'none';
-    case 'deepseek':
-      return deepseekSupports(model) ? 'deepseek' : 'none';
-    case 'moonshot':
-      return kimiSupports(model) ? 'kimi' : 'none';
-    case 'openrouter':
-      return 'openrouter';
-    case 'openai':
-      return openaiSupports(model) ? 'openai_effort' : 'none';
-    case 'gemini':
-      return geminiSupports(model) ? 'openai_effort' : 'none';
-    case 'grok':
-      return grokSupports(model) ? 'openai_effort' : 'none';
-    case 'moonshotai':
-      return kimiSupports(model) ? 'kimi' : 'none';
-    // 本地模型：参数约定与云端不同（如 ollama 用 think 而非 enable_thinking），
-    // 本扩展未实现其原生开关，统一走 none（提示词兜底），避免发错字段被拒。
-    case 'ollama':
-    case 'llamacpp':
-    case 'lmstudio':
-      return 'none';
-    default:
-      // custom / 中转站：只能按模型名猜
-      return byModel(model);
-  }
+  // 3) 本地模型：参数约定与云端不同（如 ollama 用 think 而非 enable_thinking），
+  //    本扩展未实现其原生开关，统一走 none（提示词兜底），避免发错字段被拒。
+  if (provider === 'ollama' || provider === 'llamacpp' || provider === 'lmstudio') return 'none';
+  // 4) OpenRouter 作为中转站，模型名不可预测，统一走其原生策略
+  if (provider === 'openrouter') return 'openrouter';
+  // 5) 其余（custom/中转站/siliconflow/dashscope/zhipu/deepseek/moonshot/grok/gemini/openai）
+  //    全部按模型名推断。byModel 已覆盖上述所有厂商的模型名特征，与上方逐厂商 switch
+  //    行为完全等价，故删去重复分支、保留单一真相（改厂商只需动 byModel 一处）。
+  return byModel(model);
 }
 
 function openaiSupports(model) {
@@ -324,12 +301,31 @@ function buildReasoningParams(cfg, opts) {
       break;
     }
     case 'deepseek': {
-      out.extraBody.thinking = { type: 'enabled' };
+      // 1.1.26 厂商适配（照各家官方文档，同为 OpenAI 兼容端点但字段名不同！）：
+      //   - DeepSeek 官方（provider=deepseek）：thinking:{type:'enabled'} + reasoning_effort(low/high/max)
+      //     这是 DeepSeek 自家的扩展字段，见 DeepSeek 官方 API 文档。
+      //   - 硅基流动（provider=siliconflow）：enable_thinking(bool) + thinking_budget(128~32768)
+      //     + reasoning_effort(high|max，适用 V4 / V4-Flash / GLM-5.2)，
+      //     见 api-docs.siliconflow.cn/docs/api/chat-completions-post。
+      // 此前一律发 thinking:{type:'enabled'} —— 硅基流动并不识别该字段，导致用户开了
+      // deepThinking 却不生效（且 Anthropic 传输另有 case 'anthropic' 负责，不会走到这里）。
+      const isAnth = String((cfg && cfg.transport) || 'openai') === 'anthropic';
+      const isOfficialDeepSeek = provider === 'deepseek';
+      if (isAnth || isOfficialDeepSeek) {
+        out.extraBody.thinking = { type: 'enabled' };
+      } else {
+        out.extraBody.enable_thinking = true;
+        out.extraBody.thinking_budget = dt.budgetTokens > 0
+          ? Math.floor(dt.budgetTokens)
+          : budgetForEffort(effort, QWEN_BUDGET);
+      }
       const eff = mapEffort('deepseek', model, effort);
       if (eff) out.extraBody.reasoning_effort = eff;
       out.native = true;
       // 注：DeepSeek 思考模式忽略 temperature，无需覆盖
-      out.reason = 'DeepSeek thinking=enabled effort=' + eff;
+      out.reason = 'DeepSeek(' + (isOfficialDeepSeek ? 'official' : 'via ' + (provider || '中转站')) + ') '
+        + ((isAnth || isOfficialDeepSeek) ? 'thinking=enabled' : 'enable_thinking=true budget=' + out.extraBody.thinking_budget)
+        + ' effort=' + eff;
       break;
     }
     case 'kimi': {

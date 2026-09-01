@@ -61,7 +61,9 @@ check('云端手册堆完整 schema（含「// 必填」）', cloudManual.includ
 check('本地手册短于云端', localManual.length < cloudManual.length * 0.7);
 
 console.log('[localModelSmart] 3) 文本协议解析多格式 + 误判过滤');
-const parse = agent.AgentSession.prototype.parseTextCalls;
+// 1.1.23 起 parseTextCalls 是 textParser 模块函数（agent.js 原型方法已拆走）
+const { parseTextCalls } = require('../src/textParser');
+const parse = parseTextCalls;
 
 // 3a. 传统 <foxtool>
 let r = parse.call({}, '<foxtool name="read_file">{"path":"a.txt"}</foxtool>', KNOWN);

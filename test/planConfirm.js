@@ -75,7 +75,9 @@ function check(name, fn) {
 
   const cfg = {
     agentEnabled: true,
-    planAndExecute: { enabled: true },
+    // 1.1.25：plan-pending 只在显式开启 confirmGate 时才暂停（对齐 DSH goal-round-driver：
+    // 计划即内部状态展示，不设确认门；仅显式 confirmGate 才等待用户确认）
+    planAndExecute: { enabled: true, confirmGate: true },
     toolProtocol: 'native',
     maxSteps: 25,
     temperature: 0.3,

@@ -195,7 +195,9 @@ function makeUserSandbox(root, name, manifest) {
     const stop = mgr.watch((l) => { fired = true; });
     fs.mkdirSync(path.join(root, 'watched'));
     fs.writeFileSync(path.join(root, 'watched', 'manifest.json'), '{"name":"Watched","language":"bash","run":{"command":["bash","{{file}}"]}}');
-    await new Promise((res) => setTimeout(res, 600));
+    // 1.1.25：Windows 文件系统 watch 事件可能延迟（沙箱/CI 下更明显），改为 200ms 轮询最长 2s
+    const deadline = Date.now() + 2000;
+    while (!fired && Date.now() < deadline) await new Promise((res) => setTimeout(res, 200));
     check('watch 回调被触发', fired === true);
     stop();
   });

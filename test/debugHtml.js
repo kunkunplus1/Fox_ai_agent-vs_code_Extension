@@ -6,11 +6,18 @@ const path = require('path');
 let captured = null;
 function makeVscode() {
   return {
+    // 1.1.25：envView.js:112 用 vscode.Uri.joinPath(context.extensionUri, 'media') —— mock 缺 Uri 会崩
+    Uri: {
+      joinPath: (base, ...segs) => ({ fsPath: [String(base && base.fsPath || base), ...segs].join('/'), toString: () => 'file://' + [String(base && base.fsPath || base), ...segs].join('/') }),
+      file: (p) => ({ fsPath: p, toString: () => 'file://' + p })
+    },
     window: {
       createWebviewPanel: () => ({
         webview: {
           set html(v) { captured = v; },
           get html() { return captured; },
+          asWebviewUri: (u) => u, // envView.js:113 用 webview.asWebviewUri 生成 media 资源 URI
+          cspSource: 'vscode-resource:',
           onDidReceiveMessage: () => ({ dispose() {} }),
           postMessage: () => Promise.resolve(true),
         },
@@ -36,7 +43,7 @@ Module._load = function (req, parent, isMain) {
 };
 
 const envView = require(path.join(__dirname, '..', 'src', 'envView'));
-envView.openEnvPanel({}, { taskManager: { listTasks: async () => [] } }, 'env');
+envView.openEnvPanel({ extensionUri: { fsPath: 'C:/fake-ext' } }, { taskManager: { listTasks: async () => [] } }, 'env');
 
 if (!captured) { console.error('NO HTML CAPTURED'); process.exit(1); }
 const out = path.join(__dirname, 'env.out.html');

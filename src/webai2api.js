@@ -662,6 +662,139 @@ ${anchor}`;
     } catch (e) { log('⚠️ 补丁 queue.js 失败（忽略）：' + e.message); }
   }
 
+  // ---- routes.js：补 fox_isolate 透传（审查隔离标签页信号，1.1.19） ----
+  // 在已有 foxNewSession 透传基础上增加 foxIsolate，让审查请求能开临时标签页而不切换主会话。
+  // 兼容两种上游形态：① 变量声明（const foxNewSession = ...）② 对象属性（foxNewSession: ...）。
+  const rtIsoMark = FX_PATCH_MARK + '-routes-isolate';
+  if (fs.existsSync(routesPath)) {
+    try {
+      let src = fs.readFileSync(routesPath, 'utf8');
+      if (!src.includes(rtIsoMark) && src.includes('foxNewSession')) {
+        // ① 变量声明形态：const foxNewSession = data.fox_new_session === true;
+        if (src.includes('const foxNewSession = data.fox_new_session === true;')) {
+          src = src.replace(
+            'const foxNewSession = data.fox_new_session === true;',
+            'const foxNewSession = data.fox_new_session === true;\n            const foxIsolate = data.fox_isolate === true; // ' + rtIsoMark
+          );
+        }
+        // ② 对象属性形态：foxNewSession: data.fox_new_session === true
+        else if (src.includes('foxNewSession: data.fox_new_session === true')) {
+          src = src.replace(
+            'foxNewSession: data.fox_new_session === true',
+            'foxNewSession: data.fox_new_session === true,\n                foxIsolate: data.fox_isolate === true // ' + rtIsoMark
+          );
+        }
+        // addTask 透传：把 addTask 块里的 foxNewSession 后补 foxIsolate（只在 addTask 块缺失时补）
+        const taskBlock = src.slice(src.lastIndexOf('queueManager.addTask'), src.indexOf('});', src.lastIndexOf('queueManager.addTask')) + 3);
+        if (!taskBlock.includes('foxIsolate')) {
+          const tAnchor1 = 'foxNewSession\n            });';
+          if (src.includes(tAnchor1)) src = src.replace(tAnchor1, 'foxNewSession,\n                foxIsolate\n            });');
+          const tAnchor2 = 'foxNewSession,\n            });';
+          if (src.includes(tAnchor2)) src = src.replace(tAnchor2, 'foxNewSession,\n                foxIsolate\n            });');
+        }
+        fs.writeFileSync(routesPath, src, 'utf8');
+        changed = true;
+        log('已为 routes.js 注入 fox_isolate 透传（审查隔离标签页）');
+      }
+    } catch (e) { log('⚠️ 补丁 routes.js(fox_isolate) 失败（忽略）：' + e.message); }
+  }
+
+  // ---- queue.js：补 foxIsolate 透传（1.1.19） ----
+  const qIsoMark = FX_PATCH_MARK + '-queue-isolate';
+  if (fs.existsSync(queuePath)) {
+    try {
+      let src = fs.readFileSync(queuePath, 'utf8');
+      if (!src.includes(qIsoMark) && src.includes('foxNewSession')) {
+        // 1) 解构任务时取出 foxIsolate
+        src = src.replace(
+          /const \{ res, prompt, imagePaths, modelId, modelName, id, isStreaming, reasoning, foxNewSession \} = task;/,
+          'const { res, prompt, imagePaths, modelId, modelName, id, isStreaming, reasoning, foxNewSession, foxIsolate } = task; // ' + qIsoMark
+        );
+        // 2) 传给 generate 的 meta 带上 foxIsolate
+        src = src.replace(
+          /await generate\(poolContext, prompt, imagePaths, modelId, \{ id, reasoning, foxNewSession \}\)/,
+          'await generate(poolContext, prompt, imagePaths, modelId, { id, reasoning, foxNewSession, foxIsolate }); // ' + qIsoMark
+        );
+        fs.writeFileSync(queuePath, src, 'utf8');
+        changed = true;
+        log('已为 queue.js 注入 foxIsolate 透传（审查隔离标签页）');
+      }
+    } catch (e) { log('⚠️ 补丁 queue.js(fox_isolate) 失败（忽略）：' + e.message); }
+  }
+
+  // ---- Worker.js：隔离任务开临时标签页执行，审完关闭回主会话（1.1.19，方案C） ----
+  // fox-ai 审查子代理请求带 fox_isolate=true 时，不点「新对话」（会切走主会话、审完回不来），
+  // 而是开一个临时标签页跑审查、结束后自动关闭 —— 主对话标签页始终不动，所有模型网址通用。
+  const workerPath = path.join(projectDir, 'src', 'backend', 'pool', 'Worker.js');
+  const wIsoMark = FX_PATCH_MARK + '-isolate-tab';
+  if (fs.existsSync(workerPath)) {
+    try {
+      let src = fs.readFileSync(workerPath, 'utf8');
+      if (!src.includes(wIsoMark)) {
+        const anchor = 'const adapter = registry.getAdapter(type);';
+        const inject = `        const adapter = registry.getAdapter(type);
+        if (!adapter) {
+            return { error: \`适配器不存在: \${type}\` };
+        }
+
+        // ${wIsoMark}：隔离任务（fox-ai 审查子代理）→ 开临时标签页执行，不切换主会话，审完自动关闭
+        let _isolatePage = null;
+        let _isolateNavHandler = null;
+        if (meta && meta.foxIsolate && this.browser) {
+            try {
+                logger.info('工作池', \`[\${this.name}] 隔离任务：开临时标签页执行（审查专用，不切换主会话）\`, meta);
+                _isolatePage = await this.browser.newPage();
+                _isolatePage.authState = this.page?.authState ? Object.assign({}, this.page.authState) : { isHandlingAuth: false };
+                _isolatePage._browserMutex = this._browserMutex;
+                const hcm = this.globalConfig?.browser?.humanizeCursor;
+                _isolatePage._humanizeCursorMode = hcm;
+                if (hcm === true) _isolatePage.cursor = createCursor(_isolatePage);
+                if (this._navigationHandler) {
+                    _isolateNavHandler = this._navigationHandler;
+                    _isolatePage.on('framenavigated', async () => {
+                        try { await _isolateNavHandler(_isolatePage); } catch (e) { /* ignore */ }
+                    });
+                }
+                const _isoUrl = registry.getTargetUrl ? registry.getTargetUrl(type, this.globalConfig, this.workerConfig) : (this._targetUrl || 'about:blank');
+                try {
+                    await tryGotoWithCheck(_isolatePage, _isoUrl, { timeout: 60000 });
+                } catch (e) {
+                    logger.warn('工作池', \`[\${this.name}] 隔离页导航失败（忽略，交给适配器自愈）: \${e.message}\`, meta);
+                }
+            } catch (e) {
+                logger.warn('工作池', \`[\${this.name}] 隔离标签页创建失败，回退主页面: \${e.message}\`, meta);
+                _isolatePage = null;
+            }
+        }`;
+        if (src.includes(anchor)) {
+          src = src.replace(anchor, inject);
+          // subContext 用隔离页 || 主页
+          const ctxAnchor = 'page: this.page,';
+          const ctxInject = 'page: _isolatePage || this.page,';
+          if (src.includes(ctxAnchor)) src = src.replace(ctxAnchor, ctxInject);
+          // finally 里关闭隔离页
+          const finAnchor = '        } finally {\n            this.busyCount--;\n        }';
+          const finInject = `        } finally {
+            this.busyCount--;
+            if (_isolatePage) {
+                try {
+                    await _isolatePage.close().catch(() => {});
+                    logger.info('工作池', \`[\${this.name}] 隔离任务完成，已关闭临时标签页回到主会话\`, meta);
+                } catch (e) {
+                    logger.debug('工作池', \`[\${this.name}] 隔离标签页关闭失败（忽略）: \${e.message}\`, meta);
+                }
+                _isolatePage = null;
+            }
+        }`;
+          if (src.includes(finAnchor)) src = src.replace(finAnchor, finInject);
+          fs.writeFileSync(workerPath, src, 'utf8');
+          changed = true;
+          log('已为 Worker.js 注入「隔离标签页」补丁（审查不切换主会话，方案C）');
+        }
+      }
+    } catch (e) { log('⚠️ 补丁 Worker.js 失败（忽略）：' + e.message); }
+  }
+
   // ---- 通用「新建会话」注入：page.js 共享助手 + index.js 导出 + 7 个文本适配器（1.1.49） ----
   // 让 ChatGPT / Claude / Gemini / 豆包 / LMArena / z.ai 等（除已单独处理的 DeepSeek 外）也支持
   // fox_new_session 信号：fox-ai 新建会话后，点击站点「新对话」按钮重置浏览器侧会话，避免错位。

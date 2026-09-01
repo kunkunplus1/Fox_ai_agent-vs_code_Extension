@@ -168,7 +168,63 @@ class PlanTaskStore {
    * 返回 { pending, inProgress, completed } 计数。
    */
   replaceAll(todos) {
-    const arr = Array.isArray(todos) ? todos : [];
+    // 1.1.23：容错「todos 被模型传成字符串」——文本协议模型常见把整个数组二次 JSON 序列化
+    // （todos 是 "[{...}]" 字符串而非数组），或 safeParseArgs 宽松修复后仍留下字符串值。
+    // 字符串统一先 parse 成数组再走整表替换，彻底根治「任务清单内容为空」。
+    // 1.1.24（对齐 dsh todo_write「响亮失败」）：既不是数组、也解析不出任何任务的输入，
+    // 返回 { _error } 让调用方把具体错误回灌给模型，而不是静默空清单（空清单=模型以为写成功=又一轮困惑）。
+    let arr = null;
+    let silentError = null;
+    if (Array.isArray(todos)) {
+      arr = todos;
+    } else if (typeof todos === 'string') {
+      const trimmed = todos.trim();
+      if (!trimmed) {
+        silentError = 'todos 是空字符串';
+      } else {
+        // 先试 JSON 数组
+        let parsed = null;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (_) { parsed = null; }
+        if (Array.isArray(parsed)) {
+          arr = parsed;
+        } else if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          // 单个对象 {content,status} 而非数组——常见错误，包一层
+          if (parsed.content) arr = [parsed];
+          else silentError = 'todos 是单个对象但缺 content 字段（应为数组，如 [{"content":"..."}]）';
+        } else {
+          // 行式兜底：形如「1. xxx / - xxx / • xxx」时逐行拆成任务
+          const rows = trimmed
+            .split(/\n+/)
+            .map((r) => r.replace(/^\s*(?:[-*•]|\d+[.、])\s*/, '').trim())
+            .filter((r) => r && r.length > 1);
+          if (rows.length) {
+            arr = rows.map((c) => ({ content: c, status: STATUS.PENDING }));
+          } else if (trimmed.length > 0 && trimmed.length <= 200 && !/[\n{}\[\]]/.test(trimmed)) {
+            // 单行纯文本：当成一条任务（形如「第一步：xxx」）
+            arr = [{ content: trimmed.slice(0, 200), status: STATUS.PENDING }];
+          } else {
+            silentError = `todos 解析失败（既非 JSON 数组也非任务列表文本，内容前 80 字符：${trimmed.slice(0, 80)}）`;
+          }
+        }
+      }
+    } else if (todos && typeof todos === 'object') {
+      // 单个对象（safeParseArgs 可能把数组解析成对象的情况）
+      if (todos.content) arr = [todos];
+      else silentError = 'todos 是对象但缺 content 字段（应为 [{content,status}] 数组）';
+    } else if (todos === null || todos === undefined) {
+      silentError = 'todos 缺失（必填：完整任务列表数组）';
+    } else {
+      silentError = `todos 类型错误（${typeof todos}，应为数组）`;
+    }
+    // 响亮失败：解析不出任何任务时返回错误描述，由调用方回灌给模型
+    if (!Array.isArray(arr) || arr.length === 0) {
+      if (!silentError && Array.isArray(arr) && arr.length === 0) {
+        silentError = 'todos 是空数组（至少应有一条任务）';
+      }
+      return { _error: silentError || 'todos 无法解析为任务列表' };
+    }
     const now = Date.now();
     const seen = new Set();
     const next = [];

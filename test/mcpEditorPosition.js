@@ -9,9 +9,13 @@ const assert = require('assert');
 const path = require('path');
 
 // envView.js 导出 getEnvHtml（或类似函数），这里直接读源码验证静态 HTML 片段
+// 1.1.25：openMcpEditor 前端逻辑已随拆分迁到 media/env.js（envView.js 只生成静态 HTML），
+// 所以 scrollIntoView 断言须读 media/env.js；HTML 结构断言仍读 src/envView.js。
 const srcPath = path.join(__dirname, '../src/envView.js');
 const fs = require('fs');
 const src = fs.readFileSync(srcPath, 'utf8');
+const envJsPath = path.join(__dirname, '../media/env.js');
+const envJs = fs.existsSync(envJsPath) ? fs.readFileSync(envJsPath, 'utf8') : '';
 
 let pass = 0, fail = 0;
 function check(name, fn) {
@@ -37,8 +41,9 @@ check('mcp-editor 仍位于 mcp-catalog-section 之前', () => {
   assert.ok(editorIdx < catalogIdx, 'mcp-editor 应在 mcp-catalog-section 之前');
 });
 
-check('openMcpEditor 内调用了 scrollIntoView', () => {
-  assert.ok(src.includes('editor.scrollIntoView'), '应在 openMcpEditor 中滚动到编辑器');
+check('openMcpEditor 内调用了 scrollIntoView（media/env.js 前端逻辑）', () => {
+  // 1.1.25：openMcpEditor 实现已迁到 media/env.js（envView.js 只生成静态 HTML）
+  assert.ok(envJs.includes('editor.scrollIntoView'), '应在 openMcpEditor 中滚动到编辑器');
 });
 
 check('mcp-editor 设置了背景色，增强视觉层级', () => {

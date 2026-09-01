@@ -64,6 +64,59 @@ function nonceStr() {
   return text;
 }
 
+/** 极简 Markdown → HTML（预览面板用：标题/加粗/代码块/行内代码/列表/引用/表格/链接） */
+function simpleMarkdown(src) {
+  if (!src) return '';
+  let s = String(src)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const lines = s.split(/\r?\n/);
+  const out = [];
+  let inCode = false, codeBuf = [], inTable = false, tableBuf = [];
+  const flushTable = () => {
+    if (!tableBuf.length) return;
+    const rows = tableBuf.map((r) => r.split('|').map((c) => c.trim()));
+    if (rows.length) {
+      let h = '<table><thead><tr>' + rows[0].map((c) => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i].every((c) => /^:?-{2,}:?$/.test(c))) continue; // 分隔行
+        h += '<tr>' + rows[i].map((c) => '<td>' + c + '</td>').join('') + '</tr>';
+      }
+      out.push(h + '</tbody></table>');
+    }
+    tableBuf = [];
+  };
+  for (const raw of lines) {
+    const line = raw;
+    if (/^```/.test(line)) {
+      if (inCode) { out.push('<pre>' + codeBuf.join('\n') + '</pre>'); codeBuf = []; inCode = false; }
+      else { flushTable(); inCode = true; }
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const t = line.replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+      .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    if (/^\|.*\|$/.test(line)) { tableBuf.push(line); inTable = true; continue; }
+    if (inTable) { flushTable(); inTable = false; }
+    if (/^#{1,6}\s/.test(line)) {
+      const lvl = line.match(/^#{1,6}/)[0].length;
+      out.push('<h' + lvl + '>' + t.replace(/^#{1,6}\s+/, '') + '</h' + lvl + '>');
+    } else if (/^\s*[-*+]\s+/.test(line)) {
+      out.push('<li>' + t.replace(/^\s*[-*+]\s+/, '') + '</li>');
+    } else if (/^\s*>\s?/.test(line)) {
+      out.push('<blockquote>' + t.replace(/^\s*>\s?/, '') + '</blockquote>');
+    } else if (/^\s*$/.test(line)) {
+      if (out.length && out[out.length - 1] === '<li>' + '') { /* 空 */ }
+    } else {
+      out.push('<p>' + t + '</p>');
+    }
+  }
+  flushTable();
+  if (inCode) out.push('<pre>' + codeBuf.join('\n') + '</pre>');
+  return out.join('\n');
+}
+
 function summarizeArgs(name, args) {
   if (!args || typeof args !== 'object') return '';
   const clone = {};
@@ -324,6 +377,9 @@ class ChatViewProvider {
     this._planTaskId = session._planTaskId || null;
     this._planned = !!session._planned;
     this._planPending = !!session._planPending;
+    // 会话进度摘要缓存（对齐 DSH session-checkpoint）：存档里有 progress 则缓存，
+    // _launch 传给 AgentSession 构造函数 → agent 动态附录回灌，重开/断点续跑时模型知道上次干到哪。
+    this._sessionProgress = session.progress || null;
     this.pushStatus('idle');
   }
 
@@ -762,11 +818,26 @@ class ChatViewProvider {
     if (webview) this._workchainWebviews.delete(webview);
   }
 
+  // 判断一条消息是否只应发给工作链页（会话页/其他面板不接收）。
+  // 思考步骤（kind==='llm'）与 thinking 通道的思考过程，会话页也要展示——形成
+  // 「💭思考 → 🖥️工具 → 正文」分步骤时间线（用户诉求：会话栏不能糊成一团在同一个气泡）。
+  // 审批结果 / 状态 / 错误等 step 仍只推工作链页，避免「已允许」等气泡在会话页双份渲染。
+  _isWorkchainOnly(msg) {
+    if (!msg || !msg.type) return false;
+    if (msg.type === 'step') return msg.kind !== 'llm';
+    if (msg.type === 'notice' && msg.internal === true) return true;
+    return false;
+  }
+
   post(msg) {
     const targets = [];
-    if (this.view) targets.push(this.view.webview);
-    for (const panel of this.panels) {
-      if (panel && panel.webview) targets.push(panel.webview);
+    // 思考/内部提醒只推工作链页，会话页与侧边面板不接收
+    const wcOnly = this._isWorkchainOnly(msg);
+    if (!wcOnly) {
+      if (this.view) targets.push(this.view.webview);
+      for (const panel of this.panels) {
+        if (panel && panel.webview) targets.push(panel.webview);
+      }
     }
     for (const wv of this._workchainWebviews) {
       if (wv) targets.push(wv);
@@ -897,6 +968,148 @@ class ChatViewProvider {
     }));
   }
 
+  /**
+   * 打开「产出物预览」面板：HTML/Markdown 内嵌渲染、图片直接显示、PDF 用系统默认应用打开。
+   * 由 preview_artifact 工具触发（agent.emit('artifact') → 本方法）。
+   */
+  async openArtifactPreview(art) {
+    if (!art || !art.path) return;
+    const fs = require('fs');
+    const path = require('path');
+    const abs = String(art.path);
+    if (!fs.existsSync(abs)) throw new Error('预览文件不存在：' + abs);
+    const type = String(art.type || '');
+    const ext = String(art.ext || path.extname(abs).toLowerCase().replace('.', ''));
+
+    // PDF：交给系统默认应用（VS Code 无内置 PDF 渲染）
+    if (type === 'pdf' || ext === 'pdf') {
+      try {
+        await vscode.env.openExternal(vscode.Uri.file(abs));
+      } catch (e) {
+        throw new Error('PDF 打开失败：' + e.message);
+      }
+      return;
+    }
+
+    // 图片：直接在预览面板里 <img> 显示
+    const isImage = type === 'image' || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext);
+
+    // 复用同一面板（避免堆积），可拖动到任意视图组
+    let panel = this._artifactPanel;
+    if (!panel || panel._disposed) {
+      panel = vscode.window.createWebviewPanel(
+        'foxAi.artifactPreview',
+        '产出物预览',
+        vscode.ViewColumn.Beside,
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true,
+          localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
+        }
+      );
+      panel._disposed = false;
+      panel.onDidDispose(() => { panel._disposed = true; this._artifactPanel = null; });
+      this._artifactPanel = panel;
+    } else {
+      panel.reveal(vscode.ViewColumn.Beside);
+    }
+
+    const nonce = nonceStr();
+    let contentHtml = '';
+    if (isImage) {
+      // 图片：转成 data URI 内嵌（简单可靠，不依赖 file:// 权限）
+      const buf = fs.readFileSync(abs);
+      const mime = ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp' })[ext] || 'application/octet-stream';
+      contentHtml = '<img src="data:' + mime + ';base64,' + buf.toString('base64') + '" style="max-width:100%;max-height:100%;object-fit:contain;"/>';
+    } else if (type === 'markdown' || ext === 'md' || ext === 'markdown') {
+      // Markdown：简单转 HTML（加粗/标题/代码块/列表）
+      const md = fs.readFileSync(abs, 'utf8');
+      contentHtml = '<article class="md">' + simpleMarkdown(md) + '</article>';
+    } else {
+      // HTML / 其他：整文件内嵌（脚本可用，方便实时预览网页）
+      contentHtml = fs.readFileSync(abs, 'utf8');
+    }
+
+    panel.webview.html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${panel.webview.cspSource} data: https:; style-src 'unsafe-inline' ${panel.webview.cspSource}; script-src 'unsafe-inline' 'unsafe-eval'; font-src ${panel.webview.cspSource} data:;">
+<style>
+  html, body { height:100%; margin:0; display:flex; flex-direction:column; background:#fff; color:#333; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #content { flex:1; overflow:auto; }
+  #content img { display:block; margin:0 auto; }
+  #content article.md { padding:24px; line-height:1.7; }
+  #content article.md h1, #content article.md h2, #content article.md h3 { border-bottom:1px solid #eee; padding-bottom:6px; }
+  #content article.md pre { background:#f6f8fa; padding:12px; border-radius:6px; overflow:auto; }
+  #content article.md code { background:#f0f0f0; padding:2px 4px; border-radius:3px; }
+  #content article.md blockquote { border-left:4px solid #ddd; margin:0; padding-left:12px; color:#666; }
+  #content article.md table { border-collapse:collapse; } #content article.md th, #content article.md td { border:1px solid #ddd; padding:6px 10px; }
+  #feedback { border-top:1px solid #e0e0e0; padding:10px 12px; background:#fafafa; }
+  #feedback .row { display:flex; gap:8px; }
+  #feedback textarea { flex:1; resize:vertical; min-height:48px; border:1px solid #ccc; border-radius:6px; padding:8px; font-family:inherit; font-size:13px; }
+  #feedback button { border:none; border-radius:6px; padding:8px 14px; font-size:13px; cursor:pointer; background:#2d8cf0; color:#fff; white-space:nowrap; }
+  #feedback button:hover { background:#1f7cdb; }
+  #feedback .hint { font-size:12px; color:#888; margin-bottom:6px; }
+  #feedback .status { font-size:12px; color:#2d8cf0; margin-top:6px; display:none; }
+  #feedback .status.ok { color:#18a058; }
+  #feedback .status.err { color:#d03050; }
+</style>
+</head>
+<body>
+<div id="content">${contentHtml}</div>
+<div id="feedback">
+  <div class="hint">发现明显问题？输入修改意见，插件会按你的反馈重新生成这份产出物：</div>
+  <div class="row">
+    <textarea id="fbText" placeholder="例如：标题颜色太浅看不清、第 2 节的图表换成柱状图、按钮点击没反应……"></textarea>
+    <button id="fbSend">提交修改</button>
+  </div>
+  <div class="status" id="fbStatus"></div>
+</div>
+<script>
+(function () {
+  const vscode = acquireVsCodeApi();
+  const text = document.getElementById('fbText');
+  const btn = document.getElementById('fbSend');
+  const status = document.getElementById('fbStatus');
+  function send() {
+    const content = text.value.trim();
+    if (!content) { status.className = 'status err'; status.textContent = '请先输入要修改的内容'; status.style.display = 'block'; return; }
+    status.className = 'status'; status.textContent = '已提交，等待插件修改产出物…'; status.style.display = 'block';
+    vscode.postMessage({ type: 'artifactFeedback', feedback: content, path: ${JSON.stringify(abs)} });
+    text.value = '';
+  }
+  btn.addEventListener('click', send);
+  text.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(); });
+})();
+</script>
+</body>
+</html>`;
+    panel.title = '预览 · ' + path.basename(abs);
+
+    // ★ 预览反馈 → 让插件（主代理）按用户意见重新修改产出物
+    // 复用面板的 onDidReceiveMessage（一次性注册，dispose 时随面板释放）
+    if (!panel._fbRegistered) {
+      panel._fbRegistered = true;
+      panel.webview.onDidReceiveMessage(async (msg) => {
+        try {
+          if (!msg || msg.type !== 'artifactFeedback') return;
+          const feedback = String(msg.feedback || '').trim();
+          if (!feedback) return;
+          const target = String(msg.path || abs);
+          // 把修改意见作为新的用户消息发给主代理，让它直接 edit 目标文件
+          await this.ask(
+            `【预览修改请求】用户在看预览时发现产出物「${target}」有问题，要求修改：\n${feedback}\n\n` +
+            `请直接修改文件「${target}」，改完后再调用 preview_artifact 刷新预览，让用户确认。`
+          );
+        } catch (e) {
+          log('artifactFeedback error:', e && e.stack);
+          try { panel.webview.postMessage({ type: 'fbResult', ok: false, error: String((e && e.message) || e) }); } catch (_) {}
+        }
+      });
+    }
+  }
+
   _renderFor(webview) {
     const mediaRoot = vscode.Uri.joinPath(this.context.extensionUri, 'media');
     const htmlPath = path.join(this.context.extensionPath, 'media', 'chat.html');
@@ -996,7 +1209,10 @@ class ChatViewProvider {
         // 随会话持久化规划状态，resume / 切换会话后可恢复，避免 planner 重跑建重复任务
         planTaskId: this._planTaskId || null,
         planned: !!this._planned,
-        planPending: !!this._planPending
+        planPending: !!this._planPending,
+        // 会话进度摘要（对齐 DSH session checkpoint）：运行期的工具流水账渲染成紧凑块，
+        // 随存档落盘 → load 时 _applySession 缓存 → _launch 回灌给 agent → 动态附录注入模型。
+        progress: ((this.session && this.session._renderProgressBlock) ? this.session._renderProgressBlock() : '') || this._sessionProgress || null
       });
     } catch (e) {
       log('save session failed:', (e && e.message) || String(e));
@@ -1114,6 +1330,35 @@ class ChatViewProvider {
     if (typeof sendText === 'string' && /^\s*\/mcp(\s|$)/i.test(sendText)) {
       await this._handleMcpSlash(sendText);
       return;
+    }
+
+// 拦截内置斜杠技能：/仿人 /humanize /美化 /format /幻灯片 /ppt /slides（插件自带技能，仅用户显式调用才触发）。
+      // 命中时把技能正文作为 hidden prompt 注入，模型看到 <skill_content> 直接按指导执行。
+      // 优先级：/mcp > 内置技能 > 用户技能(/<技能名>) > 自定义命令模板。
+      if (typeof sendText === 'string' && !options._slashExpanded && /^\s*\/[\s\S]/u.test(sendText)) {
+        const builtinSkill = require('./builtinSkills').matchBuiltinSkillSlash(sendText);
+        if (builtinSkill) {
+        return this.ask(visible, Object.assign({}, options, {
+          hidden: builtinSkill,
+          showText: visible,
+          _slashExpanded: true
+        }));
+      }
+    }
+
+    // 拦截 /<技能名>：用户直接激活技能（对齐 DSH skill user-invocable）。
+    // /复习资料 → 直接把该技能的正文（SKILL.md 的 body 指导）注入会话作为 hidden prompt，
+    // 模型看到 <skill_content> 后直接按指导执行，无需再调 use_skill —— 这是「用户一句话直接触发技能」的入口。
+    // 优先级：/mcp > /<技能名> > 自定义命令模板（技能名优先于同名命令模板，避免歧义）。
+    if (typeof sendText === 'string' && !options._slashExpanded && /^\s*\/[a-z0-9][a-z0-9-]*(\s|$)/i.test(sendText)) {
+      const skillPrompt = this._skillSlashPrompt(sendText);
+      if (skillPrompt) {
+        return this.ask(visible, Object.assign({}, options, {
+          hidden: skillPrompt,
+          showText: visible,
+          _slashExpanded: true
+        }));
+      }
     }
 
     // 拦截自定义 Slash Commands：`/review src/a.js` -> 展开 .fox-ai/commands/review.md 模板后再发给模型。
@@ -1494,6 +1739,41 @@ class ChatViewProvider {
     }
   }
 
+  /**
+   * 用户直接输入 /<技能名> 时，把该技能的正文（SKILL.md body 指导）渲染成 hidden prompt 注入会话。
+   * 对齐 DSH 的 user-invocable 技能：用户敲 `/技能名` 即触发，模型看到 <skill_content> 直接按指导执行，
+   * 无需再调 use_skill。技能不存在时返回 null，交给自定义命令模板 / 普通消息继续处理。
+   * @param {string} raw 用户原始输入（如 "/复习资料 帮我整理"）
+   * @returns {string|null} 命中技能时返回注入文本；未命中返回 null
+   */
+  _skillSlashPrompt(raw) {
+    try {
+      const m = /^\s*\/([a-z0-9][a-z0-9-]*)(\s+([\s\S]*))?$/i.exec(raw);
+      if (!m) return null;
+      const name = m[1];
+      const rest = (m[3] || '').trim();
+      const { UserSkillStore, defaultDir } = require('./skills');
+      const base = vscode.workspace.getConfiguration('foxAi').get('skills.storagePath', '');
+      const store = new UserSkillStore(this.context.globalStorageUri.fsPath, base || undefined);
+      const meta = store.list().find((x) => x.name === name || x.name.toLowerCase() === name.toLowerCase());
+      if (!meta) return null;
+      // 用 _metaOf 的 body 字段（frontmatter 之后的正文指导）
+      const body = (meta && meta.body) || '';
+      if (!body.trim()) return null;
+      const skillBlock = [
+        '<skill_content name="' + meta.name + '">',
+        '<skill_instructions>',
+        body.trim(),
+        '</skill_instructions>',
+        '</skill_content>'
+      ].join('\n');
+      const attach = rest ? '\n\n【用户本次请求】\n' + rest : '';
+      return skillBlock + attach;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** 命令模板目录：工作区优先，其次用户级 */
   _commandDirs() {
     const slash = require('./slashCommands');
@@ -1659,6 +1939,11 @@ class ChatViewProvider {
     const prevPlanTaskId = (prev && prev._planTaskId) || this._planTaskId || null;
     const prevPlanned = !!(prev && prev._planned) || !!this._planned;
     const prevPlanPending = !!(prev && prev._planPending) || !!this._planPending;
+    // 会话进度摘要跨「继续」/resume 保持（对齐 DSH session checkpoint）：优先取上一个 session 的
+    // 运行期流水，否则取 _applySession 从存档缓存下来的 progress（恢复/重开时模型知道上次干到哪）
+    const prevProgress = (prev && prev._progressEntries && prev._progressEntries.length)
+      ? prev._renderProgressBlock()
+      : (this._sessionProgress || null);
 
     const session = new AgentSession({
       context: this.context,
@@ -1669,7 +1954,8 @@ class ChatViewProvider {
       harness: { taskManager: this.taskManager, policy: new harness.PolicyEngine(cfg) },
       planTasks: this.planTasks,
       sessionId: this.sessionManager.currentId(),
-      resumeTaskId
+      resumeTaskId,
+      sessionProgress: prevProgress
     });
     if (prevReadFileHistory.length) session._readFileHistory = prevReadFileHistory;
     if (prevForceText) session._forceText = true;
@@ -1817,6 +2103,12 @@ class ChatViewProvider {
       image: ({ src, alt, channel, msg_id }) => {
         this.post({ type: 'image', channel, msg_id: msg_id || this.bubbleId, src, alt });
       },
+      artifact: (art) => {
+        // 产出物预览：在右侧打开预览面板（HTML/图片/Markdown/PDF）
+        this.openArtifactPreview(art).catch((e) => {
+          this.post({ type: 'notice', text: '预览打开失败：' + String((e && e.message) || e) });
+        });
+      },
       assistantEnd: ({ channel, msg_id, done }) => {
         this.post({ type: 'assistantEnd', channel, msg_id: msg_id || this.bubbleId, done });
         if (channel === 'final' || !channel) this.bubbleId = null;
@@ -1919,10 +2211,10 @@ class ChatViewProvider {
           }
           const sid = thinkingMsgId || ('st' + (++self._stepSeq));
           this._lastThinkingId = sid;
-          this.post({ type: 'step', id: sid, kind: 'llm', title: i18n.tw('调用模型'), status: 'running', group: 'reason', stepType: 'llm', timestamp: Date.now() });
+          this.post({ type: 'step', id: sid, kind: 'llm', title: i18n.tw('思考'), status: 'running', group: 'reason', stepType: 'llm', timestamp: Date.now() });
         }
       },
-      notice: ({ text }) => this.post({ type: 'notice', text }),
+      notice: ({ text, internal }) => this.post({ type: 'notice', text, internal: !!internal }),
       // 原生联网（DeepSeek/OpenAI Responses 的 web_search_call）的搜索结果 URL，
       // 透传给前端 harvest，补全引用角标成可点击链接。
       searchSources: ({ text }) => { if (text) this.post({ type: 'searchSources', text }); },

@@ -45,6 +45,35 @@ function getShell() {
   return process.env.SHELL || '/bin/bash';
 }
 
+/**
+ * argv 数组 → 单条命令展示串（安全检查 / 历史记录用）。
+ * 只做「肉眼可读的近似还原」，引号按需包裹，不追求完美转义——真正转义是 argvToShell 的职责。
+ */
+function argvJoin(argv) {
+  return (argv || []).map((x) => {
+    const s = String(x);
+    return /\s|["'&|<>()%^!]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s;
+  }).join(' ');
+}
+
+/**
+ * argv 数组 → 当前 shell 的命令字符串（集成终端用，把转义包袱甩给本函数）。
+ *  bash/zsh：单引号包裹，内部单引号用 '"'"' 拼接（POSIX 标准）
+ *  PowerShell：单引号包裹，内部单引号翻倍
+ *  cmd：双引号包裹，内部双引号 ^"、% 变 %%、! 变 ^!（延迟展开防咬）
+ */
+function argvToShell(argv, shell) {
+  const p = String(shell || process.env.SHELL || '').toLowerCase();
+  const isPwsh = /powershell|pwsh/.test(p);
+  const isCmd = /cmd(\.exe)?$|command\.com/.test(p) || (!isPwsh && process.platform === 'win32' && !p);
+  return (argv || []).map((x) => {
+    const s = String(x);
+    if (isPwsh) return "'" + s.replace(/'/g, "''") + "'";
+    if (isCmd) return /[\s"&|<>%^!()]/.test(s) ? '"' + s.replace(/"/g, '^"').replace(/%/g, '%%').replace(/!/g, '^!') + '"' : s;
+    return "'" + s.replace(/'/g, `'"'"'`) + "'"; // POSIX 单引号
+  }).join(' ');
+}
+
 function killTree(child) {
   if (!child || child.killed) return;
   try {
@@ -186,6 +215,65 @@ async function runInIntegratedTerminal(command, opts) {
 
 /* ---------------- 兜底：子进程执行 ---------------- */
 
+/**
+ * argv 真数组模式（不经 shell，转义从模型大脑移除）。
+ *  POSIX：直接 spawn(argv[0], argv.slice(1)) 真数组（无 shell，空格/特殊字符天然安全）。
+ *  Windows：.exe 真数组；.cmd/.bat 必须经 shell（Node 不解析 cmd/bat），由 argvToShell 转义后
+ *  走 runWithSpawn，转义逻辑在本函数内（插件自己拼，不依赖模型）。
+ */
+function runWithArgv(argv, opts) {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(argv[0] || ''))) {
+    return runWithSpawn(argvToShell(argv, getShell()), opts);
+  }
+  const { cwd, timeout, token, onData } = opts;
+  return new Promise((resolve) => {
+    const child = cp.spawn(argv[0], argv.slice(1), {
+      cwd: cwd || ws.rootPath() || process.cwd(),
+      windowsHide: true,
+      detached: process.platform !== 'win32',
+      env: Object.assign({}, process.env, { FORCE_COLOR: '0', NO_COLOR: '1' })
+    });
+
+    let out = '';
+    let why = 'done';
+    const append = (buf) => {
+      const clean = stripAnsi(buf.toString('utf8'));
+      out += clean;
+      if (onData) onData(clean);
+      if (out.length > 400000) {
+        why = 'truncated';
+        killTree(child);
+      }
+    };
+    child.stdout && child.stdout.on('data', append);
+    child.stderr && child.stderr.on('data', append);
+
+    const timer = setTimeout(() => {
+      why = 'timeout';
+      killTree(child);
+    }, timeout);
+
+    const cancelSub =
+      token &&
+      token.onCancelled(() => {
+        why = 'cancelled';
+        killTree(child);
+      });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      if (cancelSub) cancelSub();
+      resolve({ output: out + '\n[启动失败] ' + err.message, exitCode: -1, why: 'error', via: '子进程' });
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (cancelSub) cancelSub();
+      resolve({ output: out, exitCode: code, why, via: '子进程' });
+    });
+  });
+}
+
 function runWithSpawn(command, opts) {
   const { cwd, timeout, token, onData } = opts;
   return new Promise((resolve) => {
@@ -325,12 +413,15 @@ function asyncJobCancel(id) {
 
 /** 提交异步命令：立即返回任务号，后台 spawn 执行，不阻塞当前对话 */
 async function runCommandAsync(args) {
+  const hasArgv = Array.isArray(args && args.argv) && args.argv.length > 0;
+  const argv = hasArgv ? args.argv.map((x) => String(x)) : null;
   const command = String(args.command || '').trim();
-  if (!command) throw new Error('command 不能为空');
-  const blocked = isDangerous(command, args && args._blockedCommands);
-  if (blocked) throw new Error(`拒绝执行该命令（${blocked}）：${command}`);
+  const effectiveCmd = argv ? argvToShell(argv, getShell()) : command;
+  if (!effectiveCmd) throw new Error('command 不能为空（或 argv 至少包含程序名）');
+  const blocked = isDangerous(effectiveCmd, args && args._blockedCommands);
+  if (blocked) throw new Error(`拒绝执行该命令（${blocked}）：${effectiveCmd}`);
   const id = 'as' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const job = asyncJobShape(id, command, args.cwd);
+  const job = asyncJobShape(id, effectiveCmd, args.cwd);
   asyncJobSave(job);
   // 后台执行：不 await，任务照跑，主对话立即拿到任务号
   (async () => {
@@ -339,13 +430,22 @@ async function runCommandAsync(args) {
     j.status = 'running';
     j.startedAt = Date.now();
     asyncJobSave(j);
-    const child = cp.spawn(command, {
-      cwd: j.cwd || ws.rootPath() || process.cwd(),
-      shell: true,
-      windowsHide: true,
-      detached: process.platform !== 'win32',
-      env: Object.assign({}, process.env, { FORCE_COLOR: '0', NO_COLOR: '1' })
-    });
+    // argv 模式真数组（不经 shell）：转义彻底交给执行层；.cmd/.bat 必须经 shell（Node 不解析），内部拼串
+    const useArgvDirect = hasArgv && !(process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(argv[0] || '')));
+    const child = useArgvDirect
+      ? cp.spawn(argv[0], argv.slice(1), {
+          cwd: j.cwd || ws.rootPath() || process.cwd(),
+          windowsHide: true,
+          detached: process.platform !== 'win32',
+          env: Object.assign({}, process.env, { FORCE_COLOR: '0', NO_COLOR: '1' })
+        })
+      : cp.spawn(command, {
+          cwd: j.cwd || ws.rootPath() || process.cwd(),
+          shell: true,
+          windowsHide: true,
+          detached: process.platform !== 'win32',
+          env: Object.assign({}, process.env, { FORCE_COLOR: '0', NO_COLOR: '1' })
+        });
     j.pid = child.pid;
     asyncJobSave(j);
     let out = '';
@@ -433,8 +533,13 @@ function asyncCommandJobs(req) {
 /* ---------------- 对外工具 ---------------- */
 
 async function runCommand(args, ctx) {
+  // argv 数组优先（1.1.22 组合方案）：带空格/特殊字符参数走数组，转义由执行层处理。
+  // 有 argv 时以 argv 为准；command 拼回仅供「安全拦截 / 展示 / 历史」用，不直接执行。
+  const hasArgv = Array.isArray(args && args.argv) && args.argv.length > 0;
+  const argv = hasArgv ? args.argv.map((x) => String(x)) : null;
   const command = String(args.command || '').trim();
-  if (!command) throw new Error('command 不能为空');
+  const effectiveCmd = argv ? argvToShell(argv, getShell()) : command;
+  if (!effectiveCmd) throw new Error('command 不能为空（或 argv 至少包含程序名）');
 
   // 异步模式：bg=true → 立即提交后台命令任务，不阻塞当前对话
   if (args && args.bg === true) {
@@ -442,8 +547,9 @@ async function runCommand(args, ctx) {
   }
 
   const cfg = vscode.workspace.getConfiguration('foxAi');
-  const blocked = isDangerous(command, ctx && ctx.blockedCommands);
-  if (blocked) throw new Error(`拒绝执行该命令（${blocked}）：${command}`);
+  // 安全拦截统一看 effectiveCmd（argv 模式下把数组拼回字符串检查，防绕过 isDangerous）
+  const blocked = isDangerous(effectiveCmd, ctx && ctx.blockedCommands);
+  if (blocked) throw new Error(`拒绝执行该命令（${blocked}）：${effectiveCmd}`);
 
   const timeout = Math.max(5000, cfg.get('agent.commandTimeout', 120000));
   const mode = cfg.get('agent.terminalMode', 'integrated');
@@ -462,14 +568,19 @@ async function runCommand(args, ctx) {
   let result = null;
   if (mode === 'integrated') {
     try {
-      result = await runInIntegratedTerminal(command, { cwd, timeout, token, onData });
+      // argv 模式：拼成当前 shell 的转义串交给集成终端；command 模式原样
+      result = await runInIntegratedTerminal(effectiveCmd, { cwd, timeout, token, onData });
     } catch (e) {
       result = null;
     }
   }
-  if (!result) result = await runWithSpawn(command, { cwd, timeout, token, onData });
+  if (!result && argv) {
+    // 集成终端不可用 → 子进程真数组（不经过 shell，空格天然安全）；.cmd/.bat 内部转 shell
+    result = await runWithArgv(argv, { cwd, timeout, token, onData });
+  }
+  if (!result) result = await runWithSpawn(effectiveCmd, { cwd, timeout, token, onData });
 
-  pushHistory({ command, output: result.output, exitCode: result.exitCode, at: Date.now() });
+  pushHistory({ command: effectiveCmd, output: result.output, exitCode: result.exitCode, at: Date.now() });
 
   const maxOut = (ctx && ctx.maxToolOutput) || 8000;
   const body = tail(result.output.trim(), maxOut) || '(没有输出)';
@@ -481,7 +592,7 @@ async function runCommand(args, ctx) {
     error: '启动失败'
   };
   const status = statusMap[result.why] || String(result.why);
-  return `$ ${command}\n[${result.via} · ${status}]\n${body}`;
+  return `$ ${effectiveCmd}\n[${result.via} · ${status}]\n${body}`;
 }
 
 /** 读取当前活动终端的可见内容（用户自己跑出来的报错） */

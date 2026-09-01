@@ -41,6 +41,8 @@ const vscodeMock = {
   },
   TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   ThemeIcon: class {},
+  // 1.1.25：src/fileNav.js / src/sessionTree.js 用 new vscode.ThemeColor(...) —— mock 缺构造器导致崩溃
+  ThemeColor: class { constructor(c) { this.id = c; } },
   ConfigurationTarget: { Global: 1 },
   EventEmitter: EventEmitterMock,
   Uri: { file: (p) => ({ fsPath: p }) }
@@ -172,7 +174,8 @@ function sleep(ms) {
 
     const children = tree.getChildren(roots[0]);
     check('分组下能拿到当前会话', () => assert.strictEqual(children.length, 1));
-    check('当前会话标记为当前', () => assert.strictEqual(children[0].description, '当前'));
+    // 1.1.25：sessionTree 当前会话标记是「当前 · <相对时间>」（如「当前 · 刚刚」），断言只认前缀
+    check('当前会话标记为当前', () => assert.ok(String(children[0].description).startsWith('当前'), '应含「当前」前缀，实际：' + children[0].description));
 
     cleanTmp(tmp);
   }

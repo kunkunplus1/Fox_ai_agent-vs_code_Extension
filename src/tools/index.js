@@ -12,6 +12,7 @@ const mcp = require('./mcp'); // MCP 连接器适配器骨架（默认未启用�
 const mcpAuthor = require('./mcpAuthor'); // 自写 MCP 服务器（生成 / 登记 / 自动发现）
 const reviewChanges = require('./reviewChanges'); // 原始版 vs 修改版对比 + 深度思考
 const securityAudit = require('./securityAudit'); // 只读代码安全自检（自检 Agent）
+const skillAudit = require('./skillAudit'); // 技能安全审查（下载技能后启动前只读审查）
 const referee = require('./referee'); // 只读第三方裁判 Agent（双盲交叉验证）
 const sandboxTest = require('./sandboxTest'); // 沙盒代码自测（隔离运行 + canary 校验）
 const imageGen = require('./imageGen'); // 生图通道（独立第二模型，服务总控 agent，类似 vision 识图但反向）
@@ -213,18 +214,19 @@ const TOOLS = [
   {
     name: 'run_command',
     kind: 'exec',
-    title: (a) => `执行 ${a.command || ''}`,
+    title: (a) => `执行 ${(a && (a.argv ? a.argv.join(' ') : a.command)) || ''}`,
     description:
-      '在 VS Code 集成终端里执行 shell 命令并返回输出与退出码，用于安装依赖、构建、跑测试等。命令必须非交互（自带 -y 等参数），不要用会一直挂起的命令（如 npm run dev 长期驻留服务）。\n\n**异步模式**：传 bg=true 会立即提交后台任务并返回任务号（不阻塞当前对话），用 background_jobs action=get + id 随时查状态与完整输出，action=cancel 可取消。适合安装依赖、大构建、长测试这类耗时命令；同步等结果最多等到该模型配置的 commandTimeout。',
+      '执行 shell 命令并返回输出与退出码，用于安装依赖、构建、跑测试等。命令必须非交互（自带 -y 等参数），不要用会一直挂起的命令（如 npm run dev 长期驻留服务）。\n\n**推荐 argv 数组模式（转义最省心）**：带空格或特殊字符的参数用 argv 传数组，如 `{"argv":["cat","/path/My Docs"]}`——插件按当前 shell 自动转义拼接（集成终端）或子进程数组模式直传（不经 shell），模型完全不用管转义。纯命令（无空格参数、无管道/重定向）用 `command` 字符串即可。需要管道、重定向、环境变量前缀（如 `cd x && make`）时只能用 command 字符串，带空格参数用单引号包裹（\'/path/My Docs\'）。\n\n**argv 与 command 同时给出时以 argv 为准**；argv 仅限参数数组（argv[0] 为程序），不解析管道/重定向（那属于 shell 语法，走 command）。\n\n**异步模式**：传 bg=true 会立即提交后台任务并返回任务号（不阻塞当前对话），用 background_jobs action=get + id 随时查状态与完整输出，action=cancel 可取消。适合安装依赖、大构建、长测试这类耗时命令；同步等结果最多等到该模型配置的 commandTimeout。',
     parameters: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: '要执行的完整命令' },
+        argv: { type: 'array', items: { type: 'string' }, description: '参数数组：argv[0] 是程序/命令名，后续是参数。带空格路径直接放数组元素（如 ["cat","/path/My Docs"]），转义由执行层处理。不能含管道/重定向（那属于 shell 语法，用 command）。' },
+        command: { type: 'string', description: '要执行的完整命令（含管道/重定向/环境变量前缀时用这个；带空格参数用单引号包裹）' },
         cwd: { type: 'string', description: '工作目录，默认工作区根目录' },
         explanation: { type: 'string', description: '一句话说明为什么要跑这条命令' },
         bg: { type: 'boolean', description: 'true=异步后台执行，立刻返回任务号不阻塞；默认 false（同步等结果）' }
       },
-      required: ['command']
+      required: []
     },
     run: (a, c) => term.runCommand(a, c)
   },
@@ -432,11 +434,11 @@ const TOOLS = [
     kind: 'edit',
     title: (a) => `导入技能 ${a.url ? a.url.slice(0, 40) : ''}`,
     description:
-      '从 GitHub 下载并导入一个 Agent Skill 到用户技能目录（user-skills/），导入后可用 use_skill 激活。支持两种链接：① 仓库页 https://github.com/{owner}/{repo}（自动在仓库根 / skills/<repo>/ / skill/<repo>/ 等常见位置找 SKILL.md）；② raw 文件 https://raw.githubusercontent.com/{owner}/{repo}/{branch}/…/SKILL.md（直接下载该文件）。SKILL.md 需是标准格式（--- YAML frontmatter：name/description--- + Markdown 指导正文）；缺 when_to_use 会自动补默认值。若仓库同目录有 run.js 会一并导入（含 node --check 校验）。导入前请先向用户确认要导入的仓库来源可信。',
+      '从网上任意来源下载并导入一个 Agent Skill 到用户技能目录（user-skills/），导入后可用 use_skill 激活。支持多种链接：① GitHub 仓库页 https://github.com/{owner}/{repo}（自动在仓库根 / skills/<repo>/ / skill/<repo>/ 等常见位置找 SKILL.md）；② raw 文件 https://raw.githubusercontent.com/{owner}/{repo}/{branch}/…/SKILL.md；③ GitLab raw https://gitlab.com/{owner}/{repo}/-/raw/{branch}/…/SKILL.md；④ Gitee raw https://gitee.com/{owner}/{repo}/raw/{branch}/…/SKILL.md；⑤ 任意 https 文件直链（.md/.markdown/.txt 结尾，直接当 SKILL.md 内容下载，可接 CDN/静态托管）。SKILL.md 需是标准格式（--- YAML frontmatter：name/description--- + Markdown 指导正文）；缺 when_to_use 会自动补默认值。若仓库同目录有 run.js 会一并导入（含 node --check 校验）。导入前请先向用户确认要导入的仓库来源可信。',
     parameters: {
       type: 'object',
       properties: {
-        url: { type: 'string', description: 'GitHub 仓库页 URL 或 raw SKILL.md URL（仅支持 github.com / raw.githubusercontent.com）' },
+        url: { type: 'string', description: '技能来源 URL：GitHub 仓库页 / GitHub raw / GitLab raw / Gitee raw / 任意 .md 直链' },
         name: { type: 'string', description: '可选，自定义技能名（默认取 SKILL.md frontmatter 的 name，缺失则取仓库名）' }
       },
       required: ['url']
@@ -448,6 +450,9 @@ const TOOLS = [
       if (!res.ok) return '技能导入失败：\n' + res.errors.join('\n') + '\n（可改用 raw 文件链接，或先用 list_skills 确认是否已导入）';
       let msg = `技能「${res.name}」已从 GitHub 导入并验证通过，路径：${res.path}`;
       if (res.scriptNote) msg += '\n' + res.scriptNote;
+      // ★ 导入后自动接安全审查（对自己刚从网上下载的技能做只读静态审查，先审查再启用）
+      msg += '\n\n【安全审查】已自动对该技能做只读静态安全审查：\n' + skillAudit.run({ path: require('path').dirname(res.path) });
+      msg += '\n\n审查结论供你判断是否启用：高危需先人工确认/修复，中危确认用途，低危/通过可直接启用。';
       msg += '\n后续可用 use_skill 激活它。';
       return msg;
     }
@@ -529,6 +534,25 @@ const TOOLS = [
     run: async (a, c) => {
       const store = c && c.skills;
       if (!store) return '技能存储不可用';
+      // ★ 内置技能：知识库检索（1.1.19 知识库技能化——默认不强制灌入，agent 需要时自主调取）
+      // use_skill name=_knowledge_base → 按 query 走真实向量/关键词检索，返回命中的知识内容
+      if (a && String(a.name) === '_knowledge_base') {
+        try {
+          const q = String(a.query || '').trim() || '全部';
+          const kb = require('../knowledgeBase');
+          const res = await kb.augmentSystemPromptAsync('', q, c && c.sessionId, {
+            context: c && c.context,
+            onLog: () => {}
+          });
+          // res 是（原 system + 知识块）拼接结果；这里 basePrompt 为空 → 返回的就是知识块本身
+          const clean = String(res || '').replace(/^\s*=== 系统指令[\s\S]*?===\s*/, '').trim();
+          return '已激活内置技能「知识库检索」。检索 query：' + q + '\n\n'
+            + '【知识库命中内容】\n' + (clean || '（知识库为空或无命中，可换关键词重试）')
+            + '\n\n请结合以上知识回答用户问题；若知识不足以回答，明确说明并基于你的通用知识补充。';
+        } catch (e) {
+          return '知识库检索失败：' + String((e && e.message) || e) + '。可尝试换更短的关键词，或直接基于通用知识回答。';
+        }
+      }
       const r = store.activate(a.name, a.query);
       if (!r.ok) return r.reason + '（可用 list_skills 查看已有技能）';
 
@@ -713,7 +737,7 @@ const TOOLS = [
     kind: 'edit',
     title: () => '整体更新任务清单',
     description:
-      '一次性覆盖整个项目任务清单（整表替换）。传入完整任务列表，每项含 content（任务一句话描述）与 status（pending/in_progress/completed）。不需要任务 id——适合在「标记某步完成、调整计划、重新梳理全部步骤」时一次性给出最新全量清单，避免逐条 update_plan_task 记不住 id 导致更新失败。',
+      '一次性覆盖整个项目任务清单（整表替换）。**todos 必须是数组**（如 [{"content":"第一步","status":"in_progress"}]），**不要传字符串/串行化的 JSON 文本**——字符串会被系统静默忽略导致清单为空。',
     parameters: {
       type: 'object',
       properties: {
@@ -735,16 +759,21 @@ const TOOLS = [
     run: (a, c) => {
       const store = c && c.planTasks;
       if (!store) return '任务清单存储不可用';
-      const counts = store.replaceAll(a.todos);
-      return `已整体更新任务清单：${counts.pending} 待办、${counts.inProgress} 进行中、${counts.completed} 已完成。`;
+      const res = store.replaceAll(a.todos);
+      // 1.1.24（对齐 dsh todo_write「响亮失败」）：解析不出任务时把具体错误回灌给模型，
+      // 让模型看到「为什么失败、该怎么写」，而不是静默空清单（空清单会让模型以为写成功了）。
+      if (res && res._error) {
+        return `任务清单未更新：${res._error}。请改用标准格式重试：set_plan_tasks 传完整数组 [{"content":"任务描述","status":"pending|in_progress|completed"}]（不要传字符串/JSON 文本/空数组）。`;
+      }
+      return `已整体更新任务清单：${res.pending} 待办、${res.inProgress} 进行中、${res.completed} 已完成。`;
     }
   },
   {
     name: 'present_plan',
     kind: 'read',
-    title: () => '提交计划待确认',
+    title: () => '提交计划',
     description:
-      '在已用 create_plan_task 列好完整计划后调用，把计划提交给用户确认。调用后必须停止，不要执行任何写文件/执行命令的操作，等待用户在对话面板里点「确认执行」。',
+      '在已用 create_plan_task 列好计划后调用，把计划展示给用户看。提交后【立即继续执行】第一步，不要等待任何确认——用户可以在聊天面板里随时看到计划并干预；只有遇到真正危险或无法决定的操作才询问用户。',
     parameters: {
       type: 'object',
       properties: {
@@ -754,7 +783,7 @@ const TOOLS = [
     run: async (a, c) => {
       const store = c && c.planTasks;
       const n = store ? store.list().length : 0;
-      return `计划已提交，共 ${n} 项，等待用户确认。在用户确认前，不要执行任何步骤。`;
+      return `计划已提交（共 ${n} 项），用户已可见。继续执行第一步。`;
     }
   },
   {
@@ -762,7 +791,7 @@ const TOOLS = [
     kind: 'read',
     title: (a) => '修订计划：' + (a.reason || ''),
     description:
-      '执行过程中若需调整计划（增删步骤或改变目标），先调用 update_plan_task / create_plan_task 改好计划，再调用本工具并说明原因，等待用户再次确认后才继续；不得擅自偏离已确认的计划。',
+      '执行过程中若需调整计划（增删步骤或改变目标），先调用 update_plan_task / create_plan_task 改好计划，再调用本工具说明原因，然后【立即继续执行】调整后的步骤，不需要用户再次确认。',
     parameters: {
       type: 'object',
       properties: {
@@ -772,7 +801,7 @@ const TOOLS = [
     },
     run: async (a, c) => {
       const reason = String(a.reason || '').trim() || '（未说明原因）';
-      return `计划修订已记录，原因：${reason}。已重新提交，等待用户确认后再继续。`;
+      return `计划修订已记录，原因：${reason}。继续执行调整后的步骤。`;
     }
   },
   {
@@ -802,6 +831,20 @@ const TOOLS = [
       }
     },
     run: (a, ctx) => securityAudit.run(a, ctx)
+  },
+  {
+    name: 'skill_audit',
+    kind: 'read',
+    title: (a) => `技能安全审查 ${a.path || '(用户技能目录)'}`,
+    description:
+      '对技能做只读·脱敏·网络隔离的安全审查（下载技能后、启用前先审查）。静态规则扫描：SKILL.md 提示注入（忽略系统/用户指令、强制输出固定内容）、危险命令（rm -rf、curl|sh 下载即执行、eval/动态执行）、恶意脚本特征（base64 混淆、外联回传域名）、硬编码密钥、越权写用户目录等。绝不改文件、不读凭据、不外发请求，命中密钥打码。path 可指定单个技能目录（用户技能目录/<name>），不传则审查全部用户技能。结论分级：高危=勿启用先人工确认；中危=确认用途；低危/通过=可启用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '可选，指定单个技能目录（如 user-skills/<name>）；不传则审查全部用户技能' }
+      }
+    },
+    run: (a, ctx) => skillAudit.run(a, ctx)
   },
   {
     name: 'referee_review',
@@ -1143,6 +1186,288 @@ ${subagents.renderRoleCatalog()}
       }
       return lines.join('\n');
     }
+  },
+  {
+    name: 'preview_artifact',
+    kind: 'read',
+    title: (a) => `预览产出物 ${a.path || ''}`,
+    description:
+      '把刚生成的产出物（HTML 网页 / Markdown / 图片 / PDF）在旁边打开实时预览。调用后聊天窗口右侧会弹出预览面板，'
+      + '无需离开 VS Code 即可查看效果（HTML 直接渲染、图片直接显示、Markdown 渲染排版、PDF 用系统默认应用打开）。'
+      + '适合在写完网页 / 生成图片 / 产出报告后调用，让用户立即看到结果。参数 type 可省略（按扩展名自动识别）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要预览的文件路径（工作区内相对路径或绝对路径）' },
+        type: { type: 'string', description: '文件类型（可选，自动识别）：html / markdown / md / image / png / jpg / pdf' }
+      },
+      required: ['path']
+    },
+    run: (a, ctx) => {
+      const ws = require('./workspace');
+      const fs = require('fs');
+      const path = require('path');
+      const p = String(a.path || '').trim();
+      if (!p) throw new Error('path 不能为空');
+      // 解析路径（支持工作区相对/绝对/~）
+      let abs = p;
+      try { abs = ws.resolveUri(p, { allowOutside: true }).fsPath; } catch (_) { /* 保持原样 */ }
+      if (!fs.existsSync(abs)) throw new Error('文件不存在：' + abs);
+      const ext = path.extname(abs).toLowerCase().replace('.', '');
+      let type = String(a.type || '').toLowerCase();
+      if (!type) {
+        type = ({ html: 'html', htm: 'html', md: 'markdown', markdown: 'markdown', png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', svg: 'image', bmp: 'image', pdf: 'pdf' })[ext] || 'unknown';
+      }
+      // 交给上层打开预览面板（ctx.emitArtifact → agent.emit('artifact') → chatView 开 WebviewPanel）
+      if (ctx && typeof ctx.emitArtifact === 'function') {
+        try { ctx.emitArtifact({ path: abs, type, ext }); } catch (_) {}
+      }
+      return `已请求打开预览：${abs}（type=${type}）。\n- HTML/Markdown/图片：右侧预览面板已弹出；\n- PDF：已用系统默认应用打开（若未弹出请检查系统关联）。`;
+    }
+  },
+  {
+    name: 'convert_file',
+    kind: 'read',
+    title: (a) => `无损转换文件 ${a.path || ''}`,
+    description:
+      '把 Office/文档文件【无损提取内容】为可读文本/表格（不依赖外部软件，用内置解包解析）：\n'
+      + '  · docx → 提取全部段落文本 + 表格（表格转 Markdown 表格，内容零丢失）\n'
+      + '  · xlsx → 提取每个工作表的所有单元格（保留行列结构）\n'
+      + '  · pptx → 提取每页文字 + 表格 + 备注\n'
+      + '  · 输出可选保存为 .md / .txt / .csv，便于后续处理。\n'
+      + '用户上传 docx/pdf/xlsx 等文件、或要求「把 word 变成表格 / 提取文档内容」时调用。'
+      + 'PDF 不支持内置无损提取（二进制格式），请用 run_command 调 python 的 pdfplumber/PyMuPDF，或提示用户另存为文本。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要转换的文件路径（.docx / .xlsx / .pptx）' },
+        output: { type: 'string', description: '输出文件路径（可选，默认不落盘只返回内容）' },
+        format: { type: 'string', description: '输出格式（可选）：text（默认）/ markdown / csv' }
+      },
+      required: ['path']
+    },
+    run: async (a) => {
+      const fs = require('fs');
+      const path = require('path');
+      const os = require('os');
+      const { execSync } = require('child_process');
+      const p = String(a.path || '').trim();
+      if (!p) throw new Error('path 不能为空');
+      let abs = p;
+      try { abs = require('./workspace').resolveUri(p, { allowOutside: true }).fsPath; } catch (_) {}
+      if (!fs.existsSync(abs)) throw new Error('文件不存在：' + abs);
+      const ext = path.extname(abs).toLowerCase();
+      const supported = { '.docx': 'docx', '.xlsx': 'xlsx', '.pptx': 'pptx' };
+      if (!supported[ext]) {
+        throw new Error('不支持的格式：' + ext + '。支持 docx/xlsx/pptx 无损提取；PDF 请用 python 库（pdfplumber/PyMuPDF）处理。');
+      }
+      // 用 python 内置 zipfile + 自定义解析（无损，跨平台，无需第三方库）
+      const pyScript = path.join(os.tmpdir(), 'fx_convert_' + Date.now() + '.py');
+      const kind = supported[ext];
+      const outFormat = String(a.format || 'text').toLowerCase();
+      const pyCode = [
+        'import sys, zipfile, re, json',
+        'from xml.etree import ElementTree as ET',
+        'path = sys.argv[1]',
+        'kind = sys.argv[2]',
+        'fmt = sys.argv[3] if len(sys.argv) > 3 else "text"',
+        'NS = {',
+        '  "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",',
+        '  "a": "http://schemas.openxmlformats.org/drawingml/2006/main",',
+        '  "x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",',
+        '  "p": "http://schemas.openxmlformats.org/presentationml/2006/main",',
+        '  "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
+        '}',
+        'z = zipfile.ZipFile(path)',
+        'def q(tag):',
+        '  pfx, _, local = tag.partition(":")',
+        '  return "{" + NS.get(pfx, "") + "}" + local',
+        'out = []',
+        'def text_of(el):',
+        '  return "".join(el.itertext())',
+        'if kind == "docx":',
+        '  xml = z.read("word/document.xml")',
+        '  root = ET.fromstring(xml)',
+        '  body = root.find(q("w:body"))',
+        '  for child in body:',
+        '    tag = child.tag.split("}")[-1]',
+        '    if tag == "p":',
+        '      t = text_of(child).strip()',
+        '      if t: out.append(t)',
+        '    elif tag == "tbl":',
+        '      rows = []',
+        '      for tr in child.findall(q("w:tr")):',
+        '        cells = [" ".join(text_of(tc).split()) for tc in tr.findall(q("w:tc"))]',
+        '        rows.append(cells)',
+        '      if rows:',
+        '        out.append("")',
+        '        for r in rows: out.append("| " + " | ".join(r) + " |")',
+        '        out.append("")',
+        'elif kind == "xlsx":',
+        '  shared = {}',
+        '  try:',
+        '    sx = z.read("xl/sharedStrings.xml")',
+        '    sroot = ET.fromstring(sx)',
+        '    for i, si in enumerate(sroot.findall(q("x:si"))):',
+        '      shared[i] = text_of(si)',
+        '  except Exception: pass',
+        '  sheets = [n for n in z.namelist() if re.match(r"xl/worksheets/sheet\\d+\\.xml", n)]',
+        '  sheets.sort(key=lambda n: int(re.search(r"(\\d+)", n).group(1)))',
+        '  for sn in sheets:',
+        '    out.append("== 工作表: " + sn + " ==")',
+        '    root = ET.fromstring(z.read(sn))',
+        '    for row in root.iter(q("x:row")):',
+        '      cells = []',
+        '      for c in row.findall(q("x:c")):',
+        '        v = c.find(q("x:v"))',
+        '        t = c.get("t")',
+        '        val = ""',
+        '        if t == "s" and v is not None and v.text and int(v.text) in shared:',
+        '          val = shared[int(v.text)]',
+        '        elif v is not None and v.text is not None:',
+        '          val = v.text',
+        '        cells.append(val)',
+        '      if any(cells): out.append("| " + " | ".join(cells) + " |")',
+        'elif kind == "pptx":',
+        '  slides = sorted([n for n in z.namelist() if re.match(r"ppt/slides/slide\\d+\\.xml", n)],',
+        '                  key=lambda n: int(re.search(r"(\\d+)", n).group(1)))',
+        '  for si, sn in enumerate(slides, 1):',
+        '    root = ET.fromstring(z.read(sn))',
+        '    texts = [text_of(el).strip() for el in root.iter() if el.text and el.text.strip()]',
+        '    out.append("--- 幻灯片 %d ---" % si)',
+        '    for t in texts: out.append(t)',
+        'print(json.dumps("\\n".join(out), ensure_ascii=False))'
+      ].join('\n');
+      fs.writeFileSync(pyScript, pyCode, 'utf8');
+      let resultText = '';
+      try {
+        const py = process.platform === 'win32' ? 'python' : 'python3';
+        const raw = execSync(`"${py}" "${pyScript}" "${abs}" ${kind} ${outFormat}`, {
+          encoding: 'utf8', timeout: 60000, maxBuffer: 50 * 1024 * 1024
+        }).trim();
+        resultText = JSON.parse(raw);
+      } catch (e) {
+        // 尝试 fallback python 可执行名
+        try {
+          const raw = execSync(`python3 "${pyScript}" "${abs}" ${kind} ${outFormat}`, {
+            encoding: 'utf8', timeout: 60000, maxBuffer: 50 * 1024 * 1024
+          }).trim();
+          resultText = JSON.parse(raw);
+        } catch (e2) {
+          throw new Error('内容提取失败（需要系统 python，支持 zipfile 即可）：' + String((e && e.stderr || e.message) || e2.message).slice(0, 300));
+        }
+      } finally {
+        try { fs.unlinkSync(pyScript); } catch (_) {}
+      }
+      if (!String(resultText).trim()) return '该文件内容为空（或无可提取文本）。';
+      // 可选落盘输出
+      const outPath = String(a.output || '').trim();
+      if (outPath) {
+        try {
+          const outAbs = outPath.startsWith('/') || /^[a-zA-Z]:/.test(outPath) ? outPath : require('./workspace').resolveUri(outPath, { allowOutside: true }).fsPath;
+          fs.writeFileSync(outAbs, resultText, 'utf8');
+          return `已无损提取「${abs}」内容并保存到 ${outAbs}（${String(resultText).length} 字符）。\n\n${String(resultText).slice(0, 6000)}`;
+        } catch (e) {
+          throw new Error('输出写入失败：' + e.message);
+        }
+      }
+      return String(resultText).slice(0, 8000) + (String(resultText).length > 8000 ? '\n…（内容较长已截断，可用 output 参数保存到文件查看全文）' : '');
+    }
+  },
+  {
+    name: 'report_feedback',
+    kind: 'read',
+    title: () => '提交修改意见/反馈',
+    description:
+      '把用户对「刚才生成的产出物（网页/报告/图片等）」的修改意见或使用中遇到的问题记录下来，'
+      + '并**引导插件按用户意见直接修改产出物**。用户说「改一下 / 有问题 / 换个样式 / 标题改大点」等时调用。'
+      + '执行后系统会记录反馈，并在返回内容里明确要求：根据用户描述去 edit 对应产出物文件、改完调用 preview_artifact 刷新预览。'
+      + '参数 target 为目标产出物路径（能推断时可省略）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: '用户的修改意见或问题描述（原样保留）' },
+        target: { type: 'string', description: '要修改的产出物文件路径（可选，能推断时省略）' },
+        category: { type: 'string', description: '分类（可选）：style / bug / content / other' }
+      },
+      required: ['content']
+    },
+    run: (a) => {
+      const os = require('os');
+      const fs = require('fs');
+      const path = require('path');
+      // 存档（供追溯）
+      const dir = path.join(os.homedir(), '.fox-ai', 'feedback');
+      try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const safe = String(a.category || 'other').replace(/[^\w\u4e00-\u9fff-]/g, '_');
+      const file = path.join(dir, `${stamp}-${safe}.md`);
+      const ver = (() => { try { return require('../../package.json').version || ''; } catch (_) { return ''; } })();
+      const body = [
+        '# 用户反馈/修改意见',
+        '',
+        '- 时间：' + new Date().toLocaleString('zh-CN'),
+        '- 分类：' + (a.category || 'other'),
+        '- 目标：' + (a.target || '（未指定）'),
+        '- 插件版本：' + ver,
+        '',
+        '## 用户描述',
+        '',
+        String(a.content || ''),
+        ''
+      ].join('\n');
+      try { fs.writeFileSync(file, body, 'utf8'); } catch (e) { throw new Error('写入反馈失败：' + e.message); }
+      // ★ 核心：返回行动指令，让主代理按用户意见【直接修改产出物文件】，改完刷新预览（迭代闭环）
+      const target = String(a.target || '').trim();
+      return '已记录反馈（' + file + '）。\n\n'
+        + '[行动指令] 用户对刚才的产出物提出了修改意见，请立即按以下步骤执行：\n'
+        + '1. 定位目标产出物文件' + (target ? '「' + target + '」' : '（从当前对话上下文推断最近生成的产出物）') + '；\n'
+        + '2. 先 read_file 读取其当前内容，确认现状；\n'
+        + '3. 按用户描述 edit_file 修改（用户原话：' + String(a.content || '').slice(0, 500) + '）；\n'
+        + '4. 改完后调用 preview_artifact 刷新预览，并简短说明改了什么，请用户确认。\n'
+        + '若目标不是文件而是行为/功能问题，则修复对应实现并说明。';
+    }
+  },
+  {
+    name: 'verify_ui_anchors',
+    kind: 'read',
+    title: () => '校验 UI 锚点（视觉↔逻辑对齐）',
+    description:
+      '静态校验前端代码的「视觉↔逻辑」锚点是否对齐（视觉与功能协调系统·第三层）。传入 html 字符串或 file 路径，' +
+      '检查 JS 里 getElementById/querySelector("#id") 引用的元素是否都存在于 HTML（锚点失效 → 有样子没反应），' +
+      '以及原子组件（如 fox-modal）是否满足最小契约（必须有 onclose 关闭绑定）。返回文本化缺口报告，供你逐条修正。' +
+      '生成任何带交互的前端代码后都应调用本工具自检。',
+    parameters: {
+      type: 'object',
+      properties: {
+        html: { type: 'string', description: '完整 HTML 字符串（与 file 二选一）' },
+        file: { type: 'string', description: 'HTML 文件路径（与 html 二选一）' }
+      }
+    },
+    run: (a) => require('./uiAnchors').verifyUiAnchors(a || {})
+  },
+  {
+    name: 'ui_selfcheck',
+    kind: 'read',
+    title: () => '无头自检 UI（渲染级）',
+    description:
+      '无头浏览器自检 UI（视觉与功能协调系统·第四层，文本化反馈）。传入 html/file，先做静态锚点校验；' +
+      '若环境可解析到 Playwright，则额外真实渲染，抓取控制台报错（如 onClose 未定义）、页面异常、关键元素真实坐标/计算样式（如 #modal 是否居中生效）。' +
+      'anchors 传 [{id, expect:{属性:期望值}}] 做样式断言（如 {id:"modal", expect:{"left":"50%"}}）。返回文本化报告，你据此修正、重新 ui_selfcheck，最多迭代 3 次。' +
+      '无浏览器时自动降级为静态校验并提示安装。',
+    parameters: {
+      type: 'object',
+      properties: {
+        html: { type: 'string', description: '完整 HTML 字符串（与 file 二选一）' },
+        file: { type: 'string', description: 'HTML 文件路径（与 html 二选一）' },
+        anchors: {
+          type: 'array',
+          description: '样式断言列表，如 [{"id":"modal","expect":{"left":"50%"}}]；不传则只做坐标/报错采集',
+          items: { type: 'object' }
+        }
+      }
+    },
+    run: async (a) => require('./uiSelfCheck').uiSelfCheck(a || {})
   }
 ];
 
@@ -1510,14 +1835,35 @@ function loadToolTagMap() {
   } catch (_) { /* 配置异常走默认标签 */ }
   return _toolTagMapCache;
 }
-function toolTagMap() { return loadToolTagMap(); }
-function usingCustomToolTag() { return !!(loadToolTagMap().open); }
-/** 用当前生效的符号包裹一个工具调用示例（open 含 %name% 占位） */
-function wrapToolCall(name, body) {
+function toolTagMap(opts) { return loadToolTagMap(opts); }
+function usingCustomToolTag(opts) { return !!(loadToolTagMap(opts).open); }
+/**
+ * 用当前生效的符号包裹一个工具调用示例（open 含 %name% 占位）。
+ * 1.1.25（照 dsh 删改重构，用户「除 web 外全走原生」）：自定义标签（[[tool:]]）只为规避网页风控而生，
+ * 只在 textOnly（WebAI2API）路径渲染；直连 native 路径一律渲染标准 <foxtool>——
+ * 否则 native 模型收到 get_tools 示例里的 [[tool:]] 会与回灌提示的 <foxtool> 打架（日志实证空轮中断）。
+ * @param {object} [ctx] 可选：{ textOnly: boolean } 明确标注当前路径
+ */
+function wrapToolCall(name, body, ctx) {
   const m = loadToolTagMap();
-  if (!m.open) return `<foxtool name="${name}">\n${body}\n</foxtool>`;
+  // 1.1.25（用户「只有 web 要自定义，其他降级 text 也不能自定义」）：
+  // 自定义标签只认 WebAI2API（ctx.textOnly 或全局 customTag 标记），
+  // 直连 text（降级/显式配置/auto 落 text）一律标准 <foxtool>。
+  const onlyWeb = !!(ctx && ctx.textOnly) || _customTagOn();
+  if (!m.open || !onlyWeb) return `<foxtool name="${name}">\n${body}\n</foxtool>`;
   return `${m.open.replace('%name%', name)}\n${body}\n${m.close}`;
 }
+
+// 1.1.25（用户「除了 web 要用自定义，其他降级 text 也不能和 web 一样自定义」）：
+// 全局「WebAI2API 自定义标签模式」标记——由 AgentSession 在确认路径后设置。
+// 自定义标签（[[tool:]]）只为网页防风控而生，**只认 cfg.meta.textOnly（WebAI2API）**；
+// native 直连、以及 native 失败降级后的 text 直连，一律渲染标准 <foxtool>——
+// 降级 text 只是「用文本协议调用工具」，绝不能附带网页风控用的自定义标签。
+let _customTagMode = false;
+function _customTagOn() { return _customTagMode; }
+function _setCustomTagMode(on) { _customTagMode = !!on; }
+function customTagActive() { return _customTagMode; }
+function setCustomTagMode(on) { _customTagMode = !!on; }
 /** 把文本里的自定义符号归一化为内部标准 <foxtool>（解析前调用；无自定义配置则原样返回） */
 function normalizeToolTags(text) {
   const m = loadToolTagMap();
@@ -1693,7 +2039,111 @@ async function execute(name, args, ctx) {
   return _applyCacheDedup(name, args, ctx, _truncate(result, ctx));
 }
 
-/** 防御 undefined/null 并截断过长输出（与历史行为一致） */
+/**
+ * 目录/清单类工具输出预算（对齐 dsh「完整注入」：工具清单是给模型看目录的，
+ * 不能因通用 8000 上限被「头尾保、中间挖」——中间消失的工具模型照抄即解析失败 → 空轮中断）。
+ * get_tools 默认给足完整目录预算（50 全量 brief 约 12K 字符，24000 足够含 detail=full 参数表）；
+ * 调用方显式传 ctx.maxToolOutput 时仍尊重（外部约束优先），超了再走条目截断兜底。
+ */
+function _catalogLimit(ctx, name) {
+  // get_tools 是「目录」：对齐 dsh 完整注入——固定大预算，不受外部 maxToolOutput 压缩。
+  // 外部 maxToolOutput（默认 4000）是「普通工具结果」的长度上限；
+  // 目录若被它「头60%+尾40%+中间挖掉」，中间工具从模型视野消失 → 照抄空名 →
+  // parseTextCalls 解析失败 count=0 → 空轮 → 会话「莫名终止」（1.1.24 实锤链路）。
+  // 40000 足够容纳 detail=full 全量 50 工具参数表 + MCP 尾部；再超走整条目兜底。
+  if (name === 'get_tools') return 40000;
+  // read_file 是「读整段看内容」语义：完整返回是语义，任何 read_file 结果都不该被
+  // 通用 4000「头60%+尾40%+中间挖」——无论定向分段读还是大文件全量预览（骨架+前400行），
+  // 挖掉中间 → 模型永远看不到段尾/完整预览 → 反复读 → 上下文膨胀 100% → 被迫收尾
+  // （1.1.24 用户实测：docx_full.txt 分段读每段 6454/7119/11665 字全被中间省略）。
+  // 30000 足够容纳约 600 行原文（1678 行全书分 3 段读完）；再超走整行截断兜底（不挖中间）。
+  if (name === 'read_file') return 30000;
+  return (ctx && ctx.maxToolOutput) || 8000;
+}
+
+/**
+ * 主链路后台输入降噪（对齐 WorkBuddy RTK / 输入降噪，零侵入、不改工作流）。
+ * 默认开启；关掉用 foxAi.denoiseOutput.enabled=false。
+ * 只处理「命令行/日志类工具」的原始输出，read_file 读源码不降噪（保代码原样）。
+ * 1) 剥 ANSI：ESC 控制序列（颜色/光标/擦除/OSC 标题），剥成纯文本。
+ * 2) 折叠 \r 进度刷行：同一行反复被 \r 重刷的进度条/百分比只保留最后一次（最新状态），
+ *    正常纯 \r\n 换行不误伤；没有 \r 的文本原样。
+ * 3) 折叠连续完全重复行 ≥3：折叠为一行并标注 ×N，占位行（长度<4）不折叠防误伤。
+ */
+// 只对「命令行执行」类工具的输出做后台降噪（RTK 对应）：命令输出、终端输出、沙箱执行。
+// read_file / search 等读类工具不降噪，保证源码与检索原文原样进上下文。
+const _DENOISE_TOOLS = new Set(['run_command', 'get_terminal_output', 'run_in_sandbox']);
+const _ANSI_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+function _denoiseOutput(name, text) {
+  try {
+    if (!_DENOISE_TOOLS.has(name)) return text;
+    if (!text || typeof text !== 'string' || text.length < 24) return text;
+    let enabled = true;
+    try { const v = vscode.workspace.getConfiguration('foxAi').get('denoiseOutput.enabled'); if (v === false) enabled = false; } catch (_) { /* 默认开 */ }
+    if (!enabled) return text;
+    let out = String(text).replace(_ANSI_RE, '');
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(out)) {
+      out = out.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
+    }
+    if (out.indexOf('\r') !== -1) {
+      const parts = out.split(/\r\n|\n|\r/);
+      const lines = [];
+      for (const seg of parts) {
+        const t = seg.replace(/\s+$/g, '');
+        // \r 刷行：该段非空且是「上一次刷行残留」→ 用本轮覆盖（只在 \r 分割下产生）
+        if (t && lines.length && lines[lines.length - 1] && /^\d+(\.\d+)?%|progress|下载|加载|render|提取|处理中|Compiling|Building|Fetching|Starting/i.test(t)) {
+          lines[lines.length - 1] = t;
+        } else {
+          lines.push(t);
+        }
+      }
+      // 再次折叠重复行
+      out = _collapseRepeat(lines.join('\n'));
+    } else {
+      out = _collapseRepeat(out);
+    }
+    return out;
+  } catch (_) {
+    return text; // 任何异常都不影响原路径
+  }
+}
+function _collapseRepeat(text) {
+  const lines = text.split('\n');
+  const out = [];
+  let run = 1;
+  for (let i = 0; i < lines.length; i++) {
+    const cur = lines[i];
+    const prev = lines[i - 1];
+    if (i > 0 && cur === prev && cur.trim().length >= 4) {
+      run++;
+      continue;
+    }
+    if (run >= 3 && prev !== undefined) {
+      out.push(prev + '　×' + run);
+      run = 1;
+      // 不 continue：当前行是转折后的新行，必须保留
+    }
+    run = 1;
+    out.push(cur);
+  }
+  if (run >= 3 && lines.length) {
+    out.push(lines[lines.length - 1] + '　×' + run);
+  } else if (run > 1 && run < 3 && lines.length) {
+    // 2 次连重不折叠（可读），补回最后一次的行
+    out.push(lines[lines.length - 1]);
+  }
+  return out.join('\n');
+}
+
+/**
+ * 防御 undefined/null 并截断过长输出（与历史行为一致）。
+ * 目录/清单类输出（get_tools 等）：走「整条目截断」，绝不挖中间——
+ * 对齐 dsh（deepseek-harness）system-prompt/tools 的做法：结构化清单要么完整、
+ * 要么按条目边界保留并显式声明 truncated/total，绝不做「头60%+尾40%+中间省略」，
+ * 否则模型视野里中间工具整体消失（如 1.1.24 前 get_tools 全量 50 条 11893 字符
+ * 被 8000 上限截成 8046，create_mcp_server/规划/审查/子代理等 16 个工具凭空失踪，
+ * 模型照抄中间工具名 → parseTextCalls 解析失败 count=0 → 空轮 → 会话中断）。
+ */
 function _truncate(result, ctx) {
   let text;
   if (typeof result === 'string') {
@@ -1703,15 +2153,71 @@ function _truncate(result, ctx) {
   } else {
     text = JSON.stringify(result);
   }
-  const limit = (ctx && ctx.maxToolOutput) || 8000;
+  // 主链路后台降噪（RTK）：先剥杂讯再算长度，同一输出在降噪后可能不再超限
+  text = _denoiseOutput(ctx && ctx.toolName, text);
+  const limit = _catalogLimit(ctx, ctx && ctx.toolName);
   if (text.length <= limit) return text;
+  // 目录/清单类工具（get_tools）：整条目截断，不挖中间。
+  // 条目标记：每行「● 工具名：」开头为一个条目（renderToolGuideLine 输出格式）。
+  // 超预算时按条目边界保留尾部（保留条目标题行 + 正文），并在头部补明确提示，
+  // 让模型知道「完整清单可调用 get_tools query=xxx 单独检索」，杜绝工具名凭空消失。
+  const toolName = ctx && ctx.toolName;
+  if (toolName === 'get_tools' && text.includes('\n● ')) {
+    const segs = text.split(/(?=\n● )/);
+    // 头部说明段（第一个 ● 之前的「共 N 个工具…」）始终保留
+    const intro = segs[0] && !segs[0].startsWith('● ') ? segs[0] : '';
+    const entries = intro ? segs.slice(1) : segs;
+    // 从尾部开始整条保留，直到塞满 limit（条目不劈半）
+    const kept = [];
+    let used = intro.length;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (used + e.length > limit) break;
+      kept.unshift(e);
+      used += e.length;
+    }
+    if (!kept.length) {
+      // 极限小预算：至少保一条 + 提示，绝不输出空目录
+      const first = entries[0] || intro;
+      return first.slice(0, limit) + '\n…（工具目录超出预算，请用 get_tools query=xxx 单独检索）…';
+    }
+    const total = entries.length;
+    const shown = kept.length;
+    return (intro ? intro + '\n' : '')
+      + `…（工具目录共 ${total} 条，预算 ${limit} 字仅能展示 ${shown} 条，完整清单请用 get_tools query=关键词 单独检索）…\n`
+      + kept.join('');
+  }
+  // read_file 超预算（1.1.25：不再限于定向读，全量读同样适用）：整行截断，不挖中间、不劈行。
+  // 逐行从头部保留完整行直到塞满；剩余行数在尾部显式提示模型用更小分段继续读，
+  // 保证段尾/段头自然边界都在，模型不会误判「内容缺失」而反复重读 → 上下文膨胀；
+  // 全量读大文件（无 start/end 参数）也不会被通用「头尾保、中间挖」砍掉中段。
+  if (toolName === 'read_file') {
+    const lines = String(text).split('\n');
+    const keptLines = [];
+    let used = 0;
+    for (const ln of lines) {
+      if (used + ln.length + 1 > limit) break;
+      keptLines.push(ln);
+      used += ln.length + 1;
+    }
+    const totalLines = lines.length;
+    const keptCount = keptLines.length;
+    return keptLines.join('\n')
+      + `\n…（本段共 ${totalLines} 行，预算 ${limit} 字仅能展示前 ${keptCount} 行；请用更小的 start_line/end_line 分段继续读剩余部分）…`;
+  }
   // 智能截断：头 + 尾。命令输出 / 测试结果 / 日志的关键报错与失败摘要常在尾部，
   // 从头硬截断会丢掉失败原因，导致模型（尤其弱模型）误判“成功”或反复重试。
+  // 1.1.24（对齐 dsh pruner）：按 Unicode 码点切分（Array.from 天然不劈代理对），
+  // 避免 emoji/CJK 扩展区在裁剪边界被切成乱码半个字符。
   const headLen = Math.floor(limit * 0.6);
   const tailLen = limit - headLen;
-  return text.slice(0, headLen)
-    + '\n…（输出过长已截断，共 ' + text.length + ' 字，中间省略；如需完整内容请用更精确参数重新调用）…\n'
-    + text.slice(-tailLen);
+  const points = Array.from(text);
+  if (points.length <= limit) return text; // 码点计长下可能不需裁（如大量 emoji 场景）
+  const headPart = points.slice(0, headLen).join('');
+  const tailPart = points.slice(points.length - tailLen).join('');
+  return headPart
+    + '\n…（输出过长已截断，共 ' + points.length + ' 字，中间省略；如需完整内容请用更精确参数重新调用）…\n'
+    + tailPart;
 }
 
-module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema, toolTagMap, usingCustomToolTag, wrapToolCall, normalizeToolTags };
+module.exports = { TOOLS, getTool, toOpenAITools, toOpenAIToolsFrom, toTextManual, allTools, execute, titleOf, kindOf, mcp, sanitizeSchema, toolTagMap, usingCustomToolTag, wrapToolCall, normalizeToolTags, setCustomTagMode, customTagActive, _denoiseOutput, _collapseRepeat };
