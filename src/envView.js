@@ -227,6 +227,7 @@ function getHtml(context, webview) {
 
   <div class="pane" id="kb">
     <h2>本地知识库（AI 整理）</h2>
+    <label><input type="checkbox" id="kb-master"/> 启用本地知识库（总开关：关闭后插件模型无法使用知识库工具/检索）</label>
     <p class="hint danger">⚠️ 开启整理后，agent 读到的将是「AI 整理后」的笔记，原文不会进入上下文。建议用本地 AI（llama.cpp / Ollama）整理，数据不出本机；选云端会把源文件内容发到其服务器。</p>
     <label><input type="checkbox" id="kb-enabled"/> 开启 AI 整理（开启后知识库 RAG 只检索整理后目录）</label>
     <div class="row">
@@ -236,8 +237,7 @@ function getHtml(context, webview) {
     </div>
     <div class="row">
       <label>输出目录</label>
-      <input id="kb-output" style="flex:1;min-width:200px" placeholder="C:/Users/asis/.fox-ai/knowledge（agent 读取这里）"/>
-      <button type="button" class="pick-btn" id="kb-pick-output">选择</button>
+      <input id="kb-output" style="flex:1;min-width:200px" readonly value="" placeholder="固定：~/.fox-ai/knowledge（agent 读取这里，不可修改）"/>
     </div>
     <div class="row">
       <label>整理 AI</label>
@@ -296,7 +296,7 @@ function getHtml(context, webview) {
     </div>
     <div class="row">
       <label>知识库-2 目录</label>
-      <input id="kb-auto-dir" style="flex:1;min-width:200px" placeholder="C:/Users/asis/.fox-ai/knowledge-2（agent 检索这里）"/>
+      <input id="kb-auto-dir" style="flex:1;min-width:200px" readonly value="" placeholder="固定：~/.fox-ai/knowledge-2（agent 检索这里，不可修改）"/>
     </div>
     <hr style="margin:14px 0;border:none;border-top:1px solid rgba(128,128,128,.25)"/>
     <h3>向量模型（语义检索）</h3>
@@ -518,9 +518,10 @@ function getHtml(context, webview) {
 }
 
 async function writeOrganize(cfg, patch) {
+  if ('master' in patch && patch.master !== undefined) await cfg.update('knowledgeBase.enabled', !!patch.master, vscode.ConfigurationTarget.Global);
   if ('enabled' in patch) await cfg.update('knowledgeBase.organize.enabled', !!patch.enabled, vscode.ConfigurationTarget.Global);
   if (Array.isArray(patch.sourcePaths)) await cfg.update('knowledgeBase.organize.sourcePaths', patch.sourcePaths, vscode.ConfigurationTarget.Global);
-  if ('outputDir' in patch) await cfg.update('knowledgeBase.organize.outputDir', patch.outputDir || '', vscode.ConfigurationTarget.Global);
+  // 1.1.27：输出目录固定 ~/.fox-ai/knowledge，忽略 outputDir 写入（兼容旧配置残留）
   if ('provider' in patch) await cfg.update('knowledgeBase.organize.provider', patch.provider || 'llamacpp', vscode.ConfigurationTarget.Global);
   if ('baseUrl' in patch) await cfg.update('knowledgeBase.organize.baseUrl', patch.baseUrl || '', vscode.ConfigurationTarget.Global);
   if ('model' in patch) await cfg.update('knowledgeBase.organize.model', patch.model || '', vscode.ConfigurationTarget.Global);
@@ -529,7 +530,7 @@ async function writeOrganize(cfg, patch) {
   if ('autoEnabled' in patch) await cfg.update('knowledgeBase.autoSummarize.enabled', !!patch.autoEnabled, vscode.ConfigurationTarget.Global);
   if ('autoThreshold' in patch) await cfg.update('knowledgeBase.autoSummarize.threshold', Number(patch.autoThreshold) || 0.9, vscode.ConfigurationTarget.Global);
   if ('autoKeep' in patch) await cfg.update('knowledgeBase.autoSummarize.keepRecent', Number(patch.autoKeep) || 6, vscode.ConfigurationTarget.Global);
-  if ('autoDir' in patch) await cfg.update('knowledgeBase.autoSummarize.dir', patch.autoDir || '', vscode.ConfigurationTarget.Global);
+  // 1.1.27：知识库-2 目录固定 ~/.fox-ai/knowledge-2，忽略 autoDir 写入
   // —— 向量模型（语义检索，1.1.33）：与整理模型完全独立的一组键 ——
   if ('vecEnabled' in patch) await cfg.update('knowledgeBase.embedding.enabled', !!patch.vecEnabled, vscode.ConfigurationTarget.Global);
   if ('vecProvider' in patch) await cfg.update('knowledgeBase.embedding.provider', patch.vecProvider || 'ollama', vscode.ConfigurationTarget.Global);
@@ -542,6 +543,8 @@ async function writeOrganize(cfg, patch) {
 /** 把 webview 传来的知识库表单统一转成 writeOrganize 的 patch（整理 + 自动压缩 + 向量三段） */
 function kbPatchFromForm(c) {
   return {
+    // 1.1.27：顶层总开关（页面「启用本地知识库」）
+    master: 'master' in c ? !!c.master : undefined,
     enabled: !!c.enabled,
     sourcePaths: (c.source || '').split(',').map((x) => x.trim()).filter(Boolean),
     outputDir: (c.output || '').trim(),
@@ -847,6 +850,7 @@ function openEnvPanel(context, chatProvider, initialTab) {
         const vs = kb.vectorStats();
         panel.webview.postMessage({
           type: 'kbInit',
+          master: sub.enabled != null ? !!sub.enabled : undefined,
           vecEnabled: !!vec.enabled,
           vecProvider: vec.provider || 'ollama',
           vecBaseurl: vec.baseUrl || '',
@@ -856,17 +860,15 @@ function openEnvPanel(context, chatProvider, initialTab) {
           vecStat: `向量缓存：${vs.entries} 条${vs.sig ? '（' + vs.sig + '）' : ''}`,
           enabled: !!org.enabled,
           source: (org.sourcePaths || []).join(','),
-          output: org.outputDir || '',
+          output: kbOrg.defaultOutputDir(),
           provider: org.provider || 'llamacpp',
           baseurl: org.baseUrl || '',
           model: org.model || '',
           transport: org.transport || 'auto',
-          defaultOutput: kbOrg.defaultOutputDir(org.outputDir),
           autoEnabled: !!as.enabled,
           autoThreshold: as.threshold != null ? as.threshold : 0.9,
           autoKeep: as.keepRecent != null ? as.keepRecent : 6,
-          autoDir: as.dir || '',
-          defaultAutoDir: kbOrg.defaultAutoSummaryDir(as.dir),
+          autoDir: kbOrg.defaultAutoSummaryDir(),
           stat: `当前索引：${s.files} 文件 / ${s.chunks} 片段`
         });
       } else if (msg.type === 'setKnowledge') {

@@ -1336,7 +1336,7 @@ class AgentSession {
       let skillText = this.skills.renderForPrompt();
       // 内置技能目录（对齐 DSH bundled skill）：知识库检索始终可用（不需要知识库就绪，
       // 检索空知识库也返回空结果而不是报错），模型按需自主调取
-      const builtin = '- _knowledge_base：知识库检索（内置技能。用户问题需要参考本地知识库文档时调用 use_skill 激活它，query 传用户问题的关键词，返回命中的知识内容；知识库为空时返回空结果）';
+      const builtin = '- _knowledge_base：知识库检索（内置技能。用户问题需要参考本地知识库文档时调用 use_skill 激活它，query 传用户问题的关键词，返回命中的知识内容；知识库为空时返回空结果。可选参数：organize=true 只看「AI 整理后」目录、vector=true 强制向量语义检索、vector=false 跳过向量走关键词；不传则按知识库页面设置）';
       const joined = skillText ? skillText + '\n' + builtin : '你拥有以下内置技能（agent 可直接按需调用 use_skill 激活）：\n' + builtin;
       parts.push('【技能目录】\n' + joined);
       // CLI 固定模板指令（省 token + 稳定）：长任务需要反复执行工具时，
@@ -4966,6 +4966,8 @@ const emptyGuide = this.protocol === 'text'
    */
   async _buildKnowledgeHint() {
     try {
+      // 1.1.27：总开关关掉（或未启用）时不提示知识库技能
+      if (!kb.isEnabled()) return '';
       const fileCount = kb.listKnowledgeFiles(this.sessionId).length;
       return fileCount > 0
         ? '【知识库技能】检测到知识库已就绪（' + fileCount + ' 个文档）。'

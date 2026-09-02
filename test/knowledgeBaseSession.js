@@ -85,8 +85,11 @@ client.chatNonStream = async () => ({ content: '【摘要】测试摘要内容�
 const kb = require('../src/knowledgeBase');
 const org = require('../src/knowledgeOrganizer');
 
+// 1.1.27：输出目录固定 ~/.fox-ai/knowledge(-2)——mock os.homedir 让固定目录落到临时区，避免污染真实用户目录
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fox-kb-session-'));
-const kb2Dir = path.join(tmpDir, 'knowledge-2');
+const realHomedir = os.homedir;
+os.homedir = () => tmpDir;
+const kb2Dir = path.join(tmpDir, '.fox-ai', 'knowledge-2');
 fs.mkdirSync(kb2Dir, { recursive: true });
 
 function reset() {

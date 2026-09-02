@@ -46,21 +46,24 @@ function noRealDirCfg(extra) {
 }
 
 (async () => {
-  // 1) 各开关组合
+  // 1) 各开关组合（1.1.27：总开关显式 false 一票否决；undefined 回退子开关）
   mockCfg = { knowledgeBase: { enabled: true } };
   ok('knowledgeBase.enabled=true 时启用', kb.isEnabled() === true);
 
   mockCfg = { knowledgeBase: { enabled: false, organize: { enabled: true } } };
-  ok('organize.enabled=true 时也启用', kb.isEnabled() === true);
+  ok('总开关显式关闭时一票否决（organize 开了也没用）', kb.isEnabled() === false);
 
-  mockCfg = { knowledgeBase: { enabled: false, autoSummarize: { enabled: true } } };
-  ok('autoSummarize.enabled=true 时也启用', kb.isEnabled() === true);
+  mockCfg = { knowledgeBase: { organize: { enabled: true } } };
+  ok('总开关未设置时 organize.enabled=true 也启用', kb.isEnabled() === true);
+
+  mockCfg = { knowledgeBase: { autoSummarize: { enabled: true } } };
+  ok('总开关未设置时 autoSummarize.enabled=true 也启用', kb.isEnabled() === true);
 
   mockCfg = { knowledgeBase: { enabled: false, organize: { enabled: false } } };
   ok('都关闭时未启用', kb.isEnabled() === false);
 
   mockCfg = { knowledgeBase: { enabled: false } };
-  ok('无 organize 字段时未启用', kb.isEnabled() === false);
+  ok('无 organize 字段且总开关关闭时未启用', kb.isEnabled() === false);
 
   // 2) 显式配置的源目录（paths）会被检索到
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fox-kb-paths-'));
@@ -70,19 +73,24 @@ function noRealDirCfg(extra) {
   const r = kb.retrieve('foxkbtestnote', 8000);
   ok('paths 配置的源目录被检索到', r.indexOf('foxkbtestnote') !== -1);
 
-  // 3) 整理模式下按文件名全量注入，不再依赖查询关键词
+  // 3) 1.1.27：输出目录固定不可自定义——验证 defaultOutputDir/defaultAutoSummaryDir 恒返回固定目录
+  const kbOrg = require('../src/knowledgeOrganizer');
+  const home = os.homedir();
+  ok('defaultOutputDir 固定为 ~/.fox-ai/knowledge', kbOrg.defaultOutputDir('C:/any/custom') === path.join(home, '.fox-ai', 'knowledge'));
+  ok('defaultAutoSummaryDir 固定为 ~/.fox-ai/knowledge-2', kbOrg.defaultAutoSummaryDir('/tmp/custom') === path.join(home, '.fox-ai', 'knowledge-2'));
+
+  // 3b) paths 源目录检索（总开关 enabled 时，organize 关闭走 BM25 关键词；固定目录下不可 mock 整理产物）
   const tmpOrg = fs.mkdtempSync(path.join(os.tmpdir(), 'fox-kb-org-'));
   fs.writeFileSync(path.join(tmpOrg, 'a.md'), '# 苹果\n这是一个关于苹果的故事。', 'utf8');
   fs.writeFileSync(path.join(tmpOrg, 'b.md'), '# 香蕉\n这是一个关于香蕉的故事。', 'utf8');
-  mockCfg = { knowledgeBase: { enabled: false, organize: { enabled: true, outputDir: tmpOrg }, chunkSize: 200 } };
+  mockCfg = noRealDirCfg({ knowledgeBase: { enabled: true, paths: [tmpOrg], chunkSize: 200 } });
   kb.invalidate();
-  const rOrg = kb.retrieve('任意查询甚至无关关键词', 8000);
-  ok('整理模式全量注入：包含苹果', rOrg.indexOf('苹果') !== -1);
-  ok('整理模式全量注入：包含香蕉', rOrg.indexOf('香蕉') !== -1);
-  ok('整理模式列出文件清单', kb.listKnowledgeFiles().map((f) => f.source).sort().join(',') === 'a.md,b.md');
-  const system = kb.augmentSystemPrompt('base', '无关');
+  const rOrg = kb.retrieve('苹果', 8000);
+  ok('paths 源检索到苹果', rOrg.indexOf('苹果') !== -1);
+  ok('paths 源列出文件清单', kb.listKnowledgeFiles().map((f) => f.source).sort().join(',') === 'a.md,b.md');
+  const system = kb.augmentSystemPrompt('base', '苹果');
   ok('augmentSystemPrompt 包含文件清单', system.indexOf('当前可用的知识库文件') !== -1);
-  ok('augmentSystemPrompt 包含整理内容', system.indexOf('苹果') !== -1);
+  ok('augmentSystemPrompt 包含检索内容', system.indexOf('苹果') !== -1);
 
   // 4) contextUsage.estimateMessages 估算
   ok('estimateMessages 对空数组返回 0', contextUsage.estimateMessages([]) === 0);

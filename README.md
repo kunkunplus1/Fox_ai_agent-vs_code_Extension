@@ -2,7 +2,7 @@
 
 > **制作人**：Cyunkun(kunkunplus1)
 >
-> **版本**：1.1.27
+> **版本**：1.1.28
 > **适用平台**：Visual Studio Code 及其兼容衍生版本（Cursor、Trae 等 API 兼容环境亦可）
 > **开源协议**：GNU General Public License v3.0（GPL-3.0）
 
@@ -18,9 +18,9 @@
 
 ## 安装
 
-1. 获取扩展包 `fox-ai-1.1.27.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
+1. 获取扩展包 `fox-ai-1.1.28.vsix`（由源码经 `vsce package` 打包生成，或自发布渠道取得；实际文件名以你下载的版本为准）。
 2. 打开扩展视图（侧边栏方块图标，或 `Ctrl+Shift+X`），点击右上角 `…` 选择「从 VSIX 安装」。
-3. 选中 `fox-ai-1.1.27.vsix`，安装完成后按提示重新加载（Reload）窗口。
+3. 选中 `fox-ai-1.1.28.vsix`，安装完成后按提示重新加载（Reload）窗口。
 
 扩展采用纯 Node.js 内置模块实现，无需额外下载运行时依赖，安装包体积小、部署轻便。
 
@@ -131,7 +131,7 @@
 - **整理**：命令「狐狸 AI：整理知识库」，将散落的资料归纳为结构化节点。整理 AI 的传输层可用 `foxAi.knowledgeBase.organize.transport` 选择 `auto` / `openai` / `anthropic`（选 anthropic 走 Messages API，自动映射 DeepSeek/智谱/Kimi 等厂商端点；环境面板「知识库 → 传输层」下拉直接切换）。
 - **检索**：默认启用 BM25 相关度检索（中文按二元组切分），`foxAi.knowledgeBase.topK`（默认 10）调整召回量。
 - **向量语义检索（独立开关）**：环境面板「知识库 → 向量模型」可开启向量召回，与 AI 整理完全独立——只配整理模型时保持纯 BM25；同时配向量模型时向量先做语义召回、整理继续产出笔记，可勾选「与 BM25 混合排序（RRF）」融合。支持 Ollama、阿里百炼 `text-embedding-v4`、智谱 GLM、硅基流动、OpenAI、Gemini/Mistral/OpenRouter 兼容端点、LM Studio、llama.cpp server；DeepSeek / Kimi / Claude 暂无官方 embedding 接口，可在 `custom` 下自配。向量密钥存于独立 SecretStorage 键，任意失败自动回退 BM25。
-- **存储位置**：`foxAi.knowledgeBase.*` 可配置目录与整理结果；向量缓存位于工作区 `.fox-ai/kb-vec.json`。
+- **存储位置**：整理产物固定输出到 `~/.fox-ai/knowledge`、自动压缩摘要固定到 `~/.fox-ai/knowledge-2`（1.1.27 起不可自定义，避免目录漂移）；向量缓存位于工作区 `.fox-ai/kb-vec.json`。
 
 ## 用户自建技能
 
@@ -375,7 +375,7 @@ MCP（Model Context Protocol）连接器使智能体能够调用外部工具服�
 | 生图 | `foxAi.imageGen.enabled` / `.provider` / `.baseUrl` / `.apiKey` / `.model` |
 | 审查注入 | `foxAi.review.enabled` / `foxAi.review.injectTimeout` |
 | 上下文用量 | `foxAi.showContextUsage` / `foxAi.contextWindow` |
-| 自动压缩 | `foxAi.knowledgeBase.autoSummarize.enabled` / `.threshold` / `.keepRecent` / `.dir` |
+| 自动压缩 | `foxAi.knowledgeBase.autoSummarize.enabled` / `.threshold` / `.keepRecent`（目录固定 `~/.fox-ai/knowledge-2`） |
 | 存储位置 | `foxAi.sessions.storagePath` / `foxAi.memory.storagePath` / `foxAi.skills.storagePath` / `foxAi.planTasks.storagePath` |
 | 智能体 | `foxAi.agent.enabled` / `foxAi.agent.maxSteps` / `foxAi.agent.maxContinues` / `foxAi.agent.autoApprove` / `foxAi.agent.blockedCommands` / `foxAi.agent.providerProfile`（auto·deepseek·openai·claude·none） |
 | 任务清单 | `foxAi.planTask.enabled` / `.provider` / `.baseUrl` / `.model` |

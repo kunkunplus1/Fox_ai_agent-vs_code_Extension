@@ -336,7 +336,7 @@
     }
 
     bindPick('kb-pick-source', 'pickKbSource', 'kb-source');
-    bindPick('kb-pick-output', 'pickKbOutput', 'kb-output');
+    // 1.1.27：输出目录固定 ~/.fox-ai/knowledge，不允许自定义（无 pick 按钮、不保存）
     onChange('kb-key', (e) => {
       const provider = document.getElementById('kb-provider');
       post({ type: 'setKbKey', provider: provider ? provider.value : '', value: e.target.value });
@@ -347,9 +347,9 @@
       post({ type: 'organize', config: collectKbForm() });
     });
     // 勾选框/输入即时保存，避免切页后丢失
+    onChange('kb-master', saveKb);
     onChange('kb-enabled', saveKb);
     onChange('kb-source', saveKb);
-    onChange('kb-output', saveKb);
     onChange('kb-provider', saveKb);
     onChange('kb-baseurl', saveKb);
     onChange('kb-model', saveKb);
@@ -357,7 +357,7 @@
     onChange('kb-auto-enabled', saveKb);
     onChange('kb-auto-threshold', saveKb);
     onChange('kb-auto-keep', saveKb);
-    onChange('kb-auto-dir', saveKb);
+    // 1.1.27：kb-output / kb-auto-dir 固定目录，不再绑定保存
     onClick('kb-rebuild', () => post({ type: 'rebuildKb' }));
 
     /* ---- 向量模型（语义检索）：与整理 AI 完全独立的一组控件 ---- */
@@ -435,9 +435,10 @@
   // 知识库标签页交互
   function collectKbForm() {
     return {
+      master: document.getElementById('kb-master').checked,
       enabled: document.getElementById('kb-enabled').checked,
       source: document.getElementById('kb-source').value,
-      output: document.getElementById('kb-output').value,
+      // 1.1.27：输出目录固定 ~/.fox-ai/knowledge（后端忽略自定义），不再随表单提交
       provider: document.getElementById('kb-provider').value,
       baseurl: document.getElementById('kb-baseurl').value,
       model: document.getElementById('kb-model').value,
@@ -446,7 +447,6 @@
       autoEnabled: document.getElementById('kb-auto-enabled').checked,
       autoThreshold: document.getElementById('kb-auto-threshold').value,
       autoKeep: document.getElementById('kb-auto-keep').value,
-      autoDir: document.getElementById('kb-auto-dir').value,
       // 向量模型（语义检索）—— 与上面的整理 AI 互不影响
       vecEnabled: val('kb-vec-enabled', 'checked', false),
       vecProvider: val('kb-vec-provider', 'value', 'ollama'),
@@ -945,8 +945,10 @@
           log.textContent = '❌ 调用失败：' + m.command + (m.error ? '\\n' + m.error : '');
         }
       } else if (m.type === 'kbInit') {
+        setVal('kb-master', 'checked', !!m.master);
         document.getElementById('kb-enabled').checked = !!m.enabled;
         document.getElementById('kb-source').value = m.source || '';
+        // 1.1.27：输出目录固定，展示后端实际目录
         document.getElementById('kb-output').value = m.output || '';
         document.getElementById('kb-provider').value = m.provider || 'llamacpp';
         document.getElementById('kb-baseurl').value = m.baseurl || '';

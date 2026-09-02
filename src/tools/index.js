@@ -548,7 +548,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         name: { type: 'string', description: '要激活的技能名' },
-        query: { type: 'string', description: '本次用户需求，会一并交给技能指导参考' }
+        query: { type: 'string', description: '本次用户需求，会一并交给技能指导参考' },
+        organize: { type: 'boolean', description: '（仅 _knowledge_base）true=只检索「AI 整理后」目录，false=检索全部原文；不传则按知识库页面设置' },
+        vector: { type: 'boolean', description: '（仅 _knowledge_base）true=强制用向量语义检索，false=跳过向量走关键词；不传则按知识库页面设置' }
       },
       required: ['name']
     },
@@ -561,13 +563,23 @@ const TOOLS = [
         try {
           const q = String(a.query || '').trim() || '全部';
           const kb = require('../knowledgeBase');
-          const res = await kb.augmentSystemPromptAsync('', q, c && c.sessionId, {
+          // 1.1.27：页面总开关（knowledgeBase.enabled）一票否决——没开则插件模型也用不了工具
+          if (!kb.isEnabled()) {
+            return '知识库未启用：请在「环境面板 → 知识库」打开「启用本地知识库」总开关（或开启整理/自动压缩/向量语义检索任一子开关）后重试。';
+          }
+          const o = {
             context: c && c.context,
             onLog: () => {}
-          });
+          };
+          // 模型可通过输入参数覆盖本次检索模式；不传则按页面设置（默认行为）
+          if (typeof a.organize === 'boolean') o.forceOrganize = a.organize;
+          if (typeof a.vector === 'boolean') o.forceVector = a.vector;
+          if (a.vector === false) o.noVector = true;
+          const res = await kb.augmentSystemPromptAsync('', q, c && c.sessionId, o);
           // res 是（原 system + 知识块）拼接结果；这里 basePrompt 为空 → 返回的就是知识块本身
           const clean = String(res || '').replace(/^\s*=== 系统指令[\s\S]*?===\s*/, '').trim();
-          return '已激活内置技能「知识库检索」。检索 query：' + q + '\n\n'
+          const mode = o.forceVector ? '向量语义检索' : (o.noVector ? '关键词检索' : (o.forceOrganize ? '整理后目录' : '默认模式'));
+          return '已激活内置技能「知识库检索」。检索 query：' + q + '（模式：' + mode + '）\n\n'
             + '【知识库命中内容】\n' + (clean || '（知识库为空或无命中，可换关键词重试）')
             + '\n\n请结合以上知识回答用户问题；若知识不足以回答，明确说明并基于你的通用知识补充。';
         } catch (e) {

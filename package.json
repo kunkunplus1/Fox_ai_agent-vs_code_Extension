@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.27",
+  "version": "1.1.28",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -1408,8 +1408,7 @@
           },
           "foxAi.knowledgeBase.enabled": {
             "type": "boolean",
-            "default": false,
-            "description": "%foxai.n171%"
+            "description": "%foxai.n171%（不设默认值：未设置时按子开关判断，显式关闭则整个知识库禁用）"
           },
           "foxAi.knowledgeBase.paths": {
             "type": "array",
@@ -1458,7 +1457,8 @@
             "type": "string",
             "default": "",
             "order": 12,
-            "description": "%foxai.n177%"
+            "description": "%foxai.n177%",
+            "deprecationMessage": "已固定为 ~/.fox-ai/knowledge，此设置不再生效。"
           },
           "foxAi.knowledgeBase.organize.provider": {
             "type": "string",
@@ -1542,7 +1542,8 @@
           "foxAi.knowledgeBase.autoSummarize.dir": {
             "type": "string",
             "default": "",
-            "description": "%foxai.n185%"
+            "description": "%foxai.n185%",
+            "deprecationMessage": "已固定为 ~/.fox-ai/knowledge-2，此设置不再生效。"
           },
           "foxAi.knowledgeBase.bm25Enabled": {
             "type": "boolean",

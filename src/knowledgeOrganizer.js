@@ -44,17 +44,13 @@ function expandHome(p) {
   return p;
 }
 
-// 整理后输出目录：默认放在用户数据目录下，agent 通过 RAG 读取它
-function defaultOutputDir(custom) {
-  const c = (custom || '').trim();
-  if (c) return expandHome(c);
+// 整理后输出目录：固定用户数据目录下，agent 通过 RAG 读取它（1.1.27：不允许自定义，避免目录漂移）
+function defaultOutputDir() {
   return path.join(os.homedir(), '.fox-ai', 'knowledge');
 }
 
-// 自动压缩摘要目录（知识库-2）：默认放在用户数据目录下，agent 通过 RAG 读取它
-function defaultAutoSummaryDir(custom) {
-  const c = (custom || '').trim();
-  if (c) return expandHome(c);
+// 自动压缩摘要目录（知识库-2）：固定用户数据目录下，agent 通过 RAG 读取它（1.1.27：不允许自定义）
+function defaultAutoSummaryDir() {
   return path.join(os.homedir(), '.fox-ai', 'knowledge-2');
 }
 
@@ -280,12 +276,11 @@ function sessionSummaryPath(dir, sessionId) {
  * @param {Array} messages 要压缩的对话消息数组（角色 + 内容）
  * @returns {Promise<string|null>} 写入的文件路径；无需压缩或失败时返回 null
  */
-async function summarizeConversation(context, messages, { onLog, signal, sessionId, dir, protocol } = {}) {
+async function summarizeConversation(context, messages, { onLog, signal, sessionId, protocol } = {}) {
   if (!Array.isArray(messages) || messages.length < 2) return null;
 
-  const cfg = config.conf().get('knowledgeBase.autoSummarize', {}) || {};
   const organizer = await resolveOrganizer(context);
-  const summaryDir = dir || defaultAutoSummaryDir(cfg.dir);
+  const summaryDir = defaultAutoSummaryDir();
   fs.mkdirSync(summaryDir, { recursive: true });
 
   // 组装对话文本：优先走「类型感知专用预处理」（本地、零模型开销、最大化压缩冗余），
@@ -400,7 +395,7 @@ async function organize(context, { onLog, signal } = {}) {
   if (!sourcePaths.length) throw new Error('未设置整理源目录（foxAi.knowledgeBase.organize.sourcePaths）');
 
   const organizer = await resolveOrganizer(context);
-  const outputDir = defaultOutputDir(cfg.outputDir);
+  const outputDir = defaultOutputDir();
   fs.mkdirSync(outputDir, { recursive: true });
 
   // 非本地 provider：明文提示后弹一次确认

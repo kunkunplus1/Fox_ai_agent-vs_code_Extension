@@ -31,7 +31,11 @@ function config() {
 
 function isEnabled() {
   const cfg = config();
-  if (cfg.enabled) return true;
+  // 1.1.27：顶层总开关（UI 页面「启用本地知识库」）。显式关闭时一票否决——
+  // 总开关关掉后，即使子开关（整理/压缩/向量）开着，插件模型也用不了知识库工具。
+  // 注意：只认「显式 false」（undefined 视为未设置，回退子开关判断，兼容老用户只开子开关）。
+  if (cfg.enabled === false) return false;
+  if (cfg.enabled === true) return true;
   if (cfg.organize && cfg.organize.enabled) return true;
   if (cfg.autoSummarize && cfg.autoSummarize.enabled) return true;
   // 只开了向量模型（语义检索）也算知识库启用
@@ -193,7 +197,7 @@ function listFiles(paths, sessionId) {
   const files = [];
   const cfg = config();
   const as = cfg.autoSummarize || {};
-  const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
+  const kb2Dir = as.enabled ? org.defaultAutoSummaryDir() : '';
   for (const p of paths) {
     let stat;
     try {
@@ -287,7 +291,7 @@ function collectChunks(sessionId) {
   // 整理产物目录：只要存在就纳入（无论「AI 整理」开关是否开启）。
   // 关键修复：关掉整理后，残留的历史笔记仍在产物目录里，不应让向量检索突然失明
   // ——否则会出现「没有整理模型情况下，向量内容没识别到」。
-  const out = org.defaultOutputDir(organize.outputDir);
+  const out = org.defaultOutputDir();
   if (fs.existsSync(out)) paths.push(out);
   // 用户显式配置的源目录：始终纳入，是向量/BM25 的独立内容来源，不依赖整理开关。
   if (Array.isArray(cfg.paths) && cfg.paths.length) {
@@ -301,7 +305,7 @@ function collectChunks(sessionId) {
   }
   const as = cfg.autoSummarize || {};
   if (as.enabled) {
-    const dir = org.defaultAutoSummaryDir(as.dir);
+    const dir = org.defaultAutoSummaryDir();
     if (fs.existsSync(dir)) paths.push(dir);
   }
   if (!paths.length) {
@@ -427,7 +431,7 @@ function listOtherSessionSummaries(currentSessionId) {
   const cfg = config();
   const as = cfg.autoSummarize || {};
   if (!as.enabled) return [];
-  const dir = org.defaultAutoSummaryDir(as.dir);
+  const dir = org.defaultAutoSummaryDir();
   if (!fs.existsSync(dir)) return [];
   const currentSafe = String(currentSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
   const out = [];
@@ -457,7 +461,7 @@ async function requestSessionAccess(sessionId, currentSessionId) {
 
   const cfg = config();
   const as = cfg.autoSummarize || {};
-  const dir = org.defaultAutoSummaryDir(as.dir);
+  const dir = org.defaultAutoSummaryDir();
   const file = path.join(dir, `${safeId}-summary.md`);
   if (!fs.existsSync(file)) {
     return { allowed: false, sessionId: safeId, reason: '未找到该会话的压缩摘要文件' };
@@ -494,7 +498,7 @@ function listKnowledgeFiles(sessionId) {
   const as = cfg.autoSummarize || {};
   const files = [];
   // 整理产物目录：只要存在就纳入（无论「AI 整理」开关状态），避免「关整理后残留笔记从文件列表消失」
-  const out = org.defaultOutputDir(organize.outputDir);
+  const out = org.defaultOutputDir();
   if (fs.existsSync(out)) {
     for (const f of walkDir(out)) files.push({ file: f, source: path.basename(f), kb2: false });
   }
@@ -522,7 +526,7 @@ function listKnowledgeFiles(sessionId) {
     }
   }
   if (as.enabled) {
-    const dir = org.defaultAutoSummaryDir(as.dir);
+    const dir = org.defaultAutoSummaryDir();
     if (fs.existsSync(dir)) {
       for (const f of walkDir(dir)) {
         if (!isAllowedSummaryFile(f, sessionId)) continue;
@@ -564,8 +568,9 @@ function retrieve(query, maxChars, sessionId, opts) {
   };
 
   // 整理模式：整理后的文件数量通常可控，直接按文件排序全量注入
-  if (organize.enabled) {
-    const outDir = org.defaultOutputDir(organize.outputDir);
+  // 1.1.27：forceOrganize 覆盖——模型传 organize=true 时即使页面未开整理也只看整理产物
+  if (organize.enabled || (opts && opts.forceOrganize)) {
+    const outDir = org.defaultOutputDir();
     const out = [];
     let used = 0;
     const orgChunks = chunks.filter((c) => c.file.startsWith(outDir + path.sep));
@@ -576,7 +581,7 @@ function retrieve(query, maxChars, sessionId, opts) {
       pushSrc(c);
     }
     const as = cfg.autoSummarize || {};
-    const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
+    const kb2Dir = as.enabled ? org.defaultAutoSummaryDir() : '';
     const kb2Chunks = kb2Dir ? chunks.filter((c) => c.file.startsWith(kb2Dir + path.sep)) : [];
     if (kb2Chunks.length) {
       const scored = rankChunks(kb2Chunks, query, bm25Enabled, topK);
@@ -788,11 +793,14 @@ function clearVectorCache() {
   return { ok: true };
 }
 
-/** 解析向量模型配置；未启用 / 配不全返回 null（上层直接走 BM25） */
-async function resolveVectorConfig(context) {
+/** 解析向量模型配置；未启用 / 配不全返回 null（上层直接走 BM25）。
+ *  @param {{force?:boolean}} [opts] force=true 时忽略 embedding.enabled 开关（工具传 vector:true 强制尝试），
+ *   但 baseUrl/model 仍须配置完整，多模态模型仍拒绝。 */
+async function resolveVectorConfig(context, opts) {
   try {
+    const force = !!(opts && opts.force);
     const e = await emb.resolveEmbeddingConfig(context);
-    if (!e.enabled) {
+    if (!e.enabled && !force) {
       vlog('resolveVectorConfig：向量检索开关未开启（embedding.enabled=false）→ 走 BM25');
       return null;
     }
@@ -803,7 +811,7 @@ async function resolveVectorConfig(context) {
       );
       return null;
     }
-    if (!emb.isEmbedUsable(e)) {
+    if (!emb.isEmbedUsable(Object.assign({}, e, { enabled: force || !!e.enabled }))) {
       vlog(
         'resolveVectorConfig：向量配置不可用 → 走 BM25。' +
           `enabled=${e.enabled} kind=${e.kind} baseUrl=${e.baseUrl || '(空)'} model=${e.model || '(空)'} provider=${e.pid}` +
@@ -959,55 +967,54 @@ async function retrieveAsync(query, maxChars, sessionId, opts) {
       o.onSources(uniq);
     }
   };
-  vlog(`retrieveAsync：入口 query="${String(query || '').slice(0, 60)}" maxChars=${maxChars} sessionId=${sessionId || '(无)'} context=${o.context ? '有' : '无'}`);
-  const e = await resolveVectorConfig(o.context);
-  if (!e) {
-    vlog('retrieveAsync：向量配置不可用 → 走同步 BM25 retrieve');
-    return retrieve(query, maxChars, sessionId, o);
-  }
+  vlog(`retrieveAsync：入口 query="${String(query || '').slice(0, 60)}" maxChars=${maxChars} sessionId=${sessionId || '(无)'} context=${o.context ? '有' : '无'} forceOrganize=${!!o.forceOrganize} forceVector=${!!o.forceVector} noVector=${!!o.noVector}`);
+  // 1.1.27：工具参数 override——noVector 跳过向量；forceVector 忽略页面向量开关强行尝试（配置仍须可用）
+  if (!o.noVector) {
+    const e = await resolveVectorConfig(o.context, o.forceVector ? { force: true } : undefined);
+    if (e) {
+      const cfg = config();
+      const organize = cfg.organize || {};
+      const chunks = collectChunks(sessionId);
+      if (!chunks.length) {
+        vlog('retrieveAsync：无知识库片段 → 返回空');
+        return '';
+      }
 
-  const cfg = config();
-  const organize = cfg.organize || {};
-  const chunks = collectChunks(sessionId);
-  if (!chunks.length) {
-    vlog('retrieveAsync：无知识库片段 → 返回空');
-    return '';
-  }
+      const limit = Math.max(0, maxChars || 8000);
+      const topK = Math.max(3, Math.min(30, cfg.topK || 10));
 
-  const limit = Math.max(0, maxChars || 8000);
-  const topK = Math.max(3, Math.min(30, cfg.topK || 10));
+      // 候选池：整理模式只看「整理后的产物」+ 知识库-2；否则全部片段
+      // 1.1.27：forceOrganize 覆盖——模型传 organize=true 时即使页面未开整理也只看整理产物
+      let pool = chunks;
+      if (organize.enabled || o.forceOrganize) {
+        const outDir = org.defaultOutputDir();
+        const as = cfg.autoSummarize || {};
+        const kb2Dir = as.enabled ? org.defaultAutoSummaryDir() : '';
+        pool = chunks.filter(
+          (c) => c.file.startsWith(outDir + path.sep) || (kb2Dir && c.file.startsWith(kb2Dir + path.sep))
+        );
+        if (!pool.length) pool = chunks;
+      }
+      vlog(`retrieveAsync：候选池 ${pool.length}/${chunks.length} 片段（整理模式=${!!organize.enabled || !!o.forceOrganize}）`);
 
-  // 候选池：整理模式只看「整理后的产物」+ 知识库-2；否则全部片段
-  let pool = chunks;
-  if (organize.enabled) {
-    const outDir = org.defaultOutputDir(organize.outputDir);
-    const as = cfg.autoSummarize || {};
-    const kb2Dir = as.enabled ? org.defaultAutoSummaryDir(as.dir) : '';
-    pool = chunks.filter(
-      (c) => c.file.startsWith(outDir + path.sep) || (kb2Dir && c.file.startsWith(kb2Dir + path.sep))
-    );
-    if (!pool.length) pool = chunks;
-  }
-  vlog(`retrieveAsync：候选池 ${pool.length}/${chunks.length} 片段（整理模式=${!!organize.enabled}）`);
+      loadVecCache(embedSignature(e));
 
-  loadVecCache(embedSignature(e));
-
-  try {
-    const started = Date.now();
-    const { list, covered, total } = await rankChunksSemantic(pool, query, e, topK, e.hybrid !== false, o);
-    if (!list.length) {
-      vlog('retrieveAsync：语义召回为空 → 回退 BM25');
-      return retrieve(query, maxChars, sessionId, o);
-    }
-    const out = [];
-    let used = 0;
-    for (const c of list) {
-      if (used + c.text.length > limit) break;
-      const rel = typeof c.sem === 'number' && c.sem ? c.sem : c.score;
-      out.push(`【来源：${c.source} · 语义相关度 ${Number(rel).toFixed(2)}】\n${c.text.trim()}`);
-      used += c.text.length + 30;
-      pushSrc(c);
-    }
+      try {
+        const started = Date.now();
+        const { list, covered, total } = await rankChunksSemantic(pool, query, e, topK, e.hybrid !== false, o);
+        if (!list.length) {
+          vlog('retrieveAsync：语义召回为空 → 回退 BM25');
+          return retrieve(query, maxChars, sessionId, o);
+        }
+        const out = [];
+        let used = 0;
+        for (const c of list) {
+          if (used + c.text.length > limit) break;
+          const rel = typeof c.sem === 'number' && c.sem ? c.sem : c.score;
+          out.push(`【来源：${c.source} · 语义相关度 ${Number(rel).toFixed(2)}】\n${c.text.trim()}`);
+          used += c.text.length + 30;
+          pushSrc(c);
+        }
     const stat =
       `🧭 向量检索：${e.label} / ${e.model}（${e.kind === 'ollama' ? 'Ollama 原生' : 'OpenAI 兼容'}）` +
       `，候选 ${total} 片段、已向量化 ${covered}，命中 ${out.length} 段，耗时 ${Date.now() - started}ms` +
@@ -1025,6 +1032,13 @@ async function retrieveAsync(query, maxChars, sessionId, opts) {
     if (o.onLog) o.onLog(`⚠️ 向量检索失败，已回退关键词检索：${msg}`);
     return retrieve(query, maxChars, sessionId, o);
   }
+    }
+    // 1.1.27：向量不可用（未开/配不全）→ 回退 BM25；forceVector 且配置不可用时同样回退并说明
+    vlog('retrieveAsync：向量不可用 → 回退 BM25' + (o.forceVector ? '（forceVector 但配置不可用）' : ''));
+    return retrieve(query, maxChars, sessionId, o);
+  }
+  // 1.1.27：noVector=true（模型指定跳过向量）→ 直接走 BM25
+  return retrieve(query, maxChars, sessionId, o);
 }
 
 /**
