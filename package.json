@@ -2,7 +2,7 @@
   "name": "fox-ai",
   "displayName": "狐狸 AI 智能体",
   "description": "VS Code 里的编程智能体：接本地 llama.cpp / Ollama 或 DeepSeek、智谱、通义、Kimi、硅基流动等国内 API，能直接读写工作区文件、执行终端命令、读取报错并自动修复，全过程可暂停 / 继续 / 取消。",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "publisher": "foxai",
   "license": "GPL-3.0",
   "icon": "media/fox-icon.png",
@@ -36,7 +36,7 @@
     "onStartupFinished"
   ],
   "scripts": {
-    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/grammarProbe.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js && node test/staticPrefix.js && node test/providerProfiles.js && node test/layeredContext.js"
+    "test": "node test/smoke.js && node test/officialSearchFormat.js && node test/stealthFetch.js && node test/imageOutput.js && node test/imageGen.js && node test/imageGenVendor.js && node test/requestJsonExtra.js && node test/router.js && node test/toolSelect.js && node test/timeoutGuard.js && node test/planner.js && node test/selfConsistency.js && node test/memory.js && node test/log.js && node test/autoContinue.js && node test/reasoningParams.js && node test/inline.js && node test/inlineConfig.js && node test/knowledgeBaseSession.js && node test/compressMeta.js && node test/compress.js && node test/autoSummarize.js && node test/localModelProtocol.js && node test/localModelSmart.js && node test/configWeak.js && node test/weakModelMode.js && node test/failover.js && node test/sandbox.js && node test/approvalState.js && node test/planTasksClear.js && node test/render.js && node test/glob.js && node test/embedding.js && node test/knowledgeBase.js && node test/nativeSearch.js && node test/clientSearchFallback.js && node test/staticPrefix.js && node test/providerProfiles.js && node test/layeredContext.js"
   },
   "contributes": {
     "viewsContainers": {
@@ -1112,12 +1112,12 @@
           "foxAi.automations.webhookPort": {
             "type": "number",
             "default": 0,
-            "markdownDescription": "本地 webhook 监听端口（0 = 不开启）。开启后只收指令、绝不回传任何内部资料（知识库/记忆等）。"
+            "markdownDescription": "本地 webhook 监听端口（0 = 不开启）。只监听 127.0.0.1（不暴露到局域网）；开启后只收指令、绝不回传任何内部资料（知识库/记忆等）。"
           },
           "foxAi.automations.webhookSecret": {
             "type": "string",
             "default": "",
-            "markdownDescription": "webhook 校验密钥；调用方需在 body 带相同 secret 才被接受（避免未授权触发）。"
+            "markdownDescription": "webhook 校验密钥（**必填，至少 16 位随机字符串**；未配置或强度不足时 webhook 拒绝启动）。调用方需在请求 body 带相同的 secret 才被接受，用于防止网页 CSRF 与局域网未授权触发。"
           }
         }
       },

@@ -125,8 +125,25 @@ function installNpmLocal(pkg, title, modulesPath) {
   );
 }
 
+/** 若用户仍把 foxAi.apiKey 明文存在设置里，一次性提示迁移到系统密钥链（SecretStorage）。
+ * 明文 settings.json 可能随仓库提交/云同步外泄；不打断使用，只在首次检测到时提醒一次。 */
+function maybeWarnPlainApiKey(context) {
+  try {
+    if (!context || !context.globalState) return;
+    if (context.globalState.get('foxAi.plainApiKeyWarnedOnce')) return;
+    const c = vscode.workspace.getConfiguration('foxAi');
+    const plain = String(c.get('apiKey') || '').trim();
+    if (!plain) return;
+    context.globalState.update('foxAi.plainApiKeyWarnedOnce', true);
+    vscode.window.showWarningMessage(
+      tw('[狐狸 AI] 检测到 foxAi.apiKey 以明文存于设置文件。为避免随仓库/同步外泄，建议删除该设置项，改从配置界面重新保存密钥（将存入系统密钥链 SecretStorage）。')
+    );
+  } catch (_) { /* 提示失败不阻塞启动 */ }
+}
+
 function activate(context) {
   ws.registerDiffProvider(context);
+  maybeWarnPlainApiKey(context);
 
   chatProvider = new ChatViewProvider(context);
   // 扩展停用时统一释放 provider 持有的监听器（侧边栏 webview / 可移动面板）
@@ -240,14 +257,24 @@ function activate(context) {
     _autoSched.start();
     const port = Number(cfg.get('automations.webhookPort', 0));
     if (port > 0) {
-      const secret = cfg.get('automations.webhookSecret', '') || '';
-      _autoServer = automations.createWebhookServer({
-        port,
-        secret,
-        allowedIds: _autoStore.list().map((x) => x.id),
-        dispatch: (id) => { const a = _autoStore.get(id); autoFire(a); return require('crypto').randomBytes(6).toString('hex'); }
-      });
-      console.log('[狐狸 AI] 自动化 webhook 已监听端口', port);
+      const secret = String(cfg.get('automations.webhookSecret', '') || '');
+      const minLen = automations.MIN_SECRET_LEN || 16;
+      // 安全红线：没有足够强度的 secret 就绝不监听。
+      // 否则任意网页（CSRF）或局域网内任意主机都能 POST 触发自动化任务 → 可被驱动去读写文件/执行命令。
+      if (!secret || secret.length < minLen) {
+        const msg = '[狐狸 AI] 自动化 webhook 未启动：已配置 webhookPort，但未配置足够强度的 foxAi.automations.webhookSecret（至少 ' + minLen + ' 位随机字符串）。';
+        console.warn(msg);
+        vscode.window.showWarningMessage(tw(msg));
+      } else {
+        _autoServer = automations.createWebhookServer({
+          port,
+          secret,
+          host: '127.0.0.1', // 只监听回环，不暴露到局域网
+          allowedIds: _autoStore.list().map((x) => x.id),
+          dispatch: (id) => { const a = _autoStore.get(id); autoFire(a); return require('crypto').randomBytes(6).toString('hex'); }
+        });
+        console.log('[狐狸 AI] 自动化 webhook 已监听 127.0.0.1:' + port);
+      }
     }
     console.log('[狐狸 AI] 本地自动化调度已启动，共', _autoStore.enabledList().length, '个启用项');
   }
@@ -969,7 +996,7 @@ function activate(context) {
     await vscode.window.showTextDocument(doc);
     vscode.window.showInformationMessage(
       (created ? tw('已创建自动化示例文件，编辑后保存即生效。') : tw('自动化定义文件已打开。')) +
-      tw('需在设置开启 foxAi.automations.enabled；webhook 需配置 webhookPort 与 webhookSecret。')
+      tw('需在设置开启 foxAi.automations.enabled；webhook 需配置 webhookPort 与 webhookSecret（至少 {0} 位，仅监听 127.0.0.1）。', String(require('./src/automations').MIN_SECRET_LEN || 16))
     );
   });
 

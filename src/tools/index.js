@@ -1283,7 +1283,7 @@ ${subagents.renderRoleCatalog()}
       const fs = require('fs');
       const path = require('path');
       const os = require('os');
-      const { execSync } = require('child_process');
+      const { execFileSync } = require('child_process');
       const p = String(a.path || '').trim();
       if (!p) throw new Error('path 不能为空');
       let abs = p;
@@ -1297,7 +1297,12 @@ ${subagents.renderRoleCatalog()}
       // 用 python 内置 zipfile + 自定义解析（无损，跨平台，无需第三方库）
       const pyScript = path.join(os.tmpdir(), 'fx_convert_' + Date.now() + '.py');
       const kind = supported[ext];
-      const outFormat = String(a.format || 'text').toLowerCase();
+      // 安全：format 由模型/工具参数传入，必须白名单收口。
+      // 该值原本会直接拼进 execSync 的 shell 命令行（未加引号），
+      // 被提示注入诱导成 `text; <任意命令>` 即可让「只读提取」升级为命令执行。
+      const CONVERT_FORMATS = ['text', 'markdown', 'csv'];
+      const askedFormat = String(a.format == null ? 'text' : a.format).trim().toLowerCase();
+      const outFormat = CONVERT_FORMATS.includes(askedFormat) ? askedFormat : 'text';
       const pyCode = [
         'import sys, zipfile, re, json',
         'from xml.etree import ElementTree as ET',
@@ -1375,14 +1380,16 @@ ${subagents.renderRoleCatalog()}
       let resultText = '';
       try {
         const py = process.platform === 'win32' ? 'python' : 'python3';
-        const raw = execSync(`"${py}" "${pyScript}" "${abs}" ${kind} ${outFormat}`, {
+        // 安全：数组参数 + execFileSync，不经过 shell 解析，杜绝命令注入
+        // （原实现为字符串拼接 execSync，参数里的 ; && | 等会被 shell 当命令执行）
+        const raw = execFileSync(py, [pyScript, abs, kind, outFormat], {
           encoding: 'utf8', timeout: 60000, maxBuffer: 50 * 1024 * 1024
         }).trim();
         resultText = JSON.parse(raw);
       } catch (e) {
         // 尝试 fallback python 可执行名
         try {
-          const raw = execSync(`python3 "${pyScript}" "${abs}" ${kind} ${outFormat}`, {
+          const raw = execFileSync('python3', [pyScript, abs, kind, outFormat], {
             encoding: 'utf8', timeout: 60000, maxBuffer: 50 * 1024 * 1024
           }).trim();
           resultText = JSON.parse(raw);

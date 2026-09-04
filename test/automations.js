@@ -59,22 +59,51 @@ setTimeout(() => {
   ok('interval 调度触发 onFire', fired >= 1);
 
   console.log('自动化: webhook 红线');
+  const SEC = 'topsecret-topsecret-01'; // ≥ MIN_SECRET_LEN(16)
   let dispatched = null;
   const h = (body, secret, allowedIds) => autom.handleWebhook({ body, secret, allowedIds, dispatch: (id, args) => { dispatched = { id, args }; return 'run-123'; } });
-  let r = h(JSON.stringify({ id: 'a1', args: { x: 1 } }));
+  // 正确 secret + 已知 id → 200
+  let r = h(JSON.stringify({ id: 'a1', args: { x: 1 }, secret: SEC }), SEC, ['a1']);
   ok('合法请求回执 ok+runId', r.statusCode === 200 && r.body.ok === true && r.body.runId === 'run-123');
   ok('dispatch 被调用(id+args)', dispatched && dispatched.id === 'a1' && dispatched.args.x === 1);
-  r = h(JSON.stringify({ id: 'unknown' }), null, ['a1']);
+  // 已知 id 但不在白名单 → 404
+  r = h(JSON.stringify({ id: 'unknown', secret: SEC }), SEC, ['a1']);
   ok('未知 id 返回 404', r.statusCode === 404 && r.body.ok === false);
-  r = h(JSON.stringify({ id: 'a1' }), 'topsecret', ['a1']);
+  // secret 相关：错误 / 缺失 / 服务端未配 / 强度不足，一律 403
+  r = h(JSON.stringify({ id: 'a1', secret: 'wrong-secret-value-x' }), SEC, ['a1']);
   ok('错误 secret 返回 403', r.statusCode === 403);
-  r = h('not json', null, ['a1']);
+  r = h(JSON.stringify({ id: 'a1' }), SEC, ['a1']);
+  ok('请求缺少 secret 返回 403', r.statusCode === 403);
+  r = h(JSON.stringify({ id: 'a1', secret: SEC }), '', ['a1']);
+  ok('服务端未配 secret 一律 403（不裸奔）', r.statusCode === 403);
+  r = h(JSON.stringify({ id: 'a1', secret: 'short' }), 'short', ['a1']);
+  ok('secret 强度不足(<16 位)拒绝', r.statusCode === 403);
+  // 白名单为空：拒绝全部；未认证先于 id 校验（不可用于枚举 id）
+  r = h(JSON.stringify({ id: 'a1', secret: SEC }), SEC, []);
+  ok('allowedIds 为空拒绝全部', r.statusCode === 404);
+  r = h(JSON.stringify({ id: 'a1', secret: 'wrong-secret-value-x' }), SEC, []);
+  ok('未认证请求无法探测 id（403 优先于 404）', r.statusCode === 403);
+  r = h('not json', SEC, ['a1']);
   ok('坏 JSON 返回 400', r.statusCode === 400);
   // 红线：响应体绝不含“内部”字样
-  r = h(JSON.stringify({ id: 'a1' }));
+  r = h(JSON.stringify({ id: 'a1', secret: SEC }), SEC, ['a1']);
   ok('响应只回执、无内部内容', JSON.stringify(r.body).indexOf('knowledge') === -1 && JSON.stringify(r.body).indexOf('memory') === -1);
 
-  console.log('\n自动化测试: ' + pass + ' 通过, ' + fail + ' 失败');
-  if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-  process.exit(fail ? 1 : 0);
+  const finish = () => {
+    console.log('\n自动化测试: ' + pass + ' 通过, ' + fail + ' 失败');
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    process.exit(fail ? 1 : 0);
+  };
+  // 安全：webhook 服务器必须只监听回环（不得绑 0.0.0.0 暴露到局域网）
+  console.log('自动化: webhook 监听地址');
+  let srv = null;
+  try { srv = autom.createWebhookServer({ port: 0, secret: SEC, allowedIds: ['a1'], dispatch: () => 'x' }); }
+  catch (e) { ok('createWebhookServer 可创建', false); finish(); return; }
+  const checkAddr = () => {
+    const ad = srv.address();
+    ok('webhook 只监听 127.0.0.1', ad && ad.address === '127.0.0.1');
+    try { srv.close(() => finish()); } catch (_) { finish(); }
+  };
+  if (srv.listening) checkAddr();
+  else srv.on('listening', checkAddr);
 }, 120);

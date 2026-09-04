@@ -1026,6 +1026,9 @@ class ChatViewProvider {
 
     const nonce = nonceStr();
     let contentHtml = '';
+    // 安全：只有「HTML 预览」这一分支才需要执行文件自带的脚本（这是预览网页的功能前提）；
+    // 图片 / Markdown 分支一律使用 nonce 严格 CSP，杜绝内联脚本与 eval。
+    let allowFileScript = false;
     if (isImage) {
       // 图片：转成 data URI 内嵌（简单可靠，不依赖 file:// 权限）
       const buf = fs.readFileSync(abs);
@@ -1038,13 +1041,21 @@ class ChatViewProvider {
     } else {
       // HTML / 其他：整文件内嵌（脚本可用，方便实时预览网页）
       contentHtml = fs.readFileSync(abs, 'utf8');
+      allowFileScript = true;
     }
+    // 脚本策略：HTML 预览保留内联脚本（去掉 'unsafe-eval'，eval 不是预览必需）；
+    // 其余分支用 nonce 严格策略。
+    const cspScriptSrc = allowFileScript ? "'unsafe-inline'" : `'nonce-${nonce}'`;
+    const artifactCsp = `default-src 'none'; img-src ${panel.webview.cspSource} data: https:; style-src 'unsafe-inline' ${panel.webview.cspSource}; script-src ${cspScriptSrc}; font-src ${panel.webview.cspSource} data:;`;
+    const untrustedTip = allowFileScript
+      ? '<div id="untrusted-tip">HTML 预览：已启用文件内脚本，仅预览你信任的文件。</div>'
+      : '';
 
     panel.webview.html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${panel.webview.cspSource} data: https:; style-src 'unsafe-inline' ${panel.webview.cspSource}; script-src 'unsafe-inline' 'unsafe-eval'; font-src ${panel.webview.cspSource} data:;">
+<meta http-equiv="Content-Security-Policy" content="${artifactCsp}">
 <style>
   html, body { height:100%; margin:0; display:flex; flex-direction:column; background:#fff; color:#333; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   #content { flex:1; overflow:auto; }
@@ -1064,9 +1075,11 @@ class ChatViewProvider {
   #feedback .status { font-size:12px; color:#2d8cf0; margin-top:6px; display:none; }
   #feedback .status.ok { color:#18a058; }
   #feedback .status.err { color:#d03050; }
+  #untrusted-tip { background:#fff7e6; color:#8a5a00; font-size:12px; padding:6px 12px; border-bottom:1px solid #ffe0a3; }
 </style>
 </head>
 <body>
+${untrustedTip}
 <div id="content">${contentHtml}</div>
 <div id="feedback">
   <div class="hint">发现明显问题？输入修改意见，插件会按你的反馈重新生成这份产出物：</div>
@@ -1076,7 +1089,7 @@ class ChatViewProvider {
   </div>
   <div class="status" id="fbStatus"></div>
 </div>
-<script>
+<script nonce="${nonce}">
 (function () {
   const vscode = acquireVsCodeApi();
   const text = document.getElementById('fbText');
@@ -1096,6 +1109,9 @@ class ChatViewProvider {
 </body>
 </html>`;
     panel.title = '预览 · ' + path.basename(abs);
+    // 面板会被复用（每次预览不同文件都写回同一 panel），
+    // 这里同步记录「当前预览的真实路径」，供反馈回调使用（不信任前端传值）。
+    panel._currentAbs = abs;
 
     // ★ 预览反馈 → 让插件（主代理）按用户意见重新修改产出物
     // 复用面板的 onDidReceiveMessage（一次性注册，dispose 时随面板释放）
@@ -1106,7 +1122,9 @@ class ChatViewProvider {
           if (!msg || msg.type !== 'artifactFeedback') return;
           const feedback = String(msg.feedback || '').trim();
           if (!feedback) return;
-          const target = String(msg.path || abs);
+          // 安全：目标文件以服务端记录为准（面板复用时闭包里的 abs 会过期，故用面板上的当前路径）。
+          // 不信任前端传来的 msg.path —— 否则预览不可信 HTML 时可诱导主代理去改任意路径的文件。
+          const target = String((panel && panel._currentAbs) || abs);
           // 把修改意见作为新的用户消息发给主代理，让它直接 edit 目标文件
           await this.ask(
             `【预览修改请求】用户在看预览时发现产出物「${target}」有问题，要求修改：\n${feedback}\n\n` +

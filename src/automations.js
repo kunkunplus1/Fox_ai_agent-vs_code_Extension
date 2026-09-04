@@ -143,25 +143,46 @@ class AutomationScheduler {
  * 纯函数版 webhook 处理：供单测直接调用（无需真实 socket）。
  * @returns {{statusCode:number, body:object}}
  */
+/** webhook secret 的最短长度：低于此值视为「未配置/强度不足」，一律拒绝服务 */
+const MIN_SECRET_LEN = 16;
+
+/** 常量时间比较 secret，避免按响应耗时逐字节爆破 */
+function secretMatches(provided, secret) {
+  if (typeof secret !== 'string' || secret.length < MIN_SECRET_LEN) return false;
+  if (typeof provided !== 'string' || provided.length !== secret.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'));
+  } catch (_) { return false; }
+}
+
 function handleWebhook({ body, secret, allowedIds, dispatch }) {
   let payload;
   try { payload = JSON.parse(typeof body === 'string' ? body : (body ? JSON.stringify(body) : '{}')); }
   catch (_) { return { statusCode: 400, body: { ok: false, error: 'bad json' } }; }
 
-  const id = payload.id || payload.task;
-  if (!id || (Array.isArray(allowedIds) && allowedIds.length && !allowedIds.includes(id))) {
-    return { statusCode: 404, body: { ok: false, error: 'unknown task' } };
+  // ① 先鉴权：未认证请求不得探测任务是否存在（否则可用 404/403 的差异枚举自动化 id）。
+  //    secret 为空或过短即视为未配置 —— 宁可拒绝服务，也不裸奔（防 CSRF / 局域网未授权触发）。
+  if (!secretMatches(payload && payload.secret, secret)) {
+    return {
+      statusCode: 403,
+      body: { ok: false, error: (secret && String(secret).length >= MIN_SECRET_LEN) ? 'forbidden' : 'webhook secret not configured' }
+    };
   }
-  if (secret && payload.secret !== secret) {
-    return { statusCode: 403, body: { ok: false, error: 'forbidden' } };
+  // ② 再校验任务 id：白名单为空 = 拒绝全部（原实现空数组会放行任意 id）
+  const id = payload.id || payload.task;
+  if (!id || !Array.isArray(allowedIds) || allowedIds.length === 0 || !allowedIds.includes(id)) {
+    return { statusCode: 404, body: { ok: false, error: 'unknown task' } };
   }
   const runId = (typeof dispatch === 'function') ? dispatch(id, payload.args || {}) : crypto.randomBytes(6).toString('hex');
   // 红线：只回执，绝不回任何内部资料（知识库/记忆/工具实现/路径等）
   return { statusCode: 200, body: { ok: true, runId: String(runId) } };
 }
 
-function createWebhookServer({ port, secret, allowedIds, dispatch, route }) {
+function createWebhookServer({ port, secret, allowedIds, dispatch, route, host }) {
   const r = route || '/webhook';
+  // 安全：默认只监听回环（127.0.0.1）。原实现 server.listen(port) 会绑定全部网卡（0.0.0.0/::），
+  // 使局域网内任意主机、以及用户浏览器里的任意网页（CSRF）都能 POST 触发自动化任务。
+  const bindHost = host || '127.0.0.1';
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || (req.url || '').split('?')[0] !== r) {
       res.writeHead(405, { 'Content-Type': 'application/json' });
@@ -179,7 +200,7 @@ function createWebhookServer({ port, secret, allowedIds, dispatch, route }) {
       res.end(JSON.stringify(body)); // 仅回执
     });
   });
-  server.listen(port);
+  server.listen(port, bindHost);
   return server;
 }
 
@@ -191,5 +212,6 @@ module.exports = {
   AutomationScheduler,
   handleWebhook,
   createWebhookServer,
-  generateId
+  generateId,
+  MIN_SECRET_LEN
 };

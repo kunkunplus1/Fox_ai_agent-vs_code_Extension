@@ -27,10 +27,11 @@ initialize / tools/list / tools/call（及 ping / notifications/initialized）�
 import sys
 import os
 import json
+import re
 import time
 import asyncio
 import hashlib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 # —— 常量（有界保护）——
 MAX_LINE = 8000          # 单行最大长度，超出截断（防单行撑爆内存）
@@ -47,6 +48,69 @@ CACHE_MAX_LINES = int(os.environ.get("STEALTH_FETCH_CACHE_MAX_LINES", "5000"))
 # 全局代理（可选）：用于抓取国外站（如 news.ycombinator.com）等直连不通的目标。
 # 也可在每次调用时用 fetch_url 的 proxy 参数覆盖。格式：http://127.0.0.1:7890
 PROXY = os.environ.get("STEALTH_FETCH_PROXY", "") or None
+
+# —— SSRF 护栏 ——
+# fetch_url 的抓取目标由模型每次调用时传入，可能被提示注入诱导去访问内网 / 回环 /
+# 云元数据（169.254.169.254 等）。默认拒绝一切私网/回环/链路本地地址；
+# 只有显式设置 STEALTH_FETCH_ALLOW_PRIVATE=1 才放行（不推荐）。
+ALLOW_PRIVATE = os.environ.get("STEALTH_FETCH_ALLOW_PRIVATE", "") == "1"
+
+
+def _is_private_host(host: str) -> bool:
+    """判断主机名是否为私网/回环/链路本地地址（含 IPv4-mapped IPv6）。
+
+    域名默认放行（宿主侧另有 MCP 连接级校验）；这里覆盖字面 IP 的全部主流写法。
+    """
+    h = str(host or "").strip().rstrip(".").lower()
+    if not h:
+        return True
+    if h == "localhost" or h.endswith(".localhost") or h == "0.0.0.0":
+        return True
+    if h.startswith("::ffff:"):  # IPv4-mapped IPv6（::ffff:127.0.0.1 等）→ 拆出 IPv4 继续判
+        h = h[len("::ffff:"):]
+    if ":" in h:  # IPv6
+        if h == "::1":
+            return True
+        if h.startswith("fe80:") or h.startswith("fc") or h.startswith("fd"):
+            return True
+        return False
+    m = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$", h)
+    if not m:
+        return False
+    a, b = int(m.group(1)), int(m.group(2))
+    if a in (0, 10, 127):
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 169 and b == 254:  # 链路本地 / 云元数据
+        return True
+    return False
+
+
+def _validate_target(url: str):
+    """SSRF 护栏：scheme 仅允许 http/https；私网/回环一律拒绝（除非显式放行）。
+
+    返回 None 表示放行，否则返回错误描述字符串。
+    """
+    if not url or not isinstance(url, str):
+        return "URL 为空"
+    try:
+        p = urlparse(url)
+    except Exception:
+        return "URL 解析失败"
+    if p.scheme not in ("http", "https"):
+        return "仅允许 http/https 协议，拒绝：" + (p.scheme or "(空)")
+    host = (p.hostname or "").lower()
+    if not host:
+        return "URL 缺少主机名"
+    if ALLOW_PRIVATE:
+        return None
+    if _is_private_host(host):
+        return ("拒绝访问内网/回环地址「" + host + "」（SSRF 防护，"
+                "如确需访问本机服务可设置 STEALTH_FETCH_ALLOW_PRIVATE=1）")
+    return None
 
 # —— 跨调用持久状态（同进程全局；tools/call 在 main 里顺序执行，天然无并发）——
 _CACHE = {}          # key -> {"ts": float, "lines": list, "total": int, "status": int}
@@ -152,46 +216,65 @@ def _cache_key(url: str, cookies: dict, impersonate: str, headers_json: str) -> 
     return hashlib.sha1(sig.encode("utf-8")).hexdigest()
 
 
+class _Blocked(Exception):
+    """抓取目标被 SSRF 护栏拦截。"""
+
+
 async def _download(url: str, impersonate: str, cookies: dict, headers: dict,
                     timeout: int, proxy: str | None = None):
     """真正发起一次网络请求，流式解析出「完整行列表」（供缓存复用）。
     返回 (lines, total, status)；HTTP>=400 时返回 (None, 0, status)。
     内存护栏：行列表最多存 CACHE_MAX_LINES 行，但 total 仍计真实总行数。
-    proxy: 可选代理地址（http://127.0.0.1:7890），用于直连不通的国外站。"""
+    proxy: 可选代理地址（http://127.0.0.1:7890），用于直连不通的国外站。
+
+    安全：重定向改为手动逐跳跟随（最多 5 跳），每一跳的目标都重新过 SSRF 护栏
+    —— 防止「公网 302 → 内网/元数据」的跳板绕过。"""
     from curl_cffi.requests import AsyncSession
 
     connect_timeout = min(10, timeout)
     lines: list = []
     total = 0
     status = 0
+    cur_url = url
     async with AsyncSession(impersonate=impersonate,
                             timeout=(connect_timeout, timeout),
                             cookies=cookies) as client:
-        async with client.stream("GET", url, headers=headers,
-                                 allow_redirects=True, max_redirects=10,
-                                 proxy=proxy) as resp:
-            status = resp.status_code
-            if status >= 400:
-                return (None, 0, status)
-            cur = ""
-            async for chunk in resp.aiter_content():
-                if not chunk:
-                    continue
-                text = chunk.decode("utf-8", "replace") if isinstance(
-                    chunk, (bytes, bytearray)) else str(chunk)
-                cur += text
-                if len(cur) > CUR_HARD_CAP:
-                    cur = cur[-MAX_LINE * 4:]  # 异常超长未换行行：只保留尾部
-                while "\n" in cur:
-                    line, cur = cur.split("\n", 1)
+        for _hop in range(6):  # 原始请求 + 最多 5 次重定向
+            blocked = _validate_target(cur_url)
+            if blocked:
+                raise _Blocked(blocked + "（" + cur_url + "）")
+            async with client.stream("GET", cur_url, headers=headers,
+                                     allow_redirects=False,
+                                     proxy=proxy) as resp:
+                status = resp.status_code
+                if status in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("location")
+                    if not loc:
+                        return (None, 0, status)
+                    cur_url = urljoin(cur_url, str(loc).strip())
+                    continue  # 下一跳继续校验
+                if status >= 400:
+                    return (None, 0, status)
+                cur = ""
+                async for chunk in resp.aiter_content():
+                    if not chunk:
+                        continue
+                    text = chunk.decode("utf-8", "replace") if isinstance(
+                        chunk, (bytes, bytearray)) else str(chunk)
+                    cur += text
+                    if len(cur) > CUR_HARD_CAP:
+                        cur = cur[-MAX_LINE * 4:]  # 异常超长未换行行：只保留尾部
+                    while "\n" in cur:
+                        line, cur = cur.split("\n", 1)
+                        total += 1
+                        if len(lines) < CACHE_MAX_LINES:
+                            lines.append(line)
+                if cur:
                     total += 1
                     if len(lines) < CACHE_MAX_LINES:
-                        lines.append(line)
-            if cur:
-                total += 1
-                if len(lines) < CACHE_MAX_LINES:
-                    lines.append(cur)
-    return (lines, total, status)
+                        lines.append(cur)
+                return (lines, total, status)
+    return (None, 0, status)
 
 
 async def _fetch(url: str, start_line: int = 0, line_count: int = 80,
@@ -206,6 +289,12 @@ async def _fetch(url: str, start_line: int = 0, line_count: int = 80,
     - 整页只下载一次（CACHE_TTL 内续取来自缓存），既省流量又消除重复请求。
     - proxy：直连不通的国外站可走代理（参数或环境变量 STEALTH_FETCH_PROXY）。
     """
+    # SSRF 护栏：入口先拦（重定向跳板在 _download 内逐跳再拦）
+    url = str(url or "").strip()
+    blocked = _validate_target(url)
+    if blocked:
+        return "[stealth-fetch] 已拒绝：" + blocked
+
     start_line = max(0, int(start_line))
     line_count = max(1, min(int(line_count), 500))
     max_len = max(200, min(int(max_len), 32000))
