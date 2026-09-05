@@ -324,7 +324,14 @@ async function writeFile(args, ctx) {
 
   if (ctx && ctx.recordUndo) ctx.recordUndo({ uri, before, after: content, existed: had });
   const delta = diffStat(before, content);
-  return `${had ? '已覆盖' : '已创建'} ${relative(uri)}（+${delta.added} -${delta.removed} 行）`;
+  const oldLines = had ? diff.countLines(before) : 0;
+  const newLines = diff.countLines(content);
+  // 反馈锚点：统一回显「变更行范围 start_line/end_line」+ 总行数 + 真实增减，防止模型心算行数。
+  // 覆盖场景必须显示旧行数被替换（-X），否则模型会误以为「在旧文件上追加」。
+  if (had) {
+    return `已覆盖 ${relative(uri)}（start_line=1, end_line=${newLines}；原 ${oldLines} 行 → 现 ${newLines} 行，+${delta.added} -${delta.removed} 行）`;
+  }
+  return `已创建 ${relative(uri)}（start_line=1, end_line=${newLines}；共 ${newLines} 行）`;
 }
 
 /**
@@ -440,8 +447,33 @@ async function editFile(args, ctx) {
   await doc.save();
 
   if (ctx && ctx.recordUndo) ctx.recordUndo({ uri, before: rawBefore, after: finalAfter, existed: true });
-  const delta = diffStat(rawBefore, finalAfter);
-  return `已修改 ${relative(uri)}（${result.editKind} ${result.replacedCount} 处，+${delta.added} -${delta.removed} 行）`;
+  // 统一变更行范围回显：范围取「实际变更的新行号」（add 行的 bNo），
+  // 不含 diff context 行 —— 否则 hunk 的上下文行会被误当「整段都改了」。
+  // 多 hunk 时为首个变更 → 末个变更的覆盖范围。纯删除（无新增行）时不给行范围，
+  // 模型靠下方 diff 片段的 -N│ 删除行号定位。
+  const comp = diff.computeDiff(rawBefore, finalAfter);
+  const delta = comp.stat;
+  let rangeTxt = '';
+  let bMin = Infinity;
+  let bMax = -1;
+  if (comp.hunks) {
+    for (const h of comp.hunks) {
+      for (const r of h.rows) {
+        if (r.type === 'add' && r.bNo !== null) {
+          if (r.bNo < bMin) bMin = r.bNo;
+          if (r.bNo > bMax) bMax = r.bNo;
+        }
+      }
+    }
+  }
+  if (bMax >= bMin) rangeTxt = `start_line=${bMin}, end_line=${bMax}；`;
+  const modNote = delta.modified && delta.modified > 0 ? `，其中 ${delta.modified} 行修改` : '';
+  const statLine = `已修改 ${relative(uri)}（${rangeTxt}${result.editKind} ${result.replacedCount} 处，+${delta.added} -${delta.removed}${modNote}）`;
+  // 行号锚点：附上前 12 行带 1 索引行号的 diff（@@ 头给出变更行范围），
+  // 模型拿到「精确行号」不必数换行符心算——这是行号落点偏差的根治。
+  const brief = unifiedPreview(rawBefore, finalAfter, 12, { wordDiff: false });
+  if (brief) return statLine + '，改动如下：\n' + brief;
+  return statLine;
 }
 
 function charIndexAt(lines, line, char) {
@@ -760,12 +792,15 @@ async function deleteFile(args, ctx) {
     await doc.save();
     if (ctx && ctx.recordUndo) ctx.recordUndo({ uri, before: rawBefore, after, existed: true });
     const delta = diffStat(rawBefore, after);
-    return `已删除 ${relative(uri)} 的第 ${s}-${e} 行（-${delta.removed} 行）`;
+    const oldN = diff.countLines(rawBefore);
+    const newN = diff.countLines(after);
+    // 统一行范围回显：删除的是第几行（按入参 s-e 回显）+ 删除前后总行数
+    return `已删除 ${relative(uri)}（start_line=${s}, end_line=${e}；原 ${oldN} 行 → 现 ${newN} 行，-${delta.removed} 行）`;
   }
 
   await vscode.workspace.fs.delete(uri, { recursive: !!args.recursive, useTrash: true });
   if (ctx && ctx.recordUndo) ctx.recordUndo({ uri, before: rawBefore, existed: true, deleted: true });
-  return `已把 ${relative(uri)} 移入回收站（可用「撤销上一次改动」找回，撤销后还能「重做」恢复）`;
+  return `已把 ${relative(uri)}（原 ${diff.countLines(rawBefore)} 行）移入回收站（可用「撤销上一次改动」找回，撤销后还能「重做」恢复）`;
 }
 
 async function openFile(args) {

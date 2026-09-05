@@ -451,6 +451,17 @@ function formatUnified(before, after, maxLines, opts) {
   return out.join('\n');
 }
 
+/** 编辑器视角的行数：CRLF 归一后按换行分段，结尾的换行不额外算一行
+ * （'a\nb\n' = 2 行、'a\nb' = 2 行、'' = 0 行）。与 read_file 行号、diff 行号一致，
+ * 用于写类工具返回里给模型「原 N 行 → 现 M 行」的防呆锚点，避免心算行数。 */
+function countLines(text) {
+  const s = String(text == null ? '' : text);
+  if (!s) return 0;
+  const t = s.replace(/\r\n/g, '\n');
+  const n = t.length - t.replace(/\n/g, '').length; // 换行个数
+  return t.endsWith('\n') ? n : n + 1;
+}
+
 module.exports = {
   splitLines,
   lineKey,
@@ -459,6 +470,7 @@ module.exports = {
   tokenizeLine,
   inlineWordMark,
   capLine,
+  countLines,
   computeDiff,
   diffStat,
   formatUnified,

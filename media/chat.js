@@ -1579,8 +1579,24 @@
   // 每次工具调用 = 一张「🖥️ 工具」动作卡（标题=可读动作名，参数折叠在卡内），时间线串联成工作链。
   // 后端 stripToolBlocks 已把工具块替换成 \u0002STEP:<工具名>\u0002 私有标记（保留步骤边界但不裸露原文），
   // 前端只按标记切段，绝不照抄 DSH 的终端日志样式 —— 全用狐狸 AI 既有 step-item 卡片体系。
+  // 判断一段文本是否像是「残留的工具块碎片」（半截标签尾/只有括号与零散内容的小尾巴）。
+  // 真实思考正文通常是完整句子/段落；而 \u0002STEP:<name>\u0002 标记可能因流式/全量剥除不彻底，
+  // 在末尾残留未闭合的半截标签或紧贴的碎字。这类碎片应合并进前一思考段或按工具段收束，
+  // 绝不外露成一张内容混乱的独立卡（「思考卡片最后一句错乱」的根因之一）。
+  function isToolFrag(text) {
+    const s = String(text || '').trim();
+    if (!s) return true;
+    if (/^\u0002STEP:[^\u0002]*$/m.test(s)) return true;          // 未闭合 STEP 头
+    if (/<fox:?tool|[[tool:|<tool[>\s]/.test(s)) return true;       // 半截工具开标签
+    if (s.length <= 12 && !/[，。；：！？\n]{1,}/.test(s)) return true; // 极短且无完整标点 → 碎片尾巴
+    return false;
+  }
+
   function splitThinkingSteps(raw) {
     const STEP_RE = /\u0002STEP:([^\u0002]+)\u0002/g;
+    // 未闭合 STEP 头（流式/剥除不彻底残留）：可能夹在正文中间，需单独识别并折成工具段，
+    // 避免它连同后续零碎正文一起被 renderMarkdown 当成普通文本造成「最后一句错乱」。
+    const OPEN_STEP_RE = /\u0002STEP:([^\u0002]*)(?:\u0002|$)/g;
     const segs = [];
     let last = 0, m;
     while ((m = STEP_RE.exec(String(raw || ''))) !== null) {
@@ -1589,8 +1605,26 @@
       segs.push({ kind: 'tool', name: m[1] });
       last = m.index + m[0].length;
     }
-    const tail = String(raw).slice(last);
-    if (tail && tail.trim()) segs.push({ kind: 'text', text: tail });
+    // 后半段（最后一个闭合 STEP 之后）：若含未闭合 STEP 头，把它剥成工具段，其余归正文
+    let tail = String(raw).slice(last);
+    if (tail && tail.trim()) {
+      OPEN_STEP_RE.lastIndex = 0;
+      const om = OPEN_STEP_RE.exec(tail);
+      if (om) {
+        const preFrag = tail.slice(0, om.index);
+        if (preFrag && preFrag.trim()) segs.push({ kind: 'text', text: preFrag });
+        segs.push({ kind: 'tool', name: (om[1] || 'tool').trim() });
+        // 未闭合头之后的内容（若还有）不单独外露，避免碎片卡
+        tail = '';
+      }
+    }
+    if (tail && tail.trim()) {
+      if (isToolFrag(tail) && segs.length) {
+        // 尾部是残缺碎片：收束进上一个工具段（补齐未闭合 STEP），不单独外露
+      } else {
+        segs.push({ kind: 'text', text: tail });
+      }
+    }
     if (!segs.length && String(raw || '').trim()) segs.push({ kind: 'text', text: raw });
     return segs;
   }
@@ -1602,16 +1636,28 @@
       ts.raw += data.text || '';
     } else if (type === 'reasoning') {
       const t = data.text || '';
-      if (ts.reasoning) {
-        if (t.length > ts.reasoning.length && t.startsWith(ts.reasoning)) {
-          ts.reasoning = t;
-        } else if (t.length > 0 && ts.reasoning.includes(t)) {
-          // 完全相同片段已存在，跳过
+      // 区分「流式增量」（stream:true，3696 实时逐字推）与「轮末全量」（无 stream，
+      // 2361/2277 整块收尾下发）。全量是权威最终态，增量只是中间滚动——二者绝不能混堆进
+      // 同一 ts.reasoning，否则中间半截块 + 全量叠加会渲染成「思考卡最后一句错乱」。
+      if (data.stream) {
+        // 增量：若已是某全量的严格前缀，说明全量先到、增量是它的前段 → 丢弃（保持全量纯净）；
+        // 否则做去重追加（避免重复片段）。
+        if (ts.reasoning && t.length < ts.reasoning.length && ts.reasoning.startsWith(t)) {
+          // 增量是全量的前缀：已是全量状态，增量冗余，跳过
+        } else if (ts.reasoning) {
+          if (t.length > ts.reasoning.length && t.startsWith(ts.reasoning)) {
+            ts.reasoning = t;
+          } else if (t.length > 0 && ts.reasoning.includes(t)) {
+            // 完全相同片段已存在，跳过
+          } else {
+            ts.reasoning += t;
+          }
         } else {
-          ts.reasoning += t;
+          ts.reasoning = t;
         }
       } else {
-        ts.reasoning = t;
+        // 轮末全量：权威覆盖（增量只是中间滚动，最终态以全量为准）
+        if (t && String(t).trim()) ts.reasoning = t;
       }
     } else if (type === 'image') {
       if (!ts.images) ts.images = [];
