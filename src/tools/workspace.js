@@ -4,6 +4,7 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const diff = require('../diff'); // 纯函数 diff 引擎（Myers 行对齐 / hunk / 词级标记）
 
 const DIFF_SCHEME = 'foxai-diff';
 /** @type {Map<string, string>} 供 diff 视图读取的虚拟文档 */
@@ -473,20 +474,14 @@ function nearestHint(content, oldText) {
   return '建议先用 read_file 确认原文。';
 }
 
+/**
+ * 行级 diff 统计（委托给 src/diff 引擎，Myers 行对齐，顺序敏感）。
+ * 返回 { added, removed, modified, unchanged, similarity, degraded, ... }。
+ * 兼容说明：旧调用只读 added/removed；「修改 1 行」依旧计入 added=1、removed=1，
+ * 同时新增 modified=1，便于把「纯增删」与「修改」区分开。
+ */
 function diffStat(before, after) {
-  const a = before ? splitLines(before) : [];
-  const b = after ? splitLines(after) : [];
-  const setA = new Map();
-  for (const l of a) setA.set(l, (setA.get(l) || 0) + 1);
-  let added = 0;
-  for (const l of b) {
-    const c = setA.get(l) || 0;
-    if (c > 0) setA.set(l, c - 1);
-    else added++;
-  }
-  let removed = 0;
-  for (const c of setA.values()) removed += c;
-  return { added, removed };
+  return diff.diffStat(before, after);
 }
 
 async function listDir(args) {
@@ -803,51 +798,19 @@ async function showDiff(pathLike, oldText, newText, title) {
 
 /**
  * 生成带行号的紧凑 diff 摘要，给审批卡片 / 审查摘要展示。
- *
- * 行号规则（与编辑器、read_file 的 1 索引一致）：
- *   - 上下文行 / 删除行 标「原文件行号」，新增行标「新文件行号」；
- *   - 原行号 ≠ 新行号 时用「原→新」标注（删除/插入带来的行号错位），
- *     让模型一眼看出「第 N 行内容被挪到了第 M 行」——正是「让 AI 写第 15 行、
- *     结果写到第 14 行」这类落点偏差能被自检发现的锚点；
- *   - 行号右对齐、定宽，避免 read_file 那种宽度跳动（1/9/10 行号宽窄不一）。
+ * 委托给 src/diff 引擎（Myers 行对齐），输出骨架与历史版本一致：
+ *   - 行号 1 索引、右对齐定宽；上下文/删除行标原行号、新增行标新行号；
+ *   - 原行号 ≠ 新行号时用「原→新」标注错位，让模型一眼看出行号落点漂移；
+ *   - 前缀 -/+/空格 标识删除/新增/上下文；多个分散改动切分为多个 @@ hunk；
+ *   - 可选 opts：wordDiff（行内词级 [-删-]{+增+} 标记）、context（上下文行数）、
+ *     ignoreWhitespace / ignoreCase / ignoreBlankLines / maxLineLength 等，见 src/diff.js。
+ * @param {string} before
+ * @param {string} after
+ * @param {number} [maxLines=40]
+ * @param {Object} [opts]
  */
-function unifiedPreview(before, after, maxLines = 40) {
-  // 先把 CRLF 归一成 LF：否则「CRLF 原文件 vs LF 新内容」会被逐行误判为全部改动，
-  // 审批预览 / 审查摘要里就会出现满屏的「每行都删又都加」假 diff。
-  const a = (before || '').replace(/\r\n/g, '\n').split('\n');
-  const b = (after || '').replace(/\r\n/g, '\n').split('\n');
-  let start = 0;
-  while (start < a.length && start < b.length && a[start] === b[start]) start++;
-  let endA = a.length - 1;
-  let endB = b.length - 1;
-  while (endA >= start && endB >= start && a[endA] === b[endB]) {
-    endA--;
-    endB--;
-  }
-  const aWidth = Math.max(1, String(a.length).length);
-  const bWidth = Math.max(1, String(b.length).length);
-  const width = Math.max(aWidth, bWidth);
-  const ln = (n, pad) => String(n).padStart(pad || width, ' ');
-  const ctxStart = Math.max(0, start - 2);
-  const out = [];
-  // 上下文行：原行号与目标行号错位时标注「原→新」，行号一致则只标一个
-  for (let i = ctxStart; i < start; i++) {
-    const oldNo = i + 1;
-    const newNo = oldNo + (b.length - a.length);
-    out.push((oldNo === newNo ? ' ' + ln(oldNo) : ln(oldNo) + '→' + ln(newNo, aWidth)) + '│ ' + a[i]);
-  }
-  for (let i = start; i <= endA; i++) out.push('-' + ln(i + 1, aWidth) + '│ ' + a[i]);
-  for (let i = start; i <= endB; i++) out.push('+' + ln(i + 1, bWidth) + '│ ' + b[i]);
-  const tailEnd = Math.min(a.length - 1, endA + 2);
-  for (let i = endA + 1; i <= tailEnd; i++) {
-    const oldNo = i + 1;
-    const newNo = oldNo + (b.length - a.length);
-    out.push((oldNo === newNo ? ' ' + ln(oldNo) : ln(oldNo) + '→' + ln(newNo, aWidth)) + '│ ' + a[i]);
-  }
-  if (out.length > maxLines) {
-    return out.slice(0, maxLines).join('\n') + `\n… 还有 ${out.length - maxLines} 行`;
-  }
-  return out.join('\n');
+function unifiedPreview(before, after, maxLines = 40, opts) {
+  return diff.formatUnified(before, after, maxLines, opts);
 }
 
 module.exports = {

@@ -63,6 +63,14 @@ function shouldRun(f) {
 }
 
 const files = collectTestFiles().filter(shouldRun);
+// 防御：0 个测试文件（如发布版 vsix 内不含 test/、或目录被误删）时不能报「全部通过」——
+// 那会形成假绿，让回归形同没跑。此时必须明确失败。
+if (!files.length) {
+  console.error('未发现任何测试文件（test/ 不存在或为空，且根目录无 test_*.js）。');
+  console.error('提示：发布版 vsix 不含 test/（已在 .vscodeignore 中排除），全量回归请在源码树中运行。');
+  if (skips.length || onlys.length) console.error('当前过滤条件：skip=' + skips.join(',') + ' only=' + onlys.join(','));
+  process.exit(1);
+}
 console.log('=== fox-ai 全量回归 ===');
 console.log('共发现测试文件: ' + collectTestFiles().length + '，本次运行: ' + files.length +
   (skips.length ? '（额外跳过: ' + skips.join(', ') + '）' : '') +

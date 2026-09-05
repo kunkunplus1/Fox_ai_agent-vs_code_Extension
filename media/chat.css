@@ -745,6 +745,11 @@ body[data-vscode-theme-kind="vscode-dark"] .msg.assistant .bubble {
 .diff-line-add { background: var(--vscode-diffEditor-insertedLineBackground, rgba(63, 185, 80, .12)); color: var(--vscode-charts-green, #3fb950); }
 .diff-line-del { background: var(--vscode-diffEditor-removedLineBackground, rgba(241, 76, 76, .12)); color: var(--vscode-errorForeground, #f14c4c); }
 .diff-line-ctx { opacity: .8; }
+/* 深度 diff 增强：hunk 头 / 行号弱化 / 行内词级增删高亮 */
+.diff-line-hunk { background: rgba(127, 127, 127, .10); color: var(--vscode-descriptionForeground, #8b949e); font-style: italic; }
+.diff-ln { opacity: .55; }
+.diff-wd { background: rgba(241, 76, 76, .22); text-decoration: line-through; border-radius: 3px; padding: 0 1px; color: var(--vscode-errorForeground, #f14c4c); }
+.diff-wi { background: rgba(63, 185, 80, .22); border-radius: 3px; padding: 0 1px; color: var(--vscode-charts-green, #3fb950); }
 
 .tool-actions {
   display: flex; gap: 7px; padding: 7px 10px;

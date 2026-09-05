@@ -185,9 +185,15 @@ function once(content) {
     assert.ok(/\+2│ B2/.test(prev));
   });
   check('预览带 1 索引行号', () => {
-    // 删除行标原文件行号、新增行标新文件行号；行号错位用「原→新」标注
-    assert.ok(/1→2│ a/.test(prev));
+    // 上下文/删除行标原文件行号、新增行标新文件行号；
+    // 前缀公共行 aNo==bNo（不再按文件总长差误报 1→2 假错位）
+    assert.ok(/ 1│ a/.test(prev));
+    assert.ok(/\-2│ b/.test(prev));
+    assert.ok(/\+2│ B2/.test(prev));
     assert.ok(/\+5│ e/.test(prev));
+  });
+  check('修改统计区分 modified', () => {
+    assert.strictEqual(stat.modified, 1, 'b→B2 应为修改行');
   });
 
   console.log('\n[6] ANSI 清洗');

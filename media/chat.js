@@ -1268,20 +1268,47 @@
     delete live[id];
   }
 
+  // 行内词级差异标记（输入需已 HTML 转义）：[-删除片段-] → <del>、{+新增片段+} → <ins>
+  function renderInlineDiffMark(escaped) {
+    if (escaped.indexOf('[-') === -1 && escaped.indexOf('{+') === -1) return escaped;
+    const re = /\[-([\s\S]*?)-]|\{\+([\s\S]*?)\+\}/g;
+    let out = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(escaped))) {
+      out += escaped.slice(last, m.index);
+      if (m[1] !== undefined) out += '<del class="diff-wd">' + m[1] + '</del>';
+      else out += '<ins class="diff-wi">' + m[2] + '</ins>';
+      last = m.index + m[0].length;
+    }
+    out += escaped.slice(last);
+    return out;
+  }
+
   function renderDiff(text) {
     const lines = String(text || '').split('\n');
     const rows = [];
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i];
+      // hunk 头（@@ -a,b +c,d @@）整行弱化展示
+      if (l.charAt(0) === '@') {
+        rows.push('<div class="diff-row diff-line-hunk"><span class="diff-gutter"></span><code class="diff-code">' + escapeHtml(l) + '</code></div>');
+        continue;
+      }
       let cls = 'diff-line-ctx';
       let gutter = ' ';
-      if (l.startsWith('+')) { cls = 'diff-line-add'; gutter = '+'; }
-      else if (l.startsWith('-')) { cls = 'diff-line-del'; gutter = '-'; }
-      const content = escapeHtml(l.slice(1));
+      if (l.charAt(0) === '+') { cls = 'diff-line-add'; gutter = '+'; }
+      else if (l.charAt(0) === '-') { cls = 'diff-line-del'; gutter = '-'; }
+      const rest = l.slice(1);
+      // 行号列与内容列分离：行号半透明，内容支持词级增删高亮
+      const bar = rest.indexOf('│');
+      const code = bar >= 0
+        ? '<span class="diff-ln">' + escapeHtml(rest.slice(0, bar + 1)) + '</span>' + renderInlineDiffMark(escapeHtml(rest.slice(bar + 1)))
+        : renderInlineDiffMark(escapeHtml(rest));
       rows.push(
         '<div class="diff-row ' + cls + '">' +
         '<span class="diff-gutter">' + gutter + '</span>' +
-        '<code class="diff-code">' + (content || '&nbsp;') + '</code>' +
+        '<code class="diff-code">' + (code || '&nbsp;') + '</code>' +
         '</div>'
       );
     }

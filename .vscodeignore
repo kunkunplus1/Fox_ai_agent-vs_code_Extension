@@ -1,5 +1,6 @@
 .vscode/**
 test/**
+scripts/run-all-tests.js
 .check/**
 .gitignore
 jsconfig.json

@@ -2485,7 +2485,11 @@ const emptyGuide = this.protocol === 'text'
       }
       // unifiedPreview 带 1 索引行号：删除行标原行号、新增行标新行号，错位处「原→新」，
       // 让审查/自检能直接看出「想让第 15 行变成 X、实际落到第 14/16 行」这类落点偏差。
-      return `修改 ${path}${scope}（+${stat.added} -${stat.removed}）：\n${cut(ws.unifiedPreview(before, after), 1600)}`;
+      // 注意：此处不启用 wordDiff 词级标记 —— 这是给模型自检的纯文本，
+      // 行内标记会打断子串连续性（如 page.$$eval 变成 page.{+$+}$eval），
+      // 模型做精确子串匹配（grep $$eval）会漏。wordDiff 仅用于带 UI 渲染的审批/预览路径。
+      const modNote = stat.modified && stat.modified > 0 ? `，其中 ${stat.modified} 行修改` : '';
+      return `修改 ${path}${scope}（+${stat.added} -${stat.removed}${modNote}）：\n${cut(ws.unifiedPreview(before, after), 1600)}`;
     }
     if (name === 'write_file') {
       return `整体写入 ${path}（共 ${String(args.content || '').length} 字）：${cut(args.content, 800)}`;
@@ -4761,7 +4765,7 @@ const emptyGuide = this.protocol === 'text'
         path: ws.relative(uri),
         existed,
         stat: ws.diffStat(before, after),
-        text: existed ? ws.unifiedPreview(before, after) : after.split('\n').slice(0, 40).map((l) => '+ ' + l).join('\n'),
+        text: existed ? ws.unifiedPreview(before, after, 40, { wordDiff: true }) : after.split('\n').slice(0, 40).map((l) => '+ ' + l).join('\n'),
         before,
         after
       };
@@ -4774,7 +4778,7 @@ const emptyGuide = this.protocol === 'text'
         path: ws.relative(uri),
         existed: true,
         stat: ws.diffStat(result.before, result.after),
-        text: ws.unifiedPreview(result.before, result.after),
+        text: ws.unifiedPreview(result.before, result.after, 40, { wordDiff: true }),
         before: result.before,
         after: result.after
       };
